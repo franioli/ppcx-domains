@@ -16,14 +16,15 @@ def plot_dic_vectors(
     u: np.ndarray,
     v: np.ndarray,
     magnitudes: np.ndarray,
-    background_image: np.ndarray | None = None,
+    background_image: np.ndarray | PILImage.Image | None = None,
     vmin: float = 0.0,
     vmax: float | None = None,
     scale: float | None = None,
     scale_units: str = "xy",
     width: float = 0.003,
     headwidth: float = 2.5,
-    alpha: float = 0.8,
+    quiver_alpha: float = 1,
+    image_alpha: float = 0.7,
     cmap_name: str = "batlow",
     figsize: tuple[int, int] = (12, 10),
     dpi: int = 300,
@@ -91,7 +92,7 @@ def plot_dic_vectors(
 
     # Display background image if provided
     if background_image is not None:
-        ax.imshow(background_image, alpha=0.7)
+        ax.imshow(background_image, alpha=image_alpha)
 
     # Create quiver plot
     q = ax.quiver(
@@ -107,7 +108,7 @@ def plot_dic_vectors(
         norm=norm,
         width=width,
         headwidth=headwidth,
-        alpha=alpha,
+        alpha=quiver_alpha,
     )
 
     # Add colorbar
