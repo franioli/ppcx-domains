@@ -1,205 +1,126 @@
+import io
 import os
-from datetime import date
-from typing import Any
+from datetime import datetime
 
 import pandas as pd
-from sqlalchemy import Engine, create_engine, text
+import requests
+from dotenv import load_dotenv
+from PIL import Image
+
+# Get environment variables from .env file
+load_dotenv()
+DB_HOST = os.environ.get("DB_HOST")
+DB_PORT = os.environ.get("DB_PORT")
+DB_NAME = os.environ.get("DB_NAME")
+DB_USER = os.environ.get("DB_USER")
+DB_PASSWORD = os.environ.get("DB_PASSWORD")
+APP_HOST = os.environ.get("APP_HOST")
+APP_PORT = os.environ.get("APP_PORT")
+GET_IMAGE_VIEW = os.environ.get("GET_IMAGE_VIEW")
 
 
-class DICdb:
-    """Database connection and query interface for DIC data."""
+def get_dic_analysis_ids(
+    db_engine,
+    *,
+    reference_date: str | datetime | None = None,
+    master_timestamp: str | datetime | None = None,
+    camera_id: int | None = None,
+    camera_name: str | None = None,
+) -> pd.DataFrame:
+    """
+    Get DIC analysis metadata (including IDs) for a specific date/timestamp and optional camera filter.
+    """
+    query = """
+    SELECT 
+        DIC.id as dic_id,
+        CAM.camera_name,
+        DIC.master_timestamp,
+        DIC.slave_timestamp,
+        DIC.master_image_id,
+        DIC.slave_image_id,
+        DIC.time_difference_hours
+    FROM ppcx_app_dic DIC
+    JOIN ppcx_app_image IMG ON DIC.master_image_id = IMG.id
+    JOIN ppcx_app_camera CAM ON IMG.camera_id = CAM.id
+    WHERE 1=1
+    """
+    params = []
+    if reference_date is not None:
+        query += " AND DATE(DIC.reference_date) = %s"
+        params.append(str(reference_date))
+    if master_timestamp is not None:
+        query += " AND DATE(DIC.master_timestamp) = %s"
+        params.append(str(master_timestamp))
+    if camera_id is not None:
+        query += " AND CAM.id = %s"
+        params.append(camera_id)
+    if camera_name is not None:
+        query += " AND CAM.camera_name = %s"
+        params.append(camera_name)
+    query += " ORDER BY DIC.master_timestamp"
+    return pd.read_sql(query, db_engine, params=tuple(params))
 
-    def __init__(
-        self,
-        connection_string: str | None = None,
-        host: str | None = None,
-        port: str | int | None = None,
-        database: str | None = None,
-        user: str | None = None,
-        password: str | None = None,
-        **kwargs,
-    ):
-        """Initialize database connection.
 
-        Args:
-            connection_string: Complete PostgreSQL connection string. If provided,
-                other parameters are ignored.
-            host: Database host (default: 'localhost')
-            port: Database port (default: 5432)
-            database: Database name
-            user: Database username
-            password: Database password
-            **kwargs: Additional SQLAlchemy engine parameters
+def get_dic_data(
+    dic_id: int,
+    app_host: str = APP_HOST,
+    app_port: str = APP_PORT,
+    filter_outliers: bool = False,
+    tails_percentile: float = 0.01,
+    min_velocity: float = -1,
+) -> pd.DataFrame:
+    """
+    Fetch DIC displacement data from the Django API endpoint as a DataFrame.
+    """
+    url = f"http://{app_host}:{app_port}/API/dic/{dic_id}/"
+    response = requests.get(url)
+    if response.status_code != 200:
+        raise ValueError(f"Could not fetch DIC data for id {dic_id}: {response.text}")
 
-        Examples:
-            # Using connection string
-            db = DICDatabase("postgresql://user:pass@host:port/db")
+    data = response.json()
+    # If the data is empty, raise an error
+    if not data or "points" not in data:
+        raise ValueError(f"No valid DIC data found for id {dic_id}")
 
-            # Using individual parameters
-            db = DICDatabase(host="localhost", database="mydb", user="user", password="pass")
+    points = data["points"]
+    vectors = data["vectors"]
+    magnitudes = data["magnitudes"]
 
-            # Using environment variables for missing parameters
-            db = DICDatabase(database="mydb")  # Other params from env vars
-        """
-        if connection_string:
-            self.engine: Engine = create_engine(connection_string, **kwargs)
-        else:
-            # Use individual parameters or environment variables as fallback
-            host = host or os.environ.get("DB_HOST", "localhost")
-            port = port or os.environ.get("DB_PORT", "5432")
-            database = database or os.environ.get("DB_NAME")
-            user = user or os.environ.get("DB_USER")
-            password = password or os.environ.get("DB_PASSWORD", "")
+    # Convert to DataFrame
+    df = pd.DataFrame(points, columns=["x", "y"])
+    df["u"] = [v[0] for v in vectors]
+    df["v"] = [v[1] for v in vectors]
+    df["V"] = magnitudes
 
-            if not database:
-                raise ValueError(
-                    "Database name must be provided either as parameter or DB_NAME environment variable"
-                )
-            if not user:
-                raise ValueError(
-                    "Username must be provided either as parameter or DB_USER environment variable"
-                )
+    # Filter out extreme tails based on the specified percentile
+    if filter_outliers:
+        prob_threshold = (tails_percentile, 1 - tails_percentile)
+        velocity_percentiles = df["V"].quantile(prob_threshold).values
+        df = df[
+            (df["V"] >= velocity_percentiles[0]) & (df["V"] <= velocity_percentiles[1])
+        ].reset_index(drop=True)
 
-            connection_string = (
-                f"postgresql://{user}:{password}@{host}:{port}/{database}"
-            )
-            self.engine: Engine = create_engine(connection_string, **kwargs)
+    # Filter out low velocity vectors if specified
+    if min_velocity >= 0:
+        df = df[df["V"] >= min_velocity].reset_index(drop=True)
 
-    def execute_query(
-        self,
-        query: str,
-        params: list | tuple | dict | None = None,
-        return_dataframe: bool = True,
-    ) -> pd.DataFrame | Any:
-        """Execute a custom SQL query.
+    return df
 
-        Args:
-            query: SQL query string
-            params: Query parameters (list, tuple, or dict)
-            return_dataframe: If True, return pandas DataFrame. If False, return raw result
 
-        Returns:
-            DataFrame if return_dataframe=True, otherwise raw SQLAlchemy result
-
-        Examples:
-            # Simple query
-            df = db.execute_query("SELECT * FROM my_table LIMIT 10")
-
-            # Query with parameters (list/tuple)
-            df = db.execute_query("SELECT * FROM my_table WHERE id = %s", [123])
-
-            # Query with named parameters (dict)
-            df = db.execute_query("SELECT * FROM my_table WHERE id = %(id)s", {'id': 123})
-        """
-        if return_dataframe:
-            return pd.read_sql(query, self.engine, params=params)
-        else:
-            with self.engine.connect() as conn:
-                if params:
-                    result = conn.execute(text(query), params)
-                else:
-                    result = conn.execute(text(query))
-                return result
-
-    def get_table_info(self, table_name: str) -> pd.DataFrame:
-        """Get column information for a specific table.
-
-        Args:
-            table_name: Name of the table
-
-        Returns:
-            DataFrame with column information
-        """
-        query = """
-        SELECT 
-            column_name,
-            data_type,
-            is_nullable,
-            column_default
-        FROM information_schema.columns 
-        WHERE table_name = %s
-        ORDER BY ordinal_position
-        """
-        return self.execute_query(query, (table_name,))
-
-    def list_tables(self) -> list[str]:
-        """List all tables in the database.
-
-        Returns:
-            List of table names
-        """
-        query = """
-        SELECT table_name 
-        FROM information_schema.tables 
-        WHERE table_schema = 'public'
-        ORDER BY table_name
-        """
-        df = self.execute_query(query)
-        return df["table_name"].tolist()
-
-    def get_dic_data(self, target_date: str | date) -> pd.DataFrame:
-        """Get DIC displacement data for a specific date.
-
-        Args:
-            target_date: Target date as string (YYYY-MM-DD) or date object
-
-        Returns:
-            DataFrame with displacement data for the specified date
-        """
-        query = """
-        SELECT 
-            A.id as analysis_id,
-            A.master_image_id,
-            A.master_timestamp,
-            A.slave_image_id,
-            A.slave_timestamp,
-            A.time_difference_hours,
-            R.seed_x_px, 
-            R.seed_y_px, 
-            R.displacement_x_px, 
-            R.displacement_y_px,
-            R.displacement_magnitude_px
-        FROM glacier_monitoring_app_dicresult R
-        JOIN glacier_monitoring_app_dicanalysis A ON R.analysis_id = A.id
-        WHERE DATE(A.master_timestamp) = %s
-        ORDER BY R.seed_x_px, R.seed_y_px
-        """
-
-        return self.execute_query(query, (str(target_date),))
-
-    def get_dic_dates(self) -> tuple[list[str], list[str]]:
-        """Get all unique dates (master and slave images) for which DIC analyses are available.
-
-        Returns:
-            Tuple of lists containing master and slave image dates
-        """
-        query = """
-        SELECT DISTINCT DATE(master_timestamp), DATE(slave_timestamp)
-        FROM glacier_monitoring_app_dicanalysis
-        ORDER BY master_timestamp
-        """
-
-        df = self.execute_query(query)
-        return (df["m_date"].tolist(), df["s_date"].tolist())
-
-    def get_analysis_summary(self) -> pd.DataFrame:
-        """Get summary statistics for all analyses.
-
-        Returns:
-            DataFrame with summary statistics per analysis date
-        """
-        query = """
-        SELECT 
-            DATE(A.master_timestamp) as analysis_date,
-            COUNT(R.id) as num_points,
-            AVG(R.displacement_magnitude_px) as avg_magnitude,
-            MAX(R.displacement_magnitude_px) as max_magnitude,
-            MIN(R.displacement_magnitude_px) as min_magnitude,
-            STDDEV(R.displacement_magnitude_px) as std_magnitude
-        FROM glacier_monitoring_app_dicanalysis A
-        LEFT JOIN glacier_monitoring_app_dicresult R ON A.id = R.analysis_id
-        GROUP BY DATE(A.master_timestamp)
-        ORDER BY analysis_date
-        """
-
-        return self.execute_query(query)
+def get_image(
+    image_id: int,
+    app_host: str = APP_HOST,
+    app_port: str = APP_PORT,
+    camera_name: str | None = None,
+) -> Image.Image:
+    """Get an image from the database by its ID and rotate if from Tele camera."""
+    url = f"http://{app_host}:{app_port}/API/images/{image_id}/"
+    response = requests.get(url)
+    if response.status_code == 200:
+        img = Image.open(io.BytesIO(response.content))
+        # Rotate if camera_name is Tele (portrait mode)
+        if camera_name is not None and "tele" in camera_name.lower():
+            img = img.rotate(90, expand=True)  # 90° clockwise
+        return img
+    else:
+        raise ValueError(f"Image with ID {image_id} not found.")
