@@ -5,13 +5,15 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "cmcrameri>=1.9.0",
+    "cmcrameri>=1.9",
     "dotenv>=0.9.9",
     "exifread>=3.3.1",
     "ipykernel>=6.29.5",
     "ipympl>=0.9.7",
+    "joblib>=1.5.1",
     "matplotlib>=3.5.0",
     "numpy>=2.0",
+    "omegaconf>=2.3.0",
     "pandas>=2.3",
     "pillow>=10.0",
     "pip>=25.1.1",

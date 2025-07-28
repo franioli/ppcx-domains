@@ -1,0 +1,53 @@
+# Database configuration
+database:
+  host: "150.145.51.193"
+  port: 5432
+  name: "planpincieux"
+  user: ""
+  password: ""
+
+# API configuration
+api:
+  host: "150.145.51.193"
+  port: 8080
+  image_view: "images"
+
+# Data selection parameters
+data:
+  target_date: "2024-09-02"
+  camera_names: ["PPCX_Tele"]
+  polygon_roi_file: "data/PPCX_Tele_glacier_ROI.json"
+
+# DIC data processing parameters
+dic:
+  # Percentile-based filtering
+  filter_outliers: true
+  tails_percentile: 0.01  # Percentile for outlier filtering (0.01 = 1% tails)
+  
+  # Minimum velocity filtering
+  min_velocity: 1  # use -1 to disable
+  
+  # 2D median filter parameters
+  apply_2d_median: true
+  median_window_size: 5  # Size of median filter window (odd number recommended)
+  median_threshold_factor: 3.0  # Factor for outlier detection (n * median_deviation)
+
+# GMM clustering parameters
+clustering:
+  variables_names: ["x", "y", "log_magnitude", "angle_rad"]
+  n_components: 8
+  weight_concentration_prior: 0.5
+  max_iter: 100
+  random_state: 42
+  covariance_type: "full"
+
+# Output configuration
+output:
+  base_dir: "output"
+  save_plots: true
+  plot_dpi: 300
+
+# Parallel processing parameters
+processing:
+  n_jobs: 1  # Number of parallel jobs
+  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR

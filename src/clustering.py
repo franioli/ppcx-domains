@@ -24,9 +24,8 @@ def preproc_features(df):
     df_features["u_unit"] = df["u"] / (df["V"] + 1e-10)  # Avoid division by zero
     df_features["v_unit"] = df["v"] / (df["V"] + 1e-10)
 
-    # Spatial derivatives (approximate gradients)
-    # Note: This is a simplified approach - in practice you might want to use proper spatial interpolation
-    df_features["spatial_index"] = range(len(df_features))
+    # Square Magnitude of displacement
+    df_features["V_squared"] = df["V"] ** 2
 
     # Log magnitude for better clustering of different scales
     df_features["log_magnitude"] = np.log1p(df["V"])
