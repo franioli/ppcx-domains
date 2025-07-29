@@ -17,8 +17,15 @@ class ConfigManager:
     config_path: Path = field(default=CONFIG_PATH)
 
     def __new__(cls, config_path: Path = CONFIG_PATH):
+        """Create a singleton instance of ConfigManager."""
         if cls._instance is None:
+            # If no instance exists, create one
             cls._instance = super().__new__(cls)
+
+            # Set the config_path only on first creation
+            cls._instance.config_path = config_path
+
+        # Return the singleton instance
         return cls._instance
 
     def __post_init__(self):
@@ -45,7 +52,7 @@ class ConfigManager:
         for key, value in env_overrides.items():
             if value is not None:
                 OmegaConf.update(config, key, value)
-        return config
+        return config if isinstance(config, DictConfig) else DictConfig(config)
 
     @property
     def config(self) -> DictConfig:
@@ -63,7 +70,7 @@ class ConfigManager:
 
     def set(self, key: str, value: Any) -> None:
         """Set a configuration value by dot notation key."""
-        OmegaConf.set(self.config, key, value)
+        OmegaConf.update(self.config, key, value)
 
     @property
     def db_url(self) -> str:

@@ -29,7 +29,7 @@ class PolygonROISelector:
             self.fig, self.ax = plt.subplots(figsize=(10, 8))
             self.ax.imshow(image, alpha=0.8)
             self.ax.set_title(
-                f"{title}\nClick to add points, press Enter to finish. Click 's' to save polygon points to a json file."
+                f"{title}\nClick to add points, press Enter to finish. Click 'MAIUSC+S' to save polygon points to a json file."
             )
 
             # Initialize polygon selector
@@ -41,7 +41,7 @@ class PolygonROISelector:
             self.fig.canvas.mpl_connect("key_press_event", self.on_key_press)
             plt.show()
 
-    def on_polygon_select(self, verts, selector):
+    def on_polygon_select(self, verts):
         """Callback when polygon is selected."""
         self.polygon_points = list(verts)
         if len(self.polygon_points) >= 3:
@@ -60,7 +60,7 @@ class PolygonROISelector:
             print("Polygon selection cancelled")
             plt.close(self.fig)
 
-        if event.key == "s":
+        if event.key == "S":
             """Save the polygon points to a file."""
             if self.file_path:
                 self.to_file(self.file_path)
@@ -95,6 +95,13 @@ class PolygonROISelector:
             data = json.load(f)
         polygon_points = data.get("polygon_points", [])
         return cls(image=image, title=title, polygon_points=polygon_points)
+
+    def contains_points(self, x, y):
+        """Return a boolean mask for points (x, y) inside the polygon."""
+        if self.polygon_path is None:
+            return np.zeros_like(x, dtype=bool)
+        points = np.column_stack([x, y])
+        return self.polygon_path.contains_points(points)
 
 
 def points_inside_polygon(polygon_path, points) -> np.ndarray:

@@ -1,13 +1,9 @@
-from dotenv import load_dotenv
-from matplotlib import pyplot as plt
+import matplotlib
 
 from src.database import get_image
 from src.roi import PolygonROISelector
 
-# Set interactive mode for matplotlib
-plt.ion()
-
-load_dotenv()
+matplotlib.use("Qt5Agg")
 
 image_id = 34993
 camera_name = "PPCX_Tele"
@@ -19,3 +15,6 @@ selector = PolygonROISelector(
     title="Select unstable area for DIC analysis",
     file_path=output_file,
 )
+
+
+print("Done.")

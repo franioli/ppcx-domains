@@ -16,7 +16,7 @@ api:
 data:
   target_date: "2024-09-02"
   camera_names: ["PPCX_Tele"]
-  polygon_roi_file: "data/PPCX_Tele_glacier_ROI.json"
+  roi_path: "data/PPCX_Tele_glacier_ROI.json"
 
 # DIC data processing parameters
 dic:
@@ -34,7 +34,7 @@ dic:
 
 # GMM clustering parameters
 clustering:
-  variables_names: ["x", "y", "log_magnitude", "angle_rad"]
+  variables_names: ["V", "angle_deg"] # ["x", "y", "magnitude", "prior_class"] # "angle_rad"
   n_components: 8
   weight_concentration_prior: 0.5
   max_iter: 100
