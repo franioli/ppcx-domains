@@ -1,19 +1,7 @@
-# Database configuration
-database:
-  host: 150.145.51.193
-  port: 5434
-  name: planpincieux
-  user: postgres
-
-# API configuration
-api:
-  host: "150.145.51.193"
-  port: 8080
-  image_view: "images"
-
 # Data selection parameters
 data:
-  reference_date: "2017-07-09"
+  output_dir: "output_batch"
+  reference_date: "2016-09-28"
   camera_name: "PPCX_Tele"
   days_before_to_include: 0
   days_after_to_include: 0
@@ -22,7 +10,6 @@ data:
   roi_path: "data/roi.xml"
   sector_prior_file: "data/priors_4_sectors.xml"
   variables_names: ["V"] # List of variable names to process
-  output_dir: "output_batch"
 
 # Data preprocessing parameters
 preprocessing:
@@ -94,6 +81,16 @@ multiscale:
     similarity_threshold: 0.7
     overall_threshold: 0.8
 
+# Post-processing parameters
+postprocessing:
+  erosion_iterations: 2      # Number of erosion iterations to disconnect narrow bridges
+  dilation_iterations: 2     # Number of dilation iterations to restore cluster size
+  split_disconnected_components: true
+  min_cluster_size: 50      # Minimum number of pixels for a cluster to survive
+  # min_cluster_size_px: 100  # Minimum cluster size for second pass processing
+  connectivity: 4           # 4 or 8 connectivity for component analysis (for all postproc steps)
+  keep_only_largest_n: 4    # Keep only the largest N clusters, -1 to keep all
+
 # Morpho-kinematic analysis parameters
 morphokinematic:
   minor_overlap_threshold: 0.9
@@ -105,3 +102,17 @@ morphokinematic:
 
 # Random seed for reproducibility
 random_seed: 8927
+
+# Database configuration
+database:
+  host: 150.145.51.193
+  port: 5434
+  name: planpincieux
+  user: postgres
+
+# API configuration
+api:
+  host: "150.145.51.193"
+  port: 8080
+  image_view: "images"
+

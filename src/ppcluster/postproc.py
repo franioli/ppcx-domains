@@ -1,0 +1,862 @@
+import logging
+from itertools import combinations
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from matplotlib import pyplot as plt
+from scipy import ndimage
+from scipy.ndimage import binary_dilation, binary_erosion, label
+from scipy.stats import mode
+from sklearn.metrics import adjusted_rand_score
+
+logger = logging.getLogger("ppcx")
+
+
+# === GRID data filtering ===
+
+
+def remove_small_grid_components(
+    label_grid: np.ndarray,
+    min_size: int = 5,
+    connectivity: int = 4,
+    merge_strategy: str = "remove",
+) -> np.ndarray:
+    """
+    Remove small connected components from a 2D label grid.
+
+    This function identifies disconnected components within each cluster label
+    and removes those smaller than min_size.
+
+    Args:
+        label_grid: 2D numpy array with cluster labels (negative values = unassigned)
+        min_size: Minimum size (in grid cells) to keep a component
+        connectivity: 4 or 8 (neighbor connectivity for component detection)
+        merge_strategy: 'remove' (set to -1) or 'merge' (assign to nearest neighbor)
+
+    Returns:
+        cleaned_grid: 2D array with small components removed/merged
+    """
+    from scipy import ndimage
+
+    cleaned = label_grid.copy().astype(float)
+
+    # Define connectivity structure
+    if connectivity == 8:
+        structure = np.ones((3, 3), dtype=bool)
+    else:
+        structure = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
+
+    # Get unique cluster labels (excluding negative/unassigned)
+    unique_labels = np.unique(label_grid)
+    unique_labels = unique_labels[unique_labels >= 0]
+
+    if len(unique_labels) == 0:
+        logger.warning("No valid clusters found in grid")
+        return cleaned
+
+    total_removed = 0
+
+    # Process each cluster separately to find disconnected components
+    for lab in unique_labels:
+        mask = label_grid == lab
+        if not np.any(mask):
+            continue
+
+        # Find connected components for this cluster
+        components, n_components = ndimage.label(mask, structure=structure)
+
+        # Process each component
+        for comp_id in range(1, n_components + 1):
+            comp_mask = components == comp_id
+            comp_size = comp_mask.sum()
+
+            if comp_size < min_size:
+                if merge_strategy == "merge":
+                    # Try to merge with neighboring cluster
+                    # Dilate component to find neighbors
+                    neighbor_mask = ndimage.binary_dilation(
+                        comp_mask, structure=np.ones((3, 3))
+                    ) & (~comp_mask)
+
+                    neighbor_labels = cleaned[neighbor_mask]
+                    # Filter: exclude current label and negative values
+                    neighbor_labels = neighbor_labels[neighbor_labels >= 0]
+                    neighbor_labels = neighbor_labels[neighbor_labels != lab]
+
+                    if neighbor_labels.size > 0:
+                        # Assign to most common neighbor
+                        unique, counts = np.unique(neighbor_labels, return_counts=True)
+                        new_label = unique[np.argmax(counts)]
+                        cleaned[comp_mask] = new_label
+                        total_removed += comp_size
+                        logger.debug(
+                            f"Merged small component (size={comp_size}) "
+                            f"from cluster {lab} to cluster {new_label}"
+                        )
+                    else:
+                        # No neighbors, remove it
+                        cleaned[comp_mask] = -1
+                        total_removed += comp_size
+                else:
+                    # Remove strategy: set to unassigned (-1)
+                    cleaned[comp_mask] = -1
+                    total_removed += comp_size
+                    logger.debug(
+                        f"Removed small component (size={comp_size}) from cluster {lab}"
+                    )
+
+    # Log summary
+    final_unique = np.unique(cleaned)
+    final_unique = final_unique[final_unique >= 0]
+    n_unassigned = np.sum(cleaned < 0)
+
+    logger.info(
+        f"Removed {total_removed} grid cells from small components. "
+        f"Result: {len(final_unique)} clusters, {n_unassigned} unassigned cells"
+    )
+
+    return cleaned
+
+
+def keep_only_largest_clusters(
+    label_grid: np.ndarray,
+    n_largest: int,
+    connectivity: int = 4,
+) -> np.ndarray:
+    """
+    Keep only the N largest clusters in a 2D label grid.
+
+    This function calculates the total size of each cluster (sum of all connected
+    components for that label) and keeps only the N largest by total grid cell count.
+
+    Args:
+        label_grid: 2D numpy array with cluster labels (negative values = unassigned)
+        n_largest: Number of largest clusters to keep
+        connectivity: 4 or 8 (neighbor connectivity, used for logging only)
+
+    Returns:
+        filtered_grid: 2D array with only the N largest clusters retained
+    """
+    if n_largest <= 0:
+        logger.warning("n_largest must be > 0, returning unchanged grid")
+        return label_grid.copy()
+
+    cleaned = label_grid.copy().astype(float)
+
+    # Get unique cluster IDs (excluding negative/unassigned)
+    unique_labels = np.unique(label_grid)
+    unique_labels = unique_labels[unique_labels >= 0]
+
+    if len(unique_labels) == 0:
+        logger.warning("No valid clusters found in grid")
+        return cleaned
+
+    if len(unique_labels) <= n_largest:
+        logger.info(
+            f"Found {len(unique_labels)} clusters, no filtering needed "
+            f"(n_largest={n_largest})"
+        )
+        return cleaned
+
+    # Calculate total size for each cluster
+    cluster_sizes = {}
+    for cluster_id in unique_labels:
+        cluster_sizes[cluster_id] = np.sum(label_grid == cluster_id)
+
+    # Sort by size (descending) and keep largest N
+    sorted_clusters = sorted(cluster_sizes.items(), key=lambda x: x[1], reverse=True)
+
+    largest_clusters = set([cid for cid, _ in sorted_clusters[:n_largest]])
+
+    # Remove all clusters not in the largest N
+    for cluster_id in unique_labels:
+        if cluster_id not in largest_clusters:
+            cleaned[label_grid == cluster_id] = -1
+
+    # Calculate statistics
+    n_removed_clusters = len(unique_labels) - n_largest
+    total_removed_cells = sum(size for cid, size in sorted_clusters[n_largest:])
+    total_kept_cells = sum(size for cid, size in sorted_clusters[:n_largest])
+
+    logger.info(
+        f"Kept {n_largest} largest clusters ({total_kept_cells} cells), "
+        f"removed {n_removed_clusters} clusters ({total_removed_cells} cells)"
+    )
+
+    # Log details of kept clusters
+    for idx, (cid, size) in enumerate(sorted_clusters[:n_largest], 1):
+        logger.info(f"  #{idx}: Cluster {cid} with {size} grid cells")
+
+    # Log details of removed clusters
+    if n_removed_clusters > 0:
+        logger.debug("Removed clusters:")
+        for cid, size in sorted_clusters[n_largest:]:
+            logger.debug(f"  Cluster {cid} with {size} grid cells")
+
+    return cleaned
+
+
+def close_small_holes(
+    label_grid,
+    max_hole_size=10,
+    connectivity=8,
+    require_single_neighbor=True,
+):
+    """
+    Close small NaN-holes in a 2D label grid.
+
+    Rules:
+      - Only close holes whose size (number of NaN cells) <= max_hole_size.
+      - Only close if the dilated border of the hole contains no NaNs
+        (i.e. data all around the hole).
+      - If require_single_neighbor is True the border must contain a single unique
+        label; otherwise the most common border label is used.
+
+    Args:
+      label_grid: 2D ndarray with labels (NaN for empty cells).
+      max_hole_size: maximum hole area (in grid cells) to fill.
+      connectivity: 4 or 8 connectivity for labeling/dilation.
+      require_single_neighbor: if True, require single neighbor label on border.
+
+    Returns:
+      new_grid: copy of label_grid with selected holes filled.
+    """
+    new_grid = label_grid.copy().astype(float)
+    if connectivity == 8:
+        structure = np.ones((3, 3), dtype=bool)
+    else:
+        structure = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
+
+    # mask of holes (NaNs)
+    hole_mask_all = np.isnan(label_grid)
+    if not np.any(hole_mask_all):
+        logger.debug("close_small_holes: no holes found (no NaNs in grid).")
+        return new_grid
+
+    # label each hole component
+    comp_labels, ncomp = ndimage.label(hole_mask_all, structure=structure)
+    filled_count = 0
+    skipped_count = 0
+    for comp_id in range(1, ncomp + 1):
+        comp_mask = comp_labels == comp_id
+        comp_size = int(comp_mask.sum())
+        reason = None
+        if comp_size > max_hole_size:
+            reason = f"size>{max_hole_size}"
+            skipped_count += 1
+            logger.debug(f"hole {comp_id}: size={comp_size} skipped ({reason})")
+            continue
+
+        # dilate to get border cells (use same connectivity structure)
+        dilated = ndimage.binary_dilation(comp_mask, structure=structure)
+        border_mask = dilated & (~comp_mask)
+
+        # border values
+        border_vals = new_grid[border_mask]
+        if border_vals.size == 0:
+            reason = "no border cells"
+            skipped_count += 1
+            logger.debug(f"hole {comp_id}: size={comp_size} skipped ({reason})")
+            continue
+
+        # if any border cell is NaN -> not fully surrounded by data
+        if np.any(np.isnan(border_vals)):
+            reason = "border_has_nans"
+            skipped_count += 1
+            logger.debug(
+                f"hole {comp_id}: size={comp_size} skipped ({reason}) border_nan_fraction={np.isnan(border_vals).mean():.3f}"
+            )
+            continue
+
+        # get unique neighbor labels and counts
+        unique_neighbors, counts = np.unique(border_vals, return_counts=True)
+        if unique_neighbors.size == 0:
+            reason = "no_neighbors"
+            skipped_count += 1
+            logger.debug(f"hole {comp_id}: size={comp_size} skipped ({reason})")
+            continue
+
+        if require_single_neighbor:
+            # require border to be all same label
+            if unique_neighbors.size == 1:
+                fill_label = unique_neighbors[0]
+            else:
+                reason = f"multiple_neighbors({unique_neighbors.tolist()})"
+                skipped_count += 1
+                logger.debug(f"hole {comp_id}: size={comp_size} skipped ({reason})")
+                continue
+        else:
+            # pick most common neighbor label
+            fill_label = unique_neighbors[np.argmax(counts)]
+
+        # sanity: ensure fill_label is finite
+        if not np.isfinite(fill_label):
+            reason = "fill_label_not_finite"
+            skipped_count += 1
+            logger.debug(f"hole {comp_id}: size={comp_size} skipped ({reason})")
+            continue
+
+        # coerce label to int-like if appropriate (avoid filling with floats like 1.0)
+        if np.allclose(fill_label, np.round(fill_label)):
+            fill_label = float(int(np.round(fill_label)))
+        else:
+            fill_label = float(fill_label)
+
+        # fill hole with chosen label
+        new_grid[comp_mask] = fill_label
+        filled_count += 1
+        logger.debug(
+            f"hole {comp_id}: size={comp_size} filled with label={fill_label} (require_single_neighbor={require_single_neighbor})"
+        )
+
+    logger.info(
+        f"close_small_holes: filled={filled_count} skipped={skipped_count} total={ncomp}"
+    )
+    return new_grid
+
+
+def split_disconnected_components(label_grid, connectivity=8, start_label=0):
+    """
+    Split disconnected components of each label into unique labels.
+
+    Args:
+      label_grid: 2D array with labels (NaN = empty).
+      connectivity: 4 or 8 connectivity for ndimage.label.
+      start_label: integer to start new labels from.
+      debug: if True logs summary.
+
+    Returns:
+      new_grid: 2D array with disconnected pieces assigned unique integer labels.
+      mapping: dict original_label -> list of new labels assigned for its pieces.
+    """
+    if connectivity == 8:
+        structure = np.ones((3, 3), dtype=bool)
+    else:
+        structure = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
+
+    new_grid = np.full_like(label_grid, np.nan, dtype=float)
+    mapping = {}
+    next_label = int(start_label)
+
+    unique_labels = np.unique(label_grid[~np.isnan(label_grid)])
+    for lab in unique_labels:
+        lab = float(lab)
+        mask = label_grid == lab
+        if not np.any(mask):
+            continue
+        comp, ncomp = ndimage.label(mask, structure=structure)
+        mapping[int(lab)] = []
+        for cid in range(1, ncomp + 1):
+            comp_mask = comp == cid
+            new_grid[comp_mask] = float(next_label)
+            mapping[int(lab)].append(int(next_label))
+            next_label += 1
+
+    total_new = next_label - int(start_label)
+    logger.debug(
+        f"split_disconnected_components: original_labels={unique_labels.size} new_pieces={total_new} mapping={mapping}",
+    )
+    return new_grid, mapping
+
+
+def apply_morphological_operations(
+    cluster_grid: np.ndarray,
+    erosion_iterations: int = 2,
+    dilation_iterations: int = 2,
+    min_cluster_size: int = 100,
+    connectivity: int = 8,
+) -> np.ndarray:
+    """
+    Apply morphological operations (erosion + dilation) to disconnect narrow bridges
+    and remove small clusters.
+
+    Operations performed per cluster:
+    1. Erosion: disconnect narrow bridges and remove small protrusions
+    2. Component labeling: identify separated parts after erosion
+    3. Size filtering: remove components smaller than threshold
+    4. Dilation: restore cluster size without reconnecting separated parts
+
+    Args:
+        cluster_grid: 2D array with cluster labels (negative values = unassigned)
+        erosion_iterations: Number of erosion iterations to disconnect narrow bridges
+        dilation_iterations: Number of dilation iterations to restore cluster size
+        min_cluster_size: Minimum number of pixels for a cluster component to survive
+        structure: Structuring element for morphological operations (default: 3x3 ones)
+
+    Returns:
+        Processed cluster grid with same shape as input
+    """
+
+    if connectivity == 8:
+        structure = np.ones((3, 3), dtype=bool)
+    else:
+        structure = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
+
+    logger.info(
+        f"Applying morphological operations: erosion={erosion_iterations}, "
+        f"dilation={dilation_iterations}, min_size={min_cluster_size}"
+    )
+
+    # Get unique cluster labels (excluding negative = unassigned)
+    unique_labels = np.unique(cluster_grid)
+    unique_labels = unique_labels[unique_labels >= 0]
+
+    # Process each cluster separately
+    processed_grid = np.full_like(cluster_grid, -1, dtype=int)
+
+    for cluster_id in sorted(unique_labels):
+        # Create binary mask for this cluster
+        cluster_mask = (cluster_grid == cluster_id).astype(np.uint8)
+
+        # Step 1: Erosion to disconnect narrow bridges
+        if erosion_iterations > 0:
+            eroded_mask = binary_erosion(
+                cluster_mask, iterations=erosion_iterations, structure=structure
+            ).astype(np.uint8)
+        else:
+            eroded_mask = cluster_mask
+
+        # Step 2: Label connected components after erosion
+        labeled_eroded, n_components = label(eroded_mask, structure=structure)
+
+        if n_components == 0:
+            continue
+
+        # # Step 3: Remove small components
+        # components_removed = 0
+        # for comp_id in range(1, n_components + 1):
+        #     comp_mask = labeled_eroded == comp_id
+        #     comp_size = np.sum(comp_mask)
+
+        #     if comp_size < min_cluster_size:
+        #         labeled_eroded[comp_mask] = 0
+        #         components_removed += 1
+
+        # if components_removed > 0:
+        #     logger.debug(
+        #         f"Cluster {cluster_id}: removed {components_removed} small component(s)"
+        #     )
+
+        # # Check if anything remains after filtering
+        # if not np.any(labeled_eroded > 0):
+        #     continue
+
+        # Step 4: Dilation to restore size (but not reconnect separated parts)
+        if dilation_iterations > 0:
+            # Dilate each component separately to avoid reconnection
+            dilated_mask = np.zeros_like(labeled_eroded, dtype=np.uint8)
+            remaining_components = np.unique(labeled_eroded)
+            remaining_components = remaining_components[remaining_components > 0]
+
+            for comp_id in remaining_components:
+                comp_mask = (labeled_eroded == comp_id).astype(np.uint8)
+                dilated_comp = binary_dilation(
+                    comp_mask, iterations=dilation_iterations, structure=structure
+                ).astype(np.uint8)
+                # Add to final mask (max to handle overlaps)
+                dilated_mask = np.maximum(dilated_mask, dilated_comp)
+
+            final_mask = dilated_mask
+        else:
+            final_mask = (labeled_eroded > 0).astype(np.uint8)
+
+        # Add processed cluster to output grid
+        processed_grid[final_mask > 0] = cluster_id
+
+    n_clusters_before = len(unique_labels)
+    n_clusters_after = len(np.unique(processed_grid[processed_grid >= 0]))
+    logger.info(
+        f"Morphological operations: {n_clusters_before} → {n_clusters_after} clusters"
+    )
+
+    return processed_grid
+
+
+# === Statistics and visualization ===
+
+
+def compute_cluster_statistics_simple(
+    df_features: pd.DataFrame,
+    cluster_pred: np.ndarray,
+    posterior_probs: np.ndarray | None = None,
+) -> dict[int, dict[str, float]]:
+    """
+    Simpler per-cluster statistics that works after grid cleaning / relabeling.
+
+    - Does NOT rely on the original Bayesian model (no idata/scaler).
+    - posterior_probs is optional; if provided we compute per-point entropy and
+      use posterior_probs.max(axis=1) as a generic "assignment confidence".
+      Note: posterior_probs may refer to original model components and therefore
+      may not index new labels produced by post-processing. We only use the
+      per-point max-prob and entropy (aggregated per cleaned cluster).
+
+    Returns:
+        Mapping cluster_id -> stats dict with keys:
+          count, x_mean, y_mean, x_std, y_std,
+          velocity_mean, velocity_std, velocity_median, velocity_nmad,
+          avg_entropy (or None), avg_assignment_prob (or None)
+    """
+    cluster_pred = np.asarray(cluster_pred)
+    velocity = np.asarray(df_features["V"])
+    x_vals_all = np.asarray(df_features["x"])
+    y_vals_all = np.asarray(df_features["y"])
+
+    # Optional per-point metrics if posterior_probs available
+    if posterior_probs is not None:
+        pp = np.asarray(posterior_probs)
+        # entropy per point (stable)
+        entropy_pt = -np.sum(pp * np.log(pp + 1e-12), axis=1)
+        # per-point max assignment probability (use max over components)
+        max_prob_pt = pp.max(axis=1)
+    else:
+        entropy_pt = None
+        max_prob_pt = None
+
+    stats: dict[int, dict[str, float]] = {}
+    for lab in np.unique(cluster_pred):
+        mask = cluster_pred == lab
+        count = int(mask.sum())
+        if count == 0:
+            continue
+
+        v_vals = velocity[mask]
+        v_mean = float(np.mean(v_vals))
+        v_std = float(np.std(v_vals))
+        v_median = float(np.median(v_vals))
+        v_nmad = float(np.median(np.abs(v_vals - v_median)) * 1.4826)
+
+        x_vals = x_vals_all[mask]
+        y_vals = y_vals_all[mask]
+        x_mean = float(np.mean(x_vals))
+        y_mean = float(np.mean(y_vals))
+        x_std = float(np.std(x_vals))
+        y_std = float(np.std(y_vals))
+
+        avg_entropy = float(entropy_pt[mask].mean()) if entropy_pt is not None else None
+        avg_assign = (
+            float(max_prob_pt[mask].mean()) if max_prob_pt is not None else None
+        )
+
+        stats[int(lab)] = {
+            "count": count,
+            "x_mean": x_mean,
+            "y_mean": y_mean,
+            "x_std": x_std,
+            "y_std": y_std,
+            "velocity_mean": v_mean,
+            "velocity_std": v_std,
+            "velocity_median": v_median,
+            "velocity_nmad": v_nmad,
+            "avg_entropy": avg_entropy,
+            "avg_assignment_prob": avg_assign,
+        }
+
+    return stats
+
+
+def plot_clustering(
+    ax,
+    img: np.ndarray,
+    x: np.ndarray,
+    y: np.ndarray,
+    cluster_labels: np.ndarray,
+    title: str = "",
+    colormap_name: str = "tab10",
+    show_legend: bool = True,
+    show_stats: bool = False,
+    point_size: int = 10,
+    alpha: float = 0.7,
+) -> None:
+    """
+    Plot clustering results on a given matplotlib axis.
+
+    Args:
+        ax: Matplotlib axis to plot on
+        img: Background image to display
+        x: X coordinates of points
+        y: Y coordinates of points
+        cluster_labels: Cluster assignments for each point
+        title: Plot title
+        colormap_name: Name of matplotlib colormap to use
+        show_legend: Whether to show legend
+        show_stats: Whether to show statistics text box
+        point_size: Size of scatter plot points
+        alpha: Transparency of scatter points
+    """
+    # Display background image
+    ax.imshow(img, alpha=0.5, cmap="gray")
+
+    # Get colormap
+    colormap = plt.get_cmap(colormap_name)
+
+    # Get unique cluster labels (excluding negative = unassigned)
+    unique_labels = np.unique(cluster_labels)
+    unique_labels = unique_labels[unique_labels >= 0]
+
+    # Plot each cluster
+    for i, label in enumerate(unique_labels):
+        mask = cluster_labels == label
+        ax.scatter(
+            x[mask],
+            y[mask],
+            color=colormap(i % colormap.N),
+            label=f"Cluster {label}",
+            s=point_size,
+            alpha=alpha,
+        )
+
+    # Add legend if requested
+    if show_legend and len(unique_labels) > 0:
+        ax.legend(loc="upper right", framealpha=0.9, fontsize=10)
+
+    # Add statistics text box if requested
+    if show_stats:
+        n_clusters = len(unique_labels)
+        n_points = len(x)
+        stats_text = f"Clusters: {n_clusters}\nPoints: {n_points}"
+        ax.text(
+            0.02,
+            0.98,
+            stats_text,
+            transform=ax.transAxes,
+            fontsize=9,
+            verticalalignment="top",
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+        )
+
+    # Set title and formatting
+    ax.set_title(title, fontsize=12)
+    ax.set_aspect("equal")
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+
+def plot_clustering_grid(
+    ax,
+    img: np.ndarray,
+    cluster_grid: np.ndarray,
+    X: np.ndarray,
+    Y: np.ndarray,
+    title: str = "",
+    colormap_name: str = "tab10",
+    show_legend: bool = True,
+    show_stats: bool = False,
+    alpha: float = 0.7,
+) -> None:
+    """
+    Plot gridded clustering results on a matplotlib axis.
+
+    Args:
+        ax: Matplotlib axis to plot on
+        img: Background image to display
+        cluster_grid: 2D array with cluster IDs (negative = unassigned)
+        X: 2D meshgrid of X coordinates
+        Y: 2D meshgrid of Y coordinates
+        title: Plot title
+        colormap_name: Name of matplotlib colormap to use
+        show_legend: Whether to show legend
+        show_stats: Whether to show statistics text box
+        alpha: Transparency of colored overlay
+    """
+    from matplotlib.colors import ListedColormap
+
+    # Display background image
+    ax.imshow(img, alpha=0.5, cmap="gray")
+
+    # Get unique cluster labels (excluding negative = unassigned)
+    unique_labels = np.unique(cluster_grid)
+    unique_labels = unique_labels[unique_labels >= 0]
+    unique_labels = sorted(unique_labels)
+
+    if len(unique_labels) == 0:
+        ax.set_title(title, fontsize=12)
+        ax.set_aspect("equal")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        return
+
+    # Get base colormap
+    base_cmap = plt.get_cmap(colormap_name)
+
+    # Create a masked array for visualization
+    # Mask out negative values (unassigned)
+    cluster_masked = np.ma.masked_where(cluster_grid < 0, cluster_grid)
+
+    # Create color mapping: map each cluster_id to a color index
+    # This ensures consistent colors across plots
+    n_colors = len(unique_labels)
+    colors = [base_cmap(i % base_cmap.N) for i in range(n_colors)]
+
+    # Create a custom colormap
+    custom_cmap = ListedColormap(colors)
+
+    # Map cluster IDs to sequential indices for color mapping
+    cluster_to_idx = {cid: idx for idx, cid in enumerate(unique_labels)}
+    cluster_indexed = np.full_like(cluster_grid, -1, dtype=float)
+    for cid, idx in cluster_to_idx.items():
+        cluster_indexed[cluster_grid == cid] = idx
+
+    cluster_indexed_masked = np.ma.masked_where(cluster_indexed < 0, cluster_indexed)
+
+    # Plot the grid with colors
+    im = ax.imshow(
+        cluster_indexed_masked,
+        cmap=custom_cmap,
+        alpha=alpha,
+        interpolation="nearest",
+        vmin=0,
+        vmax=n_colors - 1,
+        extent=[X.min(), X.max(), Y.max(), Y.min()],  # Y reversed for image coords
+    )
+
+    # Add legend if requested
+    if show_legend:
+        import matplotlib.patches as mpatches
+
+        legend_patches = []
+        for cid in unique_labels:
+            idx = cluster_to_idx[cid]
+            color = colors[idx]
+            patch = mpatches.Patch(color=color, label=f"Cluster {cid}", alpha=alpha)
+            legend_patches.append(patch)
+
+        ax.legend(
+            handles=legend_patches,
+            loc="upper right",
+            framealpha=0.9,
+            fontsize=9,
+        )
+
+    # Add statistics text box if requested
+    if show_stats:
+        n_clusters = len(unique_labels)
+        n_cells = np.sum(cluster_grid >= 0)
+        stats_text = f"Clusters: {n_clusters}\nCells: {n_cells}"
+        ax.text(
+            0.02,
+            0.98,
+            stats_text,
+            transform=ax.transAxes,
+            fontsize=9,
+            verticalalignment="top",
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+        )
+
+    # Set title and formatting
+    ax.set_title(title, fontsize=12)
+    ax.set_aspect("equal")
+    ax.set_xlim(X.min(), X.max())
+    ax.set_ylim(Y.max(), Y.min())  # Y reversed for image coordinates
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+
+# == Multiscale clustering aggregation ===
+def aggregate_multiscale_clustering(
+    results, similarity_threshold=0.6, overall_threshold=0.7, fig_path=None
+):
+    """
+    Aggregate clustering results across scales, filtering unstable scales.
+
+    Parameters:
+    -----------
+    results : list of dict
+        Results from different scale clustering runs
+    similarity_threshold : float
+        Minimum mean similarity for a scale to be included
+    overall_threshold : float
+        Minimum overall similarity across scales to accept results
+
+    Returns:
+    --------
+    combined_cluster_pred : ndarray
+        Aggregated cluster assignments
+    stability_score : float
+        Measure of overall stability (0-1)
+    """
+
+    # Extract all cluster predictions
+    all_cluster_preds = np.array([res["cluster_pred"] for res in results])
+    n_scales = len(all_cluster_preds)
+    sigma_values = [res["sigma"] for res in results]
+
+    # Calculate pairwise similarities
+    similarity_matrix = np.zeros((n_scales, n_scales))
+    np.fill_diagonal(similarity_matrix, 1.0)
+    for i, j in combinations(range(n_scales), 2):
+        sim = adjusted_rand_score(all_cluster_preds[i], all_cluster_preds[j])
+        similarity_matrix[i, j] = sim
+        similarity_matrix[j, i] = sim
+
+    # Plot similarity heatmap
+    if fig_path is not None:
+        fig_path = Path(fig_path)
+        fig_path.parent.mkdir(parents=True, exist_ok=True)
+        fig, ax = plt.subplots(figsize=(4, 4))
+        sns.heatmap(
+            similarity_matrix,
+            annot=True,
+            fmt=".2f",
+            cmap="viridis",
+            xticklabels=sigma_values,
+            yticklabels=sigma_values,
+        )
+        plt.title("Adjusted Rand Index Between Scales")
+        plt.xlabel("Sigma")
+        plt.ylabel("Sigma")
+        plt.tight_layout()
+        fig.savefig(fig_path, dpi=100, bbox_inches="tight")
+        plt.close(fig)
+
+    # Calculate mean similarity for each scale (exclude self-similarity)
+    mean_similarities = (similarity_matrix.sum(axis=1) - 1) / (n_scales - 1)
+
+    # Filter scales with low similarity
+    valid_scales = mean_similarities >= similarity_threshold
+    if not np.any(valid_scales):
+        raise ValueError(
+            f"No scales meet the similarity threshold of {similarity_threshold}. "
+            f"Mean similarities: {mean_similarities}"
+        )
+
+    # Get overall stability score (mean of valid scale similarities)
+    valid_sim_matrix = similarity_matrix[np.ix_(valid_scales, valid_scales)]
+    stability_score = valid_sim_matrix.mean()
+    logger.info(f"Overall stability score: {stability_score:.2f}")
+
+    # Check if overall stability is too low
+    if stability_score < overall_threshold:
+        raise ValueError(
+            f"Overall clustering stability ({stability_score:.2f}) is below threshold "
+            f"({overall_threshold}). Results are too unstable across scales."
+        )
+
+    # Get valid cluster predictions and compute mode
+    valid_preds = all_cluster_preds[valid_scales]
+    logger.info(
+        f"Using {sum(valid_scales)}/{n_scales} scales: sigma={np.array(sigma_values)[valid_scales]}"
+    )
+
+    # Compute mode (most common label at each point)
+    combined_cluster_pred, _ = mode(valid_preds, axis=0)
+    combined_cluster_pred = combined_cluster_pred.flatten()
+
+    # Compute also average posterior probabilities, entropy and assignment uncertainty
+    avg_posterior_probs = np.mean([res["posterior_probs"] for res in results], axis=0)
+    avg_entropy = -np.sum(
+        avg_posterior_probs * np.log(avg_posterior_probs + 1e-10), axis=1
+    )
+
+    # Aggregate results in a dictionary
+    aggregated_results = {
+        "combined_cluster_pred": combined_cluster_pred,
+        "similarity_matrix": similarity_matrix,
+        "stability_score": stability_score,
+        "valid_scales": np.array(sigma_values)[valid_scales].tolist(),
+        "avg_posterior_probs": avg_posterior_probs,
+        "avg_entropy": avg_entropy,
+    }
+
+    return aggregated_results

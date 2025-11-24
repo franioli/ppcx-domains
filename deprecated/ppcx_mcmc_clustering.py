@@ -19,20 +19,21 @@ from sklearn.preprocessing import StandardScaler
 from sqlalchemy import create_engine
 
 from ppcluster import logger, mcmc
+from ppcluster.config import ConfigManager
 from ppcluster.cvat import (
     filter_dataframe_by_polygons,
     read_polygons_from_cvat,
 )
 from ppcluster.griddata import create_2d_grid, map_grid_to_points
-from ppcluster.mcmc.postproc import (
-    aggregate_multiscale_clustering,
-    remove_small_grid_components,
-    split_disconnected_components,
-)
 from ppcluster.mksectors import (
     auto_assign_mk_sectors,
     compute_mk_sector_stats,
     draw_polygon,
+)
+from ppcluster.postproc import (
+    aggregate_multiscale_clustering,
+    remove_small_grid_components,
+    split_disconnected_components,
 )
 from ppcluster.preprocessing import (
     apply_2d_gaussian_filter,
@@ -40,7 +41,6 @@ from ppcluster.preprocessing import (
     preprocess_velocity_features,
     spatial_subsample,
 )
-from ppcluster.config import ConfigManager
 from ppcluster.utils.database import (
     fetch_dic_analysis_ids,
     get_dic_analysis_by_ids,

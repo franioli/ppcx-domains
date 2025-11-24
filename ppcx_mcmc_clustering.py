@@ -10,13 +10,8 @@ import matplotlib.patches as mpatches
 import numpy as np
 import pandas as pd
 import pymc as pm
-from matplotlib import colors as mcolors
 from matplotlib import pyplot as plt
 from matplotlib.colors import Normalize
-from sklearn.metrics import (
-    adjusted_mutual_info_score,
-    adjusted_rand_score,
-)
 from sklearn.preprocessing import StandardScaler
 from sqlalchemy import create_engine
 
@@ -26,16 +21,24 @@ from ppcluster.cvat import (
     filter_dataframe_by_polygons,
     read_polygons_from_cvat,
 )
-from ppcluster.griddata import create_2d_grid, map_grid_to_points
-from ppcluster.mcmc.postproc import (
+from ppcluster.griddata import create_2d_grid
+from ppcluster.mksectors import (
+    SectorPolygons,
+    assign_sector_labels,
+    classify_points_by_sectors,
+    compute_sector_stats,
+    draw_polygon,
+    remove_polygon_overlaps,
+    validate_no_overlaps,
+    vectorize_clusters,
+)
+from ppcluster.postproc import (
     aggregate_multiscale_clustering,
+    apply_morphological_operations,
+    keep_only_largest_clusters,
+    plot_clustering_grid,
     remove_small_grid_components,
     split_disconnected_components,
-)
-from ppcluster.mksectors import (
-    auto_assign_mk_sectors,
-    compute_mk_sector_stats,
-    draw_polygon,
 )
 from ppcluster.preprocessing import (
     apply_2d_gaussian_filter,
@@ -372,9 +375,11 @@ def main(reference_date: str | None = None):
     # Output paths
     date_start = dic_analyses.iloc[0]["master_timestamp"].strftime("%Y-%m-%d")
     date_end = dic_analyses.iloc[0]["slave_timestamp"].strftime("%Y-%m-%d")
-    output_dir = output_base_dir / f"{camera_name}_{date_end}_mcmc_multiscale"
+    output_dir = output_base_dir / f"{camera_name}_{date_end}_mcmc"
     output_dir.mkdir(parents=True, exist_ok=True)
-    base_name = f"{date_start}_{date_end}"
+
+    # Define base name for outputs
+    base_name = f"{date_end}"
 
     # Get master image
     master_image_id = dic_analyses["master_image_id"].iloc[0]
@@ -441,7 +446,9 @@ def main(reference_date: str | None = None):
 
     fig, axes = mcmc.plot_spatial_priors(df, prior_probs_array, img=img)
     fig.savefig(
-        output_dir / f"{base_name}_spatial_priors.jpg", dpi=150, bbox_inches="tight"
+        output_dir / f"{base_name}_mcmc_spatial_priors.jpg",
+        dpi=150,
+        bbox_inches="tight",
     )
     plt.close(fig)
 
@@ -528,7 +535,7 @@ def main(reference_date: str | None = None):
         logger.info(f"Processing with Gaussian smoothing sigma={sigma}...")
 
         # Create scale-specific base name
-        scale_base_name = f"{date_start}_{date_end}_sigma{sigma}"
+        scale_base_name = f"{date_start}_{date_end}_mcmc_sigma{sigma}"
 
         # Apply Gaussian smoothing if needed (skipped for sigma=0)
         df_run = apply_2d_gaussian_filter(df, sigma=sigma)
@@ -614,6 +621,7 @@ def main(reference_date: str | None = None):
     )
 
     # %% # ===  POST-PROCESSING AND CLEANING OF FINAL CLUSTERING  === #
+
     # Retrieve data
     df_smooth = apply_2d_gaussian_filter(df, sigma=1)
     x = df_smooth["x"].to_numpy()
@@ -621,344 +629,541 @@ def main(reference_date: str | None = None):
     v = df_smooth["V"].to_numpy()
     kin_cluster = np.asarray(cluster_pred.copy())
 
+    # Save pre-postprocessing clustering for comparison
+    cluster_before_postproc = cluster_pred.copy()
+    X_before, Y_before, cluster_grid_before_postproc = create_2d_grid(
+        x=x, y=y, labels=cluster_before_postproc
+    )
+
+    # Create 2D grid of clustering results
     X, Y, kin_cluster_grid = create_2d_grid(x=x, y=y, labels=kin_cluster)
 
-    # Filter out small clusters
-    kin_cluster_grid = remove_small_grid_components(
-        kin_cluster_grid, min_size=100, connectivity=8
+    # Post-processing parameters
+    config.reload()
+    postproc_config = config.get("postprocessing", {})
+    erosion_iterations = postproc_config.get("erosion_iterations", 0)
+    dilation_iterations = postproc_config.get("dilation_iterations", 0)
+    min_cluster_size = postproc_config.get("min_cluster_size", 50)
+    connectivity = postproc_config.get("connectivity", 4)
+    keep_only_largest_n = postproc_config.get("keep_only_largest_n", -1)
+    logger.info(
+        f"Post-processing params: erosion={erosion_iterations}, "
+        f"dilation={dilation_iterations}, min_size={min_cluster_size}"
     )
 
-    # Split clusters along detected discontinuities
-    kin_cluster_grid, split_mapping = split_disconnected_components(
-        kin_cluster_grid, connectivity=8, start_label=0
-    )
-    kin_cluster, x, y = map_grid_to_points(X, Y, kin_cluster_grid, x, y, keep_nan=True)
+    # === STEP 1: Grid-level post-processing ===
 
-    # Remove non classified points (-1 label)
-    valid_mask = kin_cluster >= 0
-    x = x[valid_mask]
-    y = y[valid_mask]
-    v = v[valid_mask]
-    kin_cluster = kin_cluster[valid_mask]
-    prior_probs_array = prior_probs_array[valid_mask]
-
-    # Order clusters by median y descending (bottom = largest y first)
-    clusters_ids = np.unique(kin_cluster)
-    cluster_median_y = {
-        int(c): float(np.median(y[kin_cluster == c])) for c in clusters_ids
-    }
-    ordered_clusters_ids = sorted(
-        clusters_ids, key=lambda c: cluster_median_y[int(c)], reverse=True
-    )
-
-    # === Compute similarity scores with prior clusters
-    # Create a "prior class" assignment based on the sector with highest probability
-    sector_names = list(prior_probability.keys())
-    sector_assignments = np.zeros_like(kin_cluster)
-    for i, point_probs in enumerate(prior_probs_array):
-        sector_assignments[i] = np.argmax(point_probs)
-
-    # Compute similarity metrics
-    ari = adjusted_rand_score(sector_assignments, kin_cluster)
-    ami = adjusted_mutual_info_score(sector_assignments, kin_cluster)
-
-    # === Make final clustering plot after cleaning
-    fig, ax = plt.subplots(1, 1, figsize=(8, 8))
-    ax.imshow(img, alpha=0.5, cmap="gray")
-    colormap = plt.get_cmap("tab10")
-    for i, label in enumerate(clusters_ids):
-        mask = kin_cluster == label
-        ax.scatter(
-            x[mask],
-            y[mask],
-            color=colormap(i),
-            label=f"Cluster {label}",
-            s=10,
-            alpha=0.7,
+    # 1.1. Split disconnected components first
+    if postproc_config.get("split_disconnected_components", True):
+        kin_cluster_grid, split_mapping = split_disconnected_components(
+            kin_cluster_grid, connectivity=connectivity, start_label=0
         )
-    ax.legend(loc="upper right", framealpha=0.9, fontsize=10)
-    ax.set_aspect("equal")
 
-    if valid_scales is not None and len(valid_scales) > 1:
-        stability_str = (
-            f"{stability_score:.2f}" if stability_score is not None else "N/A"
+    # 1.4. Remove small components at grid level
+    if min_cluster_size > 0:
+        kin_cluster_grid = remove_small_grid_components(
+            label_grid=kin_cluster_grid,
+            min_size=min_cluster_size,
+            connectivity=connectivity,
+            merge_strategy="merge",  # or "merge" to assign to nearest neighbor
         )
-        title = f"Combined Clustering (scales: {valid_scales}, stability: {stability_str})\nPrior Agreement: AMI={ami:.2f}"
-    else:
-        title = f"Clustering (scale: {sigma_values[0]})\nPrior Agreement: AMI={ami if ami is not None else 0.0:.2f}"
 
-    ax.set_title(title)
+    # 1.2. Apply morphological operations (erosion + dilation)
+    if erosion_iterations > 0 or dilation_iterations > 0:
+        kin_cluster_grid = apply_morphological_operations(
+            cluster_grid=kin_cluster_grid,
+            erosion_iterations=erosion_iterations,
+            dilation_iterations=dilation_iterations,
+            min_cluster_size=min_cluster_size,
+            connectivity=connectivity,
+        )
+
+    # 1.5. Keep only N largest clusters (on grid)
+    if keep_only_largest_n > 0:
+        kin_cluster_grid = keep_only_largest_clusters(
+            label_grid=kin_cluster_grid,
+            n_largest=keep_only_largest_n,
+            connectivity=connectivity,
+        )
+
+    fig, (ax_before, ax_after) = plt.subplots(1, 2, figsize=(12, 6))
+    plot_clustering_grid(
+        ax=ax_before,
+        img=img,
+        cluster_grid=cluster_grid_before_postproc,
+        X=X_before,
+        Y=Y_before,
+        title="Before Post-Processing",
+        show_legend=True,
+        show_stats=True,
+        alpha=0.5,
+    )
+    plot_clustering_grid(
+        ax=ax_after,
+        img=img,
+        cluster_grid=kin_cluster_grid,
+        X=X,
+        Y=Y,
+        title="After Post-Processing",
+        show_legend=True,
+        show_stats=True,
+        alpha=0.5,
+    )
+    plt.tight_layout()
     plt.savefig(
-        output_dir / f"{base_name}_kinematic_clustering.png",
+        output_dir / f"{base_name}_kinematic_clustering_postproc.jpg",
         dpi=300,
         bbox_inches="tight",
     )
+    plt.close(fig)
 
-    # %% # ===  AUTOMATIC MORPHO-KINEMATIC SECTOR ASSIGNMENT  === #
+    # === STEP 2: Vectorize clusters to polygons ===
+    logger.info("Vectorizing grid clusters to polygons...")
 
-    # Morphokinematic parameters
-    morphokinematic_config = config.get("morphokinematic", {})
-    minor_overlap_threshold = morphokinematic_config.get("minor_overlap_threshold", 0.9)
-    sector_colors = morphokinematic_config.get("sector_colors", None)
-    default_cmap = plt.get_cmap("tab20")
-
-    assignment = auto_assign_mk_sectors(
-        x=x,
-        y=y,
-        kin_cluster=kin_cluster,
-        ordered_clusters_ids=ordered_clusters_ids,
-        overlap_threshold=minor_overlap_threshold,
+    # Fastest (convex shapes only)
+    polygons_from_clusters = vectorize_clusters(
+        kin_cluster_grid, X, Y, method="convex_hull"
     )
+    # polygons_from_clusters = vectorize_clusters(
+    #     kin_cluster_grid,
+    #     X,
+    #     Y,
+    #     method="cell_union",
+    #     buffer_distance=3.0,
+    #     simplify_tolerance=2.0,
+    # )
 
-    mk_label_str = assignment["mk_label_str"]
-    mk_label_id = assignment["mk_label_id"]
-    major_clusters = assignment["major_clusters"]
-    major_label_map = assignment["major_label_map"]
-    minor_parent = assignment["minor_parent"]
-    cluster_to_label = assignment["cluster_to_label"]
-    polygons_major = assignment["polygons_major"]
-    polygons_minor = assignment["polygons_minor"]
+    # === STEP 3: Assign sector letters (A, B, C, D...) ===
+    logger.info("Assigning sector letters to clusters...")
+    assignment_result = assign_sector_labels(
+        cluster_grid=kin_cluster_grid,
+        Y=Y,
+        polygons=polygons_from_clusters,
+        order_by="y_position",  # Options: 'y_position', 'area', 'cluster_id'
+        reverse_order=True,  # True = bottom-to-top (largest Y first)
+        label_prefix="",  # Use '' for A,B,C... or 'S' for S0,S1,S2...
+    )
+    cluster_to_letter = assignment_result["cluster_to_letter"]
+    ordered_clusters_ids = assignment_result["ordered_cluster_ids"]
+    sector_polygons = assignment_result["sector_polygons"]
 
-    label_order = sorted(assignment["label_to_index"].items(), key=lambda kv: kv[1])
-    unique_mk = np.array([lab for lab, _ in label_order], dtype=object)
-    counts = np.array([np.sum(mk_label_str == lab) for lab in unique_mk], dtype=int)
-
-    logger.info("Major sectors: %s", major_label_map)
-    if minor_parent:
-        logger.info(
-            "Minor cluster mapping: %s",
-            {
-                cluster_id: {
-                    "label": cluster_to_label[cluster_id],
-                    "parent": cluster_to_label[parent_id],
-                    "overlap": f"{overlap_ratio:.2f}",
-                }
-                for cluster_id, (parent_id, overlap_ratio) in minor_parent.items()
-            },
-        )
+    # Remove overlaps between sector polygons  (A has priority, then B, then C, etc.)
+    logger.info("Removing overlaps between sector polygons...")
+    ordered_sector_letters = [cluster_to_letter[cid] for cid in ordered_clusters_ids]
+    sector_polygons = remove_polygon_overlaps(
+        polygons=sector_polygons,
+        ordered_labels=ordered_sector_letters,
+        buffer_after_difference=1.0,  # Small buffer to smooth jagged edges
+    )
+    if validate_no_overlaps(sector_polygons, tolerance=1):
+        logger.info("✓ All sector polygons are non-overlapping")
     else:
-        logger.info("No minor clusters detected.")
+        logger.warning("⚠ Some overlaps may remain (check validation)")
 
-    print("Morpho-kinematic assignment summary:")
-    for label, count in zip(unique_mk, counts, strict=False):
-        print(f"  {label}: {count} points")
-
+    # Define colors for sectors
+    morphokinematic_config = config.get("morphokinematic", {})
+    sector_colors = morphokinematic_config.get("sector_colors", None)
+    default_cmap = plt.get_cmap("tab10")
     colors = {}
-    for idx, label in enumerate(unique_mk):
-        if sector_colors is not None:
-            major_key = "".join(filter(str.isalpha, label)) or label
-            color = sector_colors.get(label) or sector_colors.get(major_key)
+    for idx, letter in enumerate(sorted(cluster_to_letter.values())):
+        if sector_colors is not None and letter in sector_colors:
+            colors[letter] = sector_colors[letter]
         else:
-            color = mcolors.to_hex(default_cmap(idx % default_cmap.N))
-        colors[label] = color
+            colors[letter] = mcolors.to_hex(default_cmap(idx % default_cmap.N))
 
+    # Plot morpho-kinematic sectors
     fig, ax = plt.subplots(figsize=(8, 8))
     ax.imshow(img, alpha=0.5, cmap="gray")
-
-    major_labels = [
-        cluster_to_label[cid] for cid in major_clusters if cid in cluster_to_label
-    ]
     legend_patches = {}
-    for label in major_labels:
-        poly = polygons_major.get(label)
+    for letter in sorted(cluster_to_letter.values()):
+        poly = sector_polygons.get(letter)
         if poly is not None:
-            draw_polygon(
-                ax, poly, label, colors.get(label, "#444444"), fill_alpha=0.12, zorder=1
+            draw_polygon(ax, poly, colors[letter], fill_alpha=0.15, zorder=1)
+            legend_patches[letter] = mpatches.Patch(
+                color=colors[letter], label=f"Sector {letter}", alpha=0.5
             )
-            # ensure we have a legend patch for this label
-            legend_patches[label] = mpatches.Patch(
-                color=colors.get(label, "#444444"), label=label, alpha=0.4
-            )
-
-    minor_labels = [label for label in unique_mk if label not in major_labels]
-    for label in minor_labels:
-        poly = polygons_minor.get(label)
-        if poly is not None:
-            draw_polygon(
-                ax, poly, label, colors.get(label, "#888888"), fill_alpha=0.08, zorder=2
-            )
-            if label not in legend_patches:
-                legend_patches[label] = mpatches.Patch(
-                    color=colors.get(label, "#888888"), label=label, alpha=0.25
-                )
-
     if legend_patches:
         ax.legend(
             handles=list(legend_patches.values()),
             labels=list(legend_patches.keys()),
             loc="upper right",
-            fontsize=9,
+            fontsize=10,
             framealpha=0.9,
         )
-    ax.set_title("Morpho-Kinematic Sectors")
+    ax.set_title("Morpho-Kinematic Sectors", fontsize=12)
     ax.set_aspect("equal")
+    ax.set_xticks([])
+    ax.set_yticks([])
     fig.savefig(
-        output_dir / f"{base_name}_mk_sectors_perimeters.png",
+        output_dir / f"{base_name}_morphokinematic_sectors.png",
         dpi=300,
         bbox_inches="tight",
     )
+    plt.close(fig)
 
-    # %% # ===  COMPUTE AND SAVE MORPHO-KINEMATIC SECTOR STATISTICS  === #
-    mk_stats = compute_mk_sector_stats(
-        polygons_major,
-        mk_label_str,
+    # Compute sector statistics
+    velocity_df = df.copy()
+    x = velocity_df["x"].to_numpy()
+    y = velocity_df["y"].to_numpy()
+    v = velocity_df["V"].to_numpy()
+    point_sector_labels = classify_points_by_sectors(
+        polygons=sector_polygons,
         x=x,
         y=y,
-        v=v,
-        img_shape=np.asarray(img).shape if img is not None else None,
-        rasterize=True,
     )
-    mk_stats.to_csv(output_dir / f"{base_name}_mk_sector_stats.csv", index=False)
+    assigned_mask = point_sector_labels != ""
+    x_assigned = x[assigned_mask]
+    y_assigned = y[assigned_mask]
+    v_assigned = v[assigned_mask]
+    labels_assigned = point_sector_labels[assigned_mask]
+    logger.info(
+        f"Using {len(x_assigned)} / {len(x)} assigned points for statistics "
+        f"({100 * len(x_assigned) / len(x):.1f}%)"
+    )
+    mk_stats = compute_sector_stats(
+        polygons=sector_polygons,
+        point_labels=labels_assigned,
+        x=x_assigned,
+        y=y_assigned,
+        v=v_assigned,
+    )
+    mk_stats.to_csv(
+        output_dir / f"{base_name}_morphokinematic_sector_stats.csv",
+        index=False,
+    )
 
-    # ------------------------------
-    # FINAL SUMMARY FIGURE FOR QUICK INSPECTION
-    # create a single figure that contains:
-    #  - velocity field
-    #  - morpho-kinematic perimeters
-    #  - a compact table with mk_stats (top rows)
-    # save it into the detailed output_dir and also copy to a simple quick_inspect folder
-    # TODO: DO NOT REPEAT CODE, MAKE A FUNCTION OUT OF THIS
-    # ------------------------------
-    try:
-        quick_fig, axs = plt.subplots(
-            1,
-            3,
-            figsize=(16, 8),
-            gridspec_kw={"width_ratios": [1.0, 1.0, 0.9]},
-        )
-        ax_vf, ax_mk, ax_table = axs
-        # reduce whitespace around subplots
-        quick_fig.subplots_adjust(
-            left=0.02, right=0.98, top=0.98, bottom=0.02, wspace=0.01, hspace=0.01
-        )
+    logger.info(f"Saved sector statistics: {len(mk_stats)} sectors")
 
-        # 1) Velocity field
-        ax_vf.imshow(img, alpha=0.5, cmap="gray")
-        u_quiv = df["u"].to_numpy()
-        v_quiv = df["v"].to_numpy()
-        mags = np.sqrt(u_quiv**2 + v_quiv**2)
-        ax_vf.quiver(
-            df["x"].to_numpy(),
-            df["y"].to_numpy(),
-            u_quiv,
-            v_quiv,
-            mags,
-            scale=None,
-            scale_units="xy",
-            angles="xy",
-            cmap="viridis",
-            width=0.006,
-            headwidth=2.0,
-        )
-        ax_vf.set_title("Velocity field")
-        ax_vf.set_aspect("equal")
-        ax_vf.set_xticks([])
-        ax_vf.set_yticks([])
+    # %% # ===FINAL  OUTPUTS === #
+    def create_summary_figure(
+        img: np.ndarray,
+        df: pd.DataFrame,
+        mk_stats: pd.DataFrame,
+        polygons: SectorPolygons,
+        colors: dict[str, str],
+        base_name: str,
+        output_dir: Path,
+        *,
+        cluster_to_letter: dict[int, str],
+        figsize: tuple[int, int] = (18, 7),
+        dpi: int = 200,
+        min_cbar_percentile: float = 5.0,
+        max_cbar_percentile: float = 95.0,
+        stat_cols: list[str] | None = None,
+        max_labels_in_table: int = 12,
+    ) -> Path | None:
+        """
+        Create summary figure with:
+          1) Velocity field + vectors
+          2) Sector polygons
+          3) Compact statistics table
 
-        # 2) Morpho-kinematic perimeters
-        ax_mk.imshow(img, alpha=0.5, cmap="gray")
-        legend_patches_quick = {}
-        for label in major_labels:
-            poly = polygons_major.get(label)
-            if poly is not None:
-                draw_polygon(
-                    ax_mk,
-                    poly,
-                    label,
-                    colors.get(label, "#444444"),
-                    fill_alpha=0.10,
-                    zorder=1,
-                )
-                legend_patches_quick[label] = mpatches.Patch(
-                    color=colors.get(label, "#444444"), label=label, alpha=0.4
-                )
-        for label in minor_labels:
-            poly = polygons_minor.get(label)
-            if poly is not None:
-                draw_polygon(
-                    ax_mk,
-                    poly,
-                    label,
-                    colors.get(label, "#888888"),
-                    fill_alpha=0.06,
-                    zorder=2,
-                )
-                if label not in legend_patches_quick:
-                    legend_patches_quick[label] = mpatches.Patch(
-                        color=colors.get(label, "#888888"), label=label, alpha=0.25
-                    )
-        if legend_patches_quick:
-            ax_mk.legend(
-                handles=list(legend_patches_quick.values()),
-                labels=list(legend_patches_quick.keys()),
-                loc="upper right",
-                fontsize=8,
-                framealpha=0.9,
+        Args:
+            img: background image
+            df: dataframe with columns x,y,u,v,V
+            mk_stats: stats dataframe from compute_sector_stats
+            polygons: SectorPolygons (letter -> coords)
+            colors: map {letter: hex_color}
+            cluster_to_letter: cluster id -> letter mapping
+            stat_cols: optional column subset for table
+        """
+        try:
+            if stat_cols is None:
+                stat_cols = [
+                    "label",
+                    "n_points",
+                    "area_px2",
+                    "compactness",
+                    "v_mean",
+                    "v_std",
+                    "v_median",
+                ]
+
+            available = [c for c in stat_cols if c in mk_stats.columns]
+            if "label" not in available:
+                logger.warning("mk_stats has no 'label' column; skipping figure.")
+                return None
+
+            summary_fig = plt.figure(figsize=figsize)
+            gs = summary_fig.add_gridspec(
+                1,
+                3,
+                width_ratios=[1.05, 1.05, 0.9],
+                left=0.02,
+                right=0.98,
+                top=0.93,
+                bottom=0.07,
+                wspace=0.15,
             )
-        ax_mk.set_title("Morpho-kinematic perimeters")
-        ax_mk.set_aspect("equal")
-        ax_mk.set_xticks([])
-        ax_mk.set_yticks([])
 
-        # 3) Compact statistics table from mk_stats
-        ax_table.axis("off")
-        cols = [
-            "label",
-            "area_px2",
-            "centroid_x",
-            "centroid_y",
-            "compactness",
-            "v_mean",
-            "v_std",
-            "v_min",
-            "v_max",
-        ]
-        display_df = mk_stats[cols].copy()
-        # set label as columns and transpose so rows = variables, cols = sector labels
-        display_df = display_df.set_index("label").T.round(2)
+            ax_vf = summary_fig.add_subplot(gs[0, 0])
+            ax_sectors = summary_fig.add_subplot(gs[0, 1])
+            ax_table = summary_fig.add_subplot(gs[0, 2])
 
-        # limit number of sector columns for readability (keep first N if many)
-        max_labels = 8
-        if display_df.shape[1] > max_labels:
-            display_df = display_df.iloc[:, :max_labels]
+            # 1) Velocity field
+            ax_vf.imshow(img, alpha=0.55, cmap="gray")
+            mags = df["V"].to_numpy()
+            vmin = np.percentile(mags, min_cbar_percentile)
+            vmax = np.percentile(mags, max_cbar_percentile)
+            norm = Normalize(vmin=vmin, vmax=vmax)
+            q = ax_vf.quiver(
+                df["x"].to_numpy(),
+                df["y"].to_numpy(),
+                df["u"].to_numpy(),
+                df["v"].to_numpy(),
+                mags,
+                norm=norm,
+                scale=None,
+                scale_units="xy",
+                angles="xy",
+                cmap="viridis",
+                width=0.006,
+                headwidth=2.0,
+            )
+            ax_vf.set_aspect("equal")
+            ax_vf.set_xticks([])
+            ax_vf.set_yticks([])
+            cbar = plt.colorbar(q, ax=ax_vf, fraction=0.046, pad=0.03)
+            cbar.set_label("Velocity [px/day]", rotation=270, labelpad=12, fontsize=8)
+            cbar.ax.tick_params(labelsize=7)
+            ax_vf.set_title("Velocity Field", fontsize=11)
 
-        col_labels = list(display_df.columns)
-        row_labels = list(display_df.index)
+            # 2) Sector polygons
+            ax_sectors.imshow(img, alpha=0.5, cmap="gray")
+            legend_patches = {}
+            for letter in sorted(colors.keys()):
+                coords = polygons.get(letter)
+                if coords is None:
+                    continue
+                draw_polygon(
+                    ax_sectors, coords, colors[letter], fill_alpha=0.13, zorder=1
+                )
+                legend_patches[letter] = mpatches.Patch(
+                    color=colors[letter], label=f"{letter}", alpha=0.55
+                )
+            if legend_patches:
+                ax_sectors.legend(
+                    handles=list(legend_patches.values()),
+                    labels=list(legend_patches.keys()),
+                    loc="upper right",
+                    fontsize=8,
+                    framealpha=0.9,
+                )
+            ax_sectors.set_aspect("equal")
+            ax_sectors.set_xticks([])
+            ax_sectors.set_yticks([])
+            ax_sectors.set_title("Morpho-Kinematic Sectors", fontsize=11)
 
-        table = ax_table.table(
-            cellText=display_df.values,
-            colLabels=col_labels,
-            rowLabels=row_labels,
-            loc="center",
-            cellLoc="center",
-        )
-        table.auto_set_font_size(False)
-        table.set_fontsize(8)
-        table.scale(1, 1.2)
-        ax_table.set_title("Morpho-kinematic stats per sector")
+            # 3) Statistics table
+            ax_table.axis("off")
+            display_df = mk_stats[available].copy()
+            # formatting
+            for c in display_df.columns:
+                if c == "label":
+                    continue
+                if c in {"n_points", "area_px2"}:
+                    display_df[c] = display_df[c].round(0).astype(int)
+                else:
+                    display_df[c] = display_df[c].round(2)
 
-        quick_fig.tight_layout()
+            # limit columns (sector labels) if too many
+            if display_df.shape[0] > max_labels_in_table:
+                display_df = display_df.iloc[:max_labels_in_table, :]
 
-        # Save inside detailed output folder
-        summary_path = output_dir / f"{base_name}_sectors_summary.png"
-        quick_fig.savefig(summary_path, dpi=200, bbox_inches="tight")
-        plt.close(quick_fig)
+            table_df = display_df.set_index("label").T
+            table = ax_table.table(
+                cellText=table_df.values,
+                colLabels=list(table_df.columns),
+                rowLabels=list(table_df.index),
+                loc="center",
+                cellLoc="center",
+            )
+            table.auto_set_font_size(False)
+            table.set_fontsize(7)
+            table.scale(1.05, 1.6)
+            for (i, j), cell in table.get_celld().items():
+                if i == 0 or j == -1:
+                    cell.set_facecolor("#E8E8E8")
+                    cell.set_text_props(weight="bold", size=7)
+                else:
+                    cell.set_facecolor("white")
+            ax_table.set_title("Sector Statistics", fontsize=11, pad=6)
 
-    except Exception as exc:
-        logger.warning("Failed to create quick summary figure: %s", exc)
-        summary_path = None
+            summary_fig.suptitle(base_name, fontsize=13, weight="bold", y=0.985)
 
+            out_path = output_dir / f"{base_name}_sectors_summary.png"
+            summary_fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
+            plt.close(summary_fig)
+            logger.info("Saved summary figure to %s", out_path)
+            return out_path
+
+        except Exception as exc:
+            logger.warning("Failed summary figure: %s", exc, exc_info=True)
+            return None
+
+    def save_sector_results(
+        output_dir: Path,
+        base_name: str,
+        *,
+        sector_polygons: SectorPolygons,
+        cluster_to_letter: dict[int, str],
+        mk_stats: pd.DataFrame,
+        posterior_probs: np.ndarray | None = None,
+        cluster_pred: np.ndarray | None = None,
+        uncertainty: np.ndarray | None = None,
+        img_shape: tuple[int, int] | None = None,
+        export_geojson: bool = True,
+        export_shapefile: bool = False,
+    ) -> dict[str, Path]:
+        """
+        Persist final sector results in reusable formats.
+
+        Saves:
+        - Python bundle (.joblib): mappings, arrays, stats (as dict)
+        - NumPy bundle (.npz): arrays only
+        - GeoJSON (+ optional Shapefile) with Y inverted for GIS (origin bottom-left)
+
+        Args:
+            img_shape: (H, W) used to invert Y for GIS export (y_qgis = H-1 - y)
+
+        Returns:
+            Dict of artifact name -> Path (existing exports only).
+        """
+        artifacts: dict[str, Path] = {}
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1) Pythonized bundle
+        try:
+            bundle = {
+                "cluster_to_letter": cluster_to_letter,
+                "letter_to_cluster": {v: k for k, v in cluster_to_letter.items()},
+                "sector_vertices": {
+                    lab: coords for lab, coords in sector_polygons.items()
+                },
+                "mk_stats": mk_stats.to_dict(orient="list"),
+                "posterior_probs": posterior_probs,
+                "cluster_pred": cluster_pred,
+                "uncertainty": uncertainty,
+            }
+            py_path = output_dir / f"{base_name}_sectors_bundle.joblib"
+            joblib.dump(bundle, py_path)
+            artifacts["python_bundle"] = py_path
+        except Exception as exc:
+            logger.warning(f"Failed saving joblib bundle: {exc}")
+
+        # 2) NumPy arrays
+        try:
+            np_path = output_dir / f"{base_name}_sectors_arrays.npz"
+            np.savez_compressed(
+                np_path,
+                cluster_pred=cluster_pred if cluster_pred is not None else np.array([]),
+                posterior_probs=posterior_probs
+                if posterior_probs is not None
+                else np.array([]),
+                uncertainty=uncertainty if uncertainty is not None else np.array([]),
+            )
+            artifacts["numpy_arrays"] = np_path
+        except Exception as exc:
+            logger.warning(f"Failed saving npz arrays: {exc}")
+
+        # 3) Geo export (GeoJSON / Shapefile)
+        if export_geojson or export_shapefile:
+            if not sector_polygons.geometries:
+                logger.warning("No geometries to export for GIS.")
+                return artifacts
+            try:
+                import geopandas as gpd
+                from shapely.geometry import Polygon
+
+                H = img_shape[0] if (img_shape and len(img_shape) >= 1) else None
+
+                records = []
+                for lab, geom in sector_polygons.geometries.items():
+                    if geom is None or geom.is_empty:
+                        continue
+                    # Invert Y for GIS if possible
+                    if H is not None:
+                        inv_exterior = [
+                            (x, H - 1 - y) for x, y in geom.exterior.coords[:-1]
+                        ]
+                        geom_qgis = Polygon(inv_exterior)
+                    else:
+                        geom_qgis = geom
+                    records.append(
+                        {
+                            "sector": lab,
+                            "n_points": int(
+                                mk_stats.loc[mk_stats["label"] == lab, "n_points"].iloc[
+                                    0
+                                ]
+                                if lab in mk_stats["label"].values
+                                else 0
+                            ),
+                            "area_px2": float(geom.area),
+                            "compactness": float(
+                                (4 * np.pi * geom.area) / (geom.length**2 + 1e-12)
+                            ),
+                            "geometry": geom_qgis,
+                        }
+                    )
+
+                gdf = gpd.GeoDataFrame(records, geometry="geometry", crs=None)
+
+                if export_geojson:
+                    geojson_path = output_dir / f"{base_name}_sectors.geojson"
+                    gdf.to_file(geojson_path, driver="GeoJSON")
+                    artifacts["geojson"] = geojson_path
+
+                if export_shapefile:
+                    shp_dir = output_dir / f"{base_name}_shp"
+                    shp_dir.mkdir(exist_ok=True)
+                    shp_path = shp_dir / f"{base_name}_sectors.shp"
+                    gdf.to_file(shp_path)
+                    artifacts["shapefile"] = shp_path
+
+            except Exception as exc:
+                logger.warning(f"Failed GIS export: {exc}")
+
+        return artifacts
+
+    logger.info("Creating summary figure...")
+    summary_path = create_summary_figure(
+        img=img,
+        df=velocity_df,
+        mk_stats=mk_stats,
+        polygons=sector_polygons,
+        colors=colors,
+        cluster_to_letter=cluster_to_letter,
+        base_name=base_name,
+        output_dir=output_dir,
+        figsize=(18, 7),
+        dpi=200,
+    )
     if summary_path is not None:
-        # Also copy to a simple "summary" folder (no subfolders)
         quick_dir = output_base_dir / "summary"
         quick_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy(summary_path, quick_dir / f"{base_name}_sectors_summary.png")
-        logger.info(
-            "Saved quick summary to %s and copied to %s", summary_path, quick_dir
-        )
+        logger.info("Copied summary figure to %s", quick_dir)
+
+    # After mk_stats creation (right after saving CSV)
+    artifacts = save_sector_results(
+        output_dir=output_dir,
+        base_name=base_name,
+        sector_polygons=sector_polygons,
+        cluster_to_letter=cluster_to_letter,
+        mk_stats=mk_stats,
+        posterior_probs=posterior_probs,
+        cluster_pred=cluster_pred,
+        uncertainty=entropy,  # or use 'uncertainty' if available
+        img_shape=img.shape if img is not None else None,
+        export_geojson=True,
+        export_shapefile=False,
+    )
+    for k, pth in artifacts.items():
+        logger.info(f"Saved {k}: {pth}")
 
 
-# %% # === ENTRY POINT  === #
+# %%
 if __name__ == "__main__":
     import argparse
 

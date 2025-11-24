@@ -8,6 +8,7 @@ data/
 output/
 outputs/
 out/
+deprecated/
 
 # SMB credentials - never commit these!
 smb_credentials.txt

@@ -10,6 +10,7 @@ import pandas as pd
 from sqlalchemy import create_engine
 
 from ppcluster import logger
+from ppcluster.config import ConfigManager
 from ppcluster.griddata import (
     create_2d_grid,
     map_grid_to_points,
@@ -18,7 +19,7 @@ from ppcluster.mcmc import (
     assign_spatial_priors,
     compute_posterior_assignments,
 )
-from ppcluster.mcmc.postproc import (
+from ppcluster.postproc import (
     close_small_holes,
     compute_cluster_statistics_simple,
     plot_1d_velocity_clustering_simple,
@@ -28,7 +29,6 @@ from ppcluster.mcmc.postproc import (
 from ppcluster.preprocessing import (
     apply_dic_filters,
 )
-from ppcluster.config import ConfigManager
 from ppcluster.utils.database import (
     fetch_dic_analysis_ids,
     get_dic_analysis_by_ids,
