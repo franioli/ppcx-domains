@@ -568,6 +568,7 @@ def classify_points_by_sectors(
 
     return labels
 
+
 def compute_sector_stats(
     polygons: SectorPolygons,
     point_labels: ArrayLike,
@@ -633,9 +634,7 @@ def compute_sector_stats(
         perimeter = float(geom.length)
         centroid_x, centroid_y = geom.centroid.coords[0]
         compactness = (
-            (4.0 * np.pi * area) / (perimeter**2 + 1e-12)
-            if perimeter > 0
-            else np.nan
+            (4.0 * np.pi * area) / (perimeter**2 + 1e-12) if perimeter > 0 else np.nan
         )
         point_density = n_points / area if area > 0 else 0.0
 
@@ -694,7 +693,6 @@ def compute_sector_stats(
     )
 
     return df.sort_values("label").reset_index(drop=True)
-)
 
 
 # ============================================================================
