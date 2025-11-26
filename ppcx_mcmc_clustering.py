@@ -322,7 +322,7 @@ def main(reference_date: str | None = None):
     output_base_dir = Path(data_config.get("output_dir", "output"))
 
     # Data selection parameters
-    camera_name = data_config.get("camera_name", "PPCX_Tele")
+    camera_name = data_config.get("camera_name")
     days_before_to_include = data_config.get("days_before_to_include", 0)
     days_after_to_include = data_config.get("days_after_to_include", 0)
     dt_min = data_config.get("dt_min", 72)
@@ -336,12 +336,10 @@ def main(reference_date: str | None = None):
     variables_names = data_config.get("variables_names", ["V"])
 
     # Read roi and spatial priors
-    roi_path = Path(data_config.get("roi_path", "data/roi.xml"))
-    sector_prior_file = Path(
-        data_config.get("sector_prior_file", "data/priors_4_sectors.xml")
+    roi = read_polygons_from_cvat(data_config.get("roi_path"), image_name=None)
+    sectors = read_polygons_from_cvat(
+        data_config.get("sector_prior_file"), image_name=None
     )
-    roi = read_polygons_from_cvat(roi_path, image_name=None)
-    sectors = read_polygons_from_cvat(sector_prior_file, image_name=None)
 
     # Check that at least the reference date or an interval of dates is provided
     if not (reference_date or (reference_start_date and reference_end_date)):
@@ -1155,7 +1153,7 @@ def main(reference_date: str | None = None):
         posterior_probs=posterior_probs,
         cluster_pred=cluster_pred,
         uncertainty=entropy,  # or use 'uncertainty' if available
-        img_shape=img.shape if img is not None else None,
+        img_shape=img.size if img is not None else None,
         export_geojson=True,
         export_shapefile=False,
     )
