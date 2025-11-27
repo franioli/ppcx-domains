@@ -17,6 +17,11 @@ def parse_args():
         help="Comma separated list of reference dates (YYYY-MM-DD). Example: 2020-01-01,2020-02-02",
     )
     group.add_argument(
+        "--date-range",
+        action="store_true",
+        help="Run all consecutive dates between --start and --end (inclusive).",
+    )
+    group.add_argument(
         "--dates-file",
         help="File with one date (YYYY-MM-DD) per line.",
     )
@@ -26,8 +31,12 @@ def parse_args():
         help="Pick N random dates between --start and --end (inclusive).",
     )
 
-    p.add_argument("--start", help="Start date for random sampling (YYYY-MM-DD).")
-    p.add_argument("--end", help="End date for random sampling (YYYY-MM-DD).")
+    p.add_argument(
+        "--start", help="Start date for random sampling or date range (YYYY-MM-DD)."
+    )
+    p.add_argument(
+        "--end", help="End date for random sampling or date range (YYYY-MM-DD)."
+    )
     p.add_argument(
         "--season",
         help="Optional season to restrict random sampling, format 'M-M' (months numeric 1-12 inclusive). Example: --season 6-10 for Jun-Oct.",
@@ -161,6 +170,17 @@ def main():
         dates = [d.strip() for d in args.dates.split(",") if d.strip()]
     elif args.dates_file:
         dates = load_dates_from_file(Path(args.dates_file))
+    elif args.date_range:
+        if not (args.start and args.end):
+            raise SystemExit(
+                "When using --date-range you must provide --start and --end"
+            )
+        sd = datetime.strptime(args.start, "%Y-%m-%d")
+        ed = datetime.strptime(args.end, "%Y-%m-%d")
+        if ed < sd:
+            raise SystemExit("end must be >= start")
+        days = (ed - sd).days + 1
+        dates = [(sd + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
     else:
         if not (args.start and args.end):
             raise SystemExit("When using --random you must provide --start and --end")
