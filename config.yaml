@@ -1,14 +1,14 @@
 # Data selection parameters
 data:
-  output_dir: "output_batch"
-  reference_date: "2016-09-28"
+  output_dir: "output_2021"
+  reference_date: "2021-08-15"
   camera_name: "PPCX_Tele"
   days_before_to_include: 0
   days_after_to_include: 0
-  dt_min: 72  # Minimum time difference between images in hours
-  dt_max: 96  # Maximum time difference between images in hours
+  dt_min: 70  # Minimum time difference between images in hours
+  dt_max: 100  # Maximum time difference between images in hours
   roi_path: "data/roi.xml"
-  sector_prior_file: "data/priors_4_sectors.xml"
+  sector_prior_file: "data/prior_data/2020_4domains_job_24_2025_11_27_13_43_22.zip"
   variables_names: ["V"] # List of variable names to process
 
 # Data preprocessing parameters
@@ -16,9 +16,9 @@ preprocessing:
   subsample_factor: 1 # 2 means keep every 2nd point, 1 means no subsampling
   subsample_method: "regular"  # or 'random'
   filter_kwargs:
+    min_velocity: 0.5
     filter_outliers: false
     tails_percentile: 0.005
-    min_velocity: 0.5
     apply_2d_median: false
     median_window_size: 5
     median_threshold_factor: 3
@@ -76,19 +76,19 @@ mcmc:
 
 # Multi-scale processing parameters
 multiscale:
-  sigma_values: [2]
+  sigma_values: [0] # List of Gaussian sigma values for multi-scale processing (0 means no smoothing)
   aggregation:
     similarity_threshold: 0.7
     overall_threshold: 0.8
 
 # Post-processing parameters
 postprocessing:
-  erosion_iterations: 2      # Number of erosion iterations to disconnect narrow bridges
-  dilation_iterations: 2     # Number of dilation iterations to restore cluster size
+  erosion_iterations: 0      # Number of erosion iterations to disconnect narrow bridges
+  dilation_iterations: 0     # Number of dilation iterations to restore cluster size
   split_disconnected_components: true
-  min_cluster_size: 50      # Minimum number of pixels for a cluster to survive
+  min_cluster_size: 100      # Minimum number of pixels for a cluster to survive
   # min_cluster_size_px: 100  # Minimum cluster size for second pass processing
-  connectivity: 4           # 4 or 8 connectivity for component analysis (for all postproc steps)
+  connectivity: 8           # 4 or 8 connectivity for component analysis (for all postproc steps)
   keep_only_largest_n: 4    # Keep only the largest N clusters, -1 to keep all
 
 # Morpho-kinematic analysis parameters

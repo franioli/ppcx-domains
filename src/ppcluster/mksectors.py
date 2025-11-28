@@ -74,7 +74,7 @@ def vectorize_clusters(
         "convex_hull", "cell_union", "marching_squares", "alphashape"
     ] = "convex_hull",
     buffer_distance: float = 2.0,
-    simplify_tolerance: float = 2.0,
+    simplify_tolerance: float = 0,
     alpha: float = 0.0,
 ) -> SectorPolygons:
     """
@@ -576,8 +576,6 @@ def compute_sector_stats(
     x: ArrayLike,
     y: ArrayLike,
     v: ArrayLike | None = None,
-    rasterize: bool = False,
-    img_shape: tuple[int, int] | None = None,
 ) -> pd.DataFrame:
     """
     Compute descriptive statistics for sector polygons.
@@ -602,13 +600,29 @@ def compute_sector_stats(
         >>> # Then compute stats
         >>> stats = compute_sector_stats(polygons, labels, x=x, y=y, v=velocity)
     """
-    # Normalize inputs
+
+    def _compute_stats(arr: np.ndarray) -> dict[str, float]:
+        """Helper to compute basic statistics."""
+        return {
+            "mean": float(np.mean(arr)),
+            "std": float(np.std(arr)),
+            "median": float(np.median(arr)),
+            "mad": float(np.median(np.abs(arr - np.median(arr)))),
+            "nmad": float(np.median(np.abs(arr - np.median(arr)))) * 1.4826,
+            "min": float(np.min(arr)),
+            "max": float(np.max(arr)),
+            "percentile_5": float(np.percentile(arr, 5)),
+            "percentile_95": float(np.percentile(arr, 95)),
+            "quartile_1": float(np.percentile(arr, 25)),
+            "quartile_3": float(np.percentile(arr, 75)),
+            "iqr": float(np.percentile(arr, 75) - np.percentile(arr, 25)),
+        }
+
+    # Validate inputs
     x_arr = np.asarray(x, dtype=float)
     y_arr = np.asarray(y, dtype=float)
     labels_arr = np.asarray(point_labels, dtype=object)
     v_arr = np.asarray(v, dtype=float) if v is not None else None
-
-    # Validate
     if x_arr.shape != y_arr.shape:
         raise ValueError("x and y must have same shape")
     if labels_arr.shape[0] != x_arr.shape[0]:
@@ -619,7 +633,6 @@ def compute_sector_stats(
         return pd.DataFrame()
 
     rows: list[dict[str, Any]] = []
-
     for sector_label, geom in polygons.geometries.items():
         if geom is None or geom.is_empty or geom.area <= 0:
             logger.debug(f"Skipping sector {sector_label}: invalid geometry")
@@ -639,46 +652,23 @@ def compute_sector_stats(
         point_density = n_points / area if area > 0 else 0.0
 
         # Value statistics
-        v_mean = v_std = v_median = v_min = v_max = np.nan
+        v_stats = {}
         if v_arr is not None and n_points > 0:
             v_sel = v_arr[mask]
             if v_sel.size > 0:
-                v_mean = float(np.mean(v_sel))
-                v_std = float(np.std(v_sel))
-                v_median = float(np.median(v_sel))
-                v_min = float(np.min(v_sel))
-                v_max = float(np.max(v_sel))
-
-        # Pixel count (optional)
-        pixel_count = np.nan
-        if rasterize and img_shape is not None:
-            coords = polygons.get(sector_label)
-            if coords is not None:
-                try:
-                    from skimage.draw import polygon as sk_polygon
-
-                    h, w = img_shape[:2]
-                    rr, cc = sk_polygon(coords[:, 1], coords[:, 0], shape=(h, w))
-                    pixel_count = int(rr.size)
-                except Exception as exc:
-                    logger.debug(f"Rasterization failed for {sector_label}: {exc}")
+                v_stats = _compute_stats(v_sel)
 
         rows.append(
             {
                 "label": sector_label,
                 "n_points": n_points,
                 "area_px2": area,
+                "point_density_pts_per_px2": point_density,
                 "perimeter_px": perimeter,
                 "compactness": compactness,
                 "centroid_x": float(centroid_x),
                 "centroid_y": float(centroid_y),
-                "pixel_count": pixel_count,
-                "point_density_pts_per_px2": point_density,
-                "v_mean": v_mean,
-                "v_std": v_std,
-                "v_median": v_median,
-                "v_min": v_min,
-                "v_max": v_max,
+                **{f"v_{k}": v_stats.get(k, np.nan) for k in v_stats},
             }
         )
 
@@ -686,7 +676,6 @@ def compute_sector_stats(
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
-
     logger.info(
         f"Computed stats for {len(df)} sectors "
         f"(total points: {df['n_points'].sum()} / {len(x_arr)})"

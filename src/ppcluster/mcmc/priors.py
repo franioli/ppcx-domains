@@ -259,5 +259,4 @@ def plot_spatial_priors(
             axes_flat[ia].axis("off")
 
     plt.tight_layout()
-    plt.show()
     return fig, axes

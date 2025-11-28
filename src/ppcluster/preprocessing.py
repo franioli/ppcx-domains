@@ -6,6 +6,7 @@ import pandas as pd
 from scipy import ndimage
 
 from ppcluster.griddata import create_2d_grid_from_df
+from ppcluster.lamma_filter import vector_field_filter  # noqa: F401
 
 logger = logging.getLogger("ppcx")
 RANDOM_SEED = 8927
@@ -293,6 +294,14 @@ def apply_2d_median_filter(
         f"2D median filtering (u,v,V): {len(df)} -> {len(df_filtered)} points (removed {len(df) - len(df_filtered)})"
     )
     return df_filtered
+
+
+def apply_2d_lamma_filter(
+    df: pd.DataFrame,
+    method: str = "Neighbours",
+    k: int | None = None,
+) -> pd.DataFrame:
+    pass
 
 
 # === SPATIAL SUBSAMPLING ===

@@ -9,15 +9,16 @@ output/
 outputs/
 out/
 deprecated/
-
-# SMB credentials - never commit these!
-smb_credentials.txt
+*.out
 plot*/
 output*/
 data*/
 nohup.out
 .log
 .logs/
+
+# SMB credentials - never commit these!
+smb_credentials.txt
 
 # Django #  
 *.log

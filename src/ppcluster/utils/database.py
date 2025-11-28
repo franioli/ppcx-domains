@@ -177,6 +177,9 @@ def fetch_dic_analysis_ids(
 
     query += " ORDER BY DIC.master_timestamp"
 
+    # For debugging
+    logger.debug(f"Executing DIC ID fetch query:\n{query}\nWith params: {params}")
+
     # Read only the dic_id column for efficiency
     df = pd.read_sql(query, db_engine, params=tuple(params), columns=["dic_id"])
     if df.empty:

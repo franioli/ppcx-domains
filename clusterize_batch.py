@@ -70,7 +70,7 @@ def parse_args():
     return p.parse_args()
 
 
-def load_dates_from_file(path: Path):
+def _load_dates_from_file(path: Path):
     dates = []
     with open(path) as fh:
         for r in fh:
@@ -108,7 +108,7 @@ def _parse_months_spec(spec: str):
     return {m for m in out if 1 <= m <= 12}
 
 
-def random_dates_between(
+def _random_dates_between(
     start: str, end: str, n: int, include_months=None, exclude_months=None
 ):
     """
@@ -145,7 +145,41 @@ def random_dates_between(
     return [d.strftime("%Y-%m-%d") for d in picked]
 
 
-def run_one_date(python: str, script: str, date: str, timeout=None):
+def _cleanup_partial_results(date: str):
+    """Remove partial output directories for a failed date."""
+    import shutil
+
+    # Common patterns for output directories
+    patterns = [
+        f"*_{date}_*",
+        f"*{date.replace('-', '_')}*",
+        f"*{date}*",
+    ]
+
+    # Search in common output locations
+    base_dirs = [Path("."), Path("output"), Path("output_" + date[:4])]
+
+    removed = []
+    for base_dir in base_dirs:
+        if not base_dir.exists():
+            continue
+        for pattern in patterns:
+            for folder in base_dir.glob(pattern):
+                if folder.is_dir():
+                    try:
+                        shutil.rmtree(folder)
+                        removed.append(str(folder))
+                        print(f"[CLEANUP] Removed {folder}")
+                    except Exception as exc:
+                        print(f"[CLEANUP] Failed to remove {folder}: {exc}")
+
+    if not removed:
+        print(f"[CLEANUP] No partial results found for {date}")
+
+
+def run_one_date(
+    python: str, script: str, date: str, timeout=None, cleanup_on_failure=False
+):
     cmd = [python, script, "--reference-date", date]
     print(f"[RUN] {' '.join(cmd)}")
     try:
@@ -155,11 +189,15 @@ def run_one_date(python: str, script: str, date: str, timeout=None):
             print(
                 f"[ERR] Date {date} exited {proc.returncode}. stdout/stderr:\n{proc.stdout}\n{proc.stderr}"
             )
+            if cleanup_on_failure:
+                _cleanup_partial_results(date)
         else:
             print(f"[OK] Date {date} completed.")
         return ok, proc.stdout + proc.stderr
     except subprocess.TimeoutExpired:
         print(f"[ERR] Timeout for date {date}")
+        if cleanup_on_failure:
+            _cleanup_partial_results(date)
         return False, "timeout"
 
 
@@ -169,7 +207,7 @@ def main():
     if args.dates:
         dates = [d.strip() for d in args.dates.split(",") if d.strip()]
     elif args.dates_file:
-        dates = load_dates_from_file(Path(args.dates_file))
+        dates = _load_dates_from_file(Path(args.dates_file))
     elif args.date_range:
         if not (args.start and args.end):
             raise SystemExit(
@@ -198,7 +236,7 @@ def main():
         elif args.exclude_months:
             exclude_months = _parse_months_spec(args.exclude_months)
         try:
-            dates = random_dates_between(
+            dates = _random_dates_between(
                 args.start,
                 args.end,
                 args.random,
@@ -238,9 +276,9 @@ def main():
     fail = [d for d, ok in results.items() if not ok]
     print(f"Done. Success: {len(succ)} failed: {len(fail)}")
     if succ:
-        print("Succeeded dates:", succ)
+        print("Succeeded dates:", ", ".join(succ))
     if fail:
-        print("Failed dates:", fail)
+        print("Failed dates:", ", ".join(fail))
 
 
 if __name__ == "__main__":
