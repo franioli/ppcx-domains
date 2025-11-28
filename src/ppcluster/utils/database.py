@@ -343,17 +343,17 @@ def fetch_image_ids(
     """
 
     if date:
-        query += f" AND acquisition_timestamp::date = '{date}'"
+        query += f" AND datetime::date = '{date}'"
     if date_start:
-        query += f" AND acquisition_timestamp::date >= '{date_start}'"
+        query += f" AND datetime::date >= '{date_start}'"
     if date_end:
-        query += f" AND acquisition_timestamp::date <= '{date_end}'"
+        query += f" AND datetime::date <= '{date_end}'"
     if time_of_day:
-        query += f" AND to_char(acquisition_timestamp, 'HH24:MI:SS') = '{time_of_day}'"
+        query += f" AND to_char(datetime, 'HH24:MI:SS') = '{time_of_day}'"
     if time_start:
-        query += f" AND to_char(acquisition_timestamp, 'HH24:MI:SS') >= '{time_start}'"
+        query += f" AND to_char(datetime, 'HH24:MI:SS') >= '{time_start}'"
     if time_end:
-        query += f" AND to_char(acquisition_timestamp, 'HH24:MI:SS') <= '{time_end}'"
+        query += f" AND to_char(datetime, 'HH24:MI:SS') <= '{time_end}'"
     if order_by:
         query += f" ORDER BY {order_by}"
     if limit:
