@@ -5,7 +5,7 @@ from datetime import datetime
 import pandas as pd
 import requests
 from PIL import Image
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 from ppcluster.config import ConfigManager
 
@@ -412,27 +412,27 @@ def get_image(
         img = Image.open(io.BytesIO(response.content))
 
         # Get camera name to check if rotation is needed
-        camera_name = None
+        # camera_name = None
 
-        if config is not None:
-            db_engine = create_engine(config.db_url)
-            query = f"""
-                SELECT camera_name
-                FROM ppcx_app_image as image
-                JOIN ppcx_app_camera as camera
-                ON image.camera_id = camera.id
-                WHERE image.id={image_id};
-            """
-            with db_engine.connect() as conn:
-                result = conn.execute(text(query))
-                camera_name = result.scalar_one_or_none()
-        else:
-            logger.warning(
-                "ConfigManager not provided, cannot check camera name for rotation."
-            )
-        # Rotate if camera_name is Tele (portrait mode)
-        if camera_name is not None and "tele" in camera_name.lower():
-            img = img.rotate(90, expand=True)  # 90° clockwise
+        # if config is not None:
+        #     db_engine = create_engine(config.db_url)
+        #     query = f"""
+        #         SELECT camera_name
+        #         FROM ppcx_app_image as image
+        #         JOIN ppcx_app_camera as camera
+        #         ON image.camera_id = camera.id
+        #         WHERE image.id={image_id};
+        #     """
+        #     with db_engine.connect() as conn:
+        #         result = conn.execute(text(query))
+        #         camera_name = result.scalar_one_or_none()
+        # else:
+        #     logger.warning(
+        #         "ConfigManager not provided, cannot check camera name for rotation."
+        #     )
+        # # Rotate if camera_name is Tele (portrait mode)
+        # if camera_name is not None and "tele" in camera_name.lower():
+        #     img = img.rotate(90, expand=True)  # 90° clockwise
         return img
     else:
         raise ValueError(f"Image with ID {image_id} not found.")

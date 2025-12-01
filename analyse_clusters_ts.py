@@ -412,11 +412,11 @@ def export_statistics_table(results_list: list, output_path: Path):
 def main(args: argparse.Namespace, config_path: Path | None = None):
     config = ConfigManager(config_path) if config_path else ConfigManager()
 
-    input_dir = args.input_dir
+    input_dir = args.dir
     if not input_dir.exists():
         raise FileNotFoundError(f"Input directory not found: {input_dir}")
 
-    output_dir = args.output_dir or (input_dir / "time_series")
+    output_dir = args.out or (input_dir / "time_series")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Find result folders
@@ -457,6 +457,7 @@ def main(args: argparse.Namespace, config_path: Path | None = None):
         valid_results,
         output_dir / "sectors_evolution.png",
         max_dates=args.max_dates,
+        config=config,
     )
 
     # Export combined statistics table
@@ -471,13 +472,15 @@ if __name__ == "__main__":
         description="Analyze time series of clustering results"
     )
     parser.add_argument(
-        "--input-dir",
+        "--dir",
+        "-d",
         type=Path,
         required=True,
         help="Base directory containing result folders (e.g., output)",
     )
     parser.add_argument(
-        "--output-dir",
+        "--out",
+        "-o",
         type=Path,
         default=None,
         help="Output directory for time series plots (default: input_dir/time_series)",
