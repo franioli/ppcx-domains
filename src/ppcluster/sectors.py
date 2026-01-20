@@ -7,6 +7,7 @@ import pandas as pd
 import rasterio.features
 from affine import Affine
 from shapely.geometry import Polygon, shape
+from smoothify import smoothify
 
 logger = logging.getLogger("ppcx")
 
@@ -64,21 +65,6 @@ def vectorize_grid_to_gdf(
     return gdf
 
 
-def split_disconnected_polygons(gdf_in: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """
-    Explodes MultiPolygons into individual Polygons and assigns unique cluster IDs.
-    """
-    # Explode multipolygons to single polygons
-    out = gdf_in.explode(index_parts=False).reset_index(drop=True)
-
-    # Remove empty or invalid geometries
-    out = out[~out.is_empty & out.geometry.notna()].copy()
-
-    # Re-assign unique cluster IDs
-    out["cluster_id"] = range(len(out))
-    return out.reset_index(drop=True)
-
-
 def clean_morphokinematic_sectors(
     gdf_sectors: gpd.GeoDataFrame,
     df_points: pd.DataFrame,
@@ -87,6 +73,12 @@ def clean_morphokinematic_sectors(
     velocity_merge_threshold: float = 1.6,
     target_number_of_sectors: int = 4,
     force_minimum_sectors: bool = True,
+    smooth_geometries: bool = True,
+    raster_res: float | None = None,
+    smooth_iterations: int = 4,
+    merge_collection: bool = True,
+    merge_field: str = "cluster_id",
+    area_tolerance: float = 0.5,
 ) -> gpd.GeoDataFrame:
     """
     Clean polygon sectors by removing isolated ones, merging contained ones,
@@ -95,204 +87,36 @@ def clean_morphokinematic_sectors(
     if gdf_sectors.empty:
         return gdf_sectors
 
-    gdf = gdf_sectors.copy()
-    logger.info(f"Starting sector cleaning with {len(gdf)} sectors.")
+    logger.info(f"Starting sector cleaning with {len(gdf_sectors)} sectors.")
 
-    # ---------------------------------------------------------
-    # Step 0: Pre-processing
-    # ---------------------------------------------------------
-    # Ensure we work with single polygons (no MultiPolygons)
-    gdf = split_disconnected_polygons(gdf)
-    logger.info(f"After exploding multipolygons: {len(gdf)} sectors.")
+    # 1. Pre-processing (Split multipolygons, remove small noise)
+    gdf = _filter_small_sectors(gdf_sectors, min_area_px2)
 
-    # Remove very small noise polygons immediately
-    gdf["area"] = gdf.geometry.area
-    n_before = len(gdf)
-    gdf = gdf[gdf["area"] >= min_area_px2].reset_index(drop=True)
-    if len(gdf) < n_before:
-        logger.info(
-            f"Removed {n_before - len(gdf)} small noise polygons (< {min_area_px2} px²)"
-        )
+    # 2. Remove Isolated Polygons
+    gdf = _remove_isolated_sectors(gdf, isolation_buffer)
 
-    # ---------------------------------------------------------
-    # Step 1: Remove Isolated Polygons
-    # ---------------------------------------------------------
-    # Logic: If a buffered polygon doesn't touch any other, it's an outlier.
-    keep_indices = []
-    for idx in gdf.index:
-        geom = gdf.geometry[idx]
-        # Buffer slightly to check proximity
-        buffered = geom.buffer(isolation_buffer)
+    # 3. Merge Contained Polygons (Hole-Filling)
+    gdf = _merge_contained_sectors(gdf)
 
-        others = gdf.drop(idx)
-        if others.empty:
-            keep_indices.append(idx)  # Only one exists, keep it
-        elif others.geometry.intersects(buffered).any():
-            keep_indices.append(idx)  # Connected
-        else:
-            logger.info(f"Removing isolated sector ID {idx} (area={geom.area:.0f})")
-
-    gdf = gdf.loc[keep_indices].reset_index(drop=True)
-
-    # ---------------------------------------------------------
-    # Step 2: Merge Contained Polygons (Hole-Filling)
-    # ---------------------------------------------------------
-    # Logic: If A is inside B (or fills a hole in B), merge A into B.
-    # We use a while loop to handle nested cases safely.
-    changed = True
-    while changed:
-        changed = False
-        for i in gdf.index:
-            geom_i = gdf.geometry[i]
-
-            # Check against all other polygons
-            for j in gdf.index:
-                if i == j:
-                    continue
-
-                geom_j = gdf.geometry[j]
-
-                # Check 1: Strict containment
-                is_contained = geom_i.within(geom_j)
-                # Check 2: Hole filling (matches one of the interiors)
-                is_hole = any(
-                    Polygon(interior).equals(geom_i) for interior in geom_j.interiors
-                )
-
-                if is_contained or is_hole:
-                    logger.info(f"Merging polygon {i} into container {j}")
-                    # Update geometry of J to include I
-                    gdf.at[j, "geometry"] = geom_j.union(geom_i)
-                    # Remove I
-                    gdf = gdf.drop(i).reset_index(drop=True)
-                    changed = True
-                    break  # Break inner loop, restart outer loop
-            if changed:
-                break
-
-    # ---------------------------------------------------------
-    # Step 3: Iterative Statistical Merging
-    # ---------------------------------------------------------
-    # Prepare point data for velocity stats
-    gdf_pts = gpd.GeoDataFrame(
-        df_points, geometry=gpd.points_from_xy(df_points["x"], df_points["y"])
+    # 4. Iterative Statistical Merging
+    gdf = _merge_sectors_by_velocity(
+        gdf, df_points, velocity_merge_threshold, target_number_of_sectors
     )
 
-    # Initial Spatial Join (Expensive, done once)
-    # We track points by index to update their cluster assignment cheaply later
-    pts_joined = gpd.sjoin(gdf_pts, gdf[["geometry"]], how="inner", predicate="within")
-    # index_right corresponds to the dataframe index in `gdf`
+    # 5. Final Force Limit
+    if force_minimum_sectors:
+        gdf = _enforce_sector_limit(gdf, target_number_of_sectors)
 
-    def get_robust_stats(values):
-        if len(values) == 0:
-            return 0.0, 1.0  # default/safe return
-        med = np.median(values)
-        # NMAD = 1.4826 * median(|x - median|)
-        nmad = 1.4826 * np.median(np.abs(values - med))
-        return med, nmad
-
-    while len(gdf) > target_number_of_sectors:
-        gdf["area"] = gdf.geometry.area
-
-        # Identify candidate: The smallest remaining sector
-        idx_small = gdf["area"].idxmin()
-        geom_small = gdf.geometry[idx_small]
-
-        # Get stats for candidate
-        # Note: pts_joined['index_right'] matches gdf index
-        vals_small = pts_joined.loc[pts_joined["index_right"] == idx_small, "V"].values
-        med_small, nmad_small = get_robust_stats(vals_small)
-
-        logger.info(
-            f"Checking smallest sector {idx_small}: Area={gdf.at[idx_small, 'area']:.0f}, V={med_small:.2f}±{nmad_small:.2f}"
-        )
-
-        # Find Neighbors
-        # Small buffer proportional to size to find touching polygons
-        search_geom = geom_small.buffer(np.sqrt(gdf.at[idx_small, "area"]) * 0.05)
-
-        best_neighbor = None
-        min_score = float("inf")
-
-        for idx_other in gdf.index:
-            if idx_other == idx_small:
-                continue
-
-            # Must be spatially adjacent
-            if not search_geom.intersects(gdf.geometry[idx_other]):
-                continue
-
-            # Get neighbor stats
-            vals_other = pts_joined.loc[
-                pts_joined["index_right"] == idx_other, "V"
-            ].values
-            med_other, nmad_other = get_robust_stats(vals_other)
-
-            # Robust Z-Score: |Diff| / Combined_Sigma
-            sigma_comb = np.sqrt(nmad_small**2 + nmad_other**2) + 1e-6
-            z_score = abs(med_small - med_other) / sigma_comb
-
-            logger.info(
-                f" -> Neighbor {idx_other}: V={med_other:.2f}, Z-score={z_score:.2f}"
-            )
-
-            # Check threshold
-            if z_score < velocity_merge_threshold:
-                if z_score < min_score:
-                    min_score = z_score
-                    best_neighbor = idx_other
-
-        # Perform Merge if compatible neighbor found
-        if best_neighbor is not None:
-            logger.info(
-                f"Merging {idx_small} -> {best_neighbor} (Score={min_score:.2f})"
-            )
-
-            # Union Geometries
-            geom_new = gdf.geometry[best_neighbor].union(geom_small)
-            gdf.at[best_neighbor, "geometry"] = geom_new
-
-            # Update points reference: move points from small -> neighbor
-            # This avoids re-running sjoin
-            mask_pts = pts_joined["index_right"] == idx_small
-            pts_joined.loc[mask_pts, "index_right"] = best_neighbor
-
-            # Remove small sector
-            # Note: Drop changes indices, so we must update pts_joined indices too!
-            # IMPORTANT: Resetting index usually breaks external references.
-            # Strategy: Map old indices to new indices.
-
-            old_indices = gdf.index.tolist()
-            old_indices.remove(idx_small)  # This index is gone
-
-            gdf = gdf.drop(idx_small).reset_index(drop=True)
-
-            # Create map: old_index -> new_index
-            # Since we reset index, the remaining rows just shift up.
-            # old_indices[0] becomes 0, old_indices[1] becomes 1...
-            idx_map = {old: new for new, old in enumerate(old_indices)}
-
-            # Update points dataframe to match new gdf indices
-            pts_joined["index_right"] = pts_joined["index_right"].map(idx_map)
-
-            # Clean up any points that belonged to dropped sector but weren't reassigned (shouldn't happen here)
-            pts_joined = pts_joined.dropna(subset=["index_right"])
-
-        else:
-            logger.info("No compatible neighbor found. Stopping iterative merge.")
-            break
-
-    # ---------------------------------------------------------
-    # Step 4: Final Force Limit (Optional)
-    # ---------------------------------------------------------
-    logger.info(f"Sectors remaining: {len(gdf)}")
-    if force_minimum_sectors and len(gdf) > target_number_of_sectors:
-        logger.info(
-            f"Forcing reduction to {target_number_of_sectors} sectors (keeping largest)."
-        )
-        gdf["area"] = gdf.geometry.area
-        gdf = gdf.nlargest(target_number_of_sectors, columns="area").reset_index(
-            drop=True
+    # 6. Smooth Geometries (optional)
+    if smooth_geometries:
+        gdf = smoothify(
+            gdf,
+            segment_length=raster_res,
+            smooth_iterations=smooth_iterations,
+            merge_collection=merge_collection,
+            merge_field=merge_field,
+            num_cores=target_number_of_sectors,
+            area_tolerance=area_tolerance,
         )
 
     return gdf
@@ -520,3 +344,192 @@ def compute_sector_stats(
     )
 
     return df
+
+
+# ================= Helper Functions for Cleaning =================#
+def split_disconnected_polygons(gdf_in: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """
+    Explodes MultiPolygons into individual Polygons and assigns unique cluster IDs.
+    """
+    # Explode multipolygons to single polygons
+    out = gdf_in.explode(index_parts=False).reset_index(drop=True)
+
+    # Remove empty or invalid geometries
+    out = out[~out.is_empty & out.geometry.notna()].copy()
+
+    # Re-assign unique cluster IDs
+    out["cluster_id"] = range(len(out))
+    return out.reset_index(drop=True)
+
+
+def _filter_small_sectors(
+    gdf: gpd.GeoDataFrame, min_area_px2: float
+) -> gpd.GeoDataFrame:
+    """Explode multipolygons and remove those smaller than threshold."""
+    # Ensure we work with single polygons
+    gdf = split_disconnected_polygons(gdf)
+    logger.info(f"After exploding multipolygons: {len(gdf)} sectors.")
+
+    # Remove very small noise polygons
+    gdf["area"] = gdf.geometry.area
+    n_before = len(gdf)
+    gdf_clean = gdf[gdf["area"] >= min_area_px2].reset_index(drop=True)
+
+    if len(gdf_clean) < n_before:
+        logger.info(
+            f"Removed {n_before - len(gdf_clean)} small noise polygons (< {min_area_px2} px²)"
+        )
+    return gdf_clean
+
+
+def _remove_isolated_sectors(
+    gdf: gpd.GeoDataFrame, isolation_buffer: float
+) -> gpd.GeoDataFrame:
+    """Remove polygons that do not intersect with any other polygon (buffered)."""
+    keep_indices = []
+    for idx in gdf.index:
+        geom = gdf.geometry[idx]
+        buffered = geom.buffer(isolation_buffer)
+        others = gdf.drop(idx)
+
+        if others.empty or others.geometry.intersects(buffered).any():
+            keep_indices.append(idx)
+        else:
+            logger.info(f"Removing isolated sector ID {idx} (area={geom.area:.0f})")
+
+    return gdf.loc[keep_indices].reset_index(drop=True)
+
+
+def _merge_contained_sectors(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Diffusely merge polygons contained within others or filling holes."""
+    gdf = gdf.copy()
+    changed = True
+    while changed:
+        changed = False
+        for i in gdf.index:
+            geom_i = gdf.geometry[i]
+            for j in gdf.index:
+                if i == j:
+                    continue
+
+                geom_j = gdf.geometry[j]
+
+                # Check strict containment or hole filling
+                is_contained = geom_i.within(geom_j)
+                is_hole = any(
+                    Polygon(interior).equals(geom_i) for interior in geom_j.interiors
+                )
+
+                if is_contained or is_hole:
+                    logger.info(f"Merging polygon {i} into container {j}")
+                    gdf.at[j, "geometry"] = geom_j.union(geom_i)
+                    gdf = gdf.drop(i).reset_index(drop=True)
+                    changed = True
+                    break
+            if changed:
+                break
+    return gdf
+
+
+def _merge_sectors_by_velocity(
+    gdf: gpd.GeoDataFrame,
+    df_points: pd.DataFrame,
+    threshold: float,
+    target_n: int,
+) -> gpd.GeoDataFrame:
+    """Iteratively merge sectors based on velocity similarity until target is reached."""
+
+    def _get_robust_stats(values: np.ndarray) -> tuple[float, float]:
+        """Calculate median and NMAD for robust statistics."""
+        if len(values) == 0:
+            return 0.0, 1.0
+        med = np.median(values)
+        nmad = 1.4826 * np.median(np.abs(values - med))
+        return med, nmad
+
+    gdf = gdf.copy()
+
+    # Prepare point data
+    gdf_pts = gpd.GeoDataFrame(
+        df_points, geometry=gpd.points_from_xy(df_points["x"], df_points["y"])
+    )
+    # Initial Spatial Join
+    pts_joined = gpd.sjoin(gdf_pts, gdf[["geometry"]], how="inner", predicate="within")
+
+    while len(gdf) > target_n:
+        gdf["area"] = gdf.geometry.area
+        idx_small = gdf["area"].idxmin()
+        geom_small = gdf.geometry[idx_small]
+
+        # Get stats for candidate
+        vals_small = pts_joined.loc[pts_joined["index_right"] == idx_small, "V"].values
+        med_small, nmad_small = _get_robust_stats(vals_small)
+
+        logger.info(
+            f"Checking smallest sector {idx_small}: Area={gdf.at[idx_small, 'area']:.0f}, V={med_small:.2f}±{nmad_small:.2f}"
+        )
+
+        # Search Neighbors
+        search_geom = geom_small.buffer(np.sqrt(gdf.at[idx_small, "area"]) * 0.05)
+        best_neighbor = None
+        min_score = float("inf")
+
+        for idx_other in gdf.index:
+            if idx_other == idx_small:
+                continue
+            if not search_geom.intersects(gdf.geometry[idx_other]):
+                continue
+
+            # Compare stats
+            vals_other = pts_joined.loc[
+                pts_joined["index_right"] == idx_other, "V"
+            ].values
+            med_other, nmad_other = _get_robust_stats(vals_other)
+
+            sigma_comb = np.sqrt(nmad_small**2 + nmad_other**2) + 1e-6
+            z_score = abs(med_small - med_other) / sigma_comb
+
+            logger.info(
+                f" -> Neighbor {idx_other}: V={med_other:.2f}, Z-score={z_score:.2f}"
+            )
+
+            if z_score < threshold and z_score < min_score:
+                min_score = z_score
+                best_neighbor = idx_other
+
+        # Merge or Stop
+        if best_neighbor is not None:
+            logger.info(
+                f"Merging {idx_small} -> {best_neighbor} (Score={min_score:.2f})"
+            )
+            # Union
+            gdf.at[best_neighbor, "geometry"] = gdf.geometry[best_neighbor].union(
+                geom_small
+            )
+
+            # Update Point references used for stats calculation
+            mask_pts = pts_joined["index_right"] == idx_small
+            pts_joined.loc[mask_pts, "index_right"] = best_neighbor
+
+            # Handle index shift due to drop
+            old_indices = gdf.index.tolist()
+            old_indices.remove(idx_small)
+            gdf = gdf.drop(idx_small).reset_index(drop=True)
+
+            idx_map = {old: new for new, old in enumerate(old_indices)}
+            pts_joined["index_right"] = pts_joined["index_right"].map(idx_map)
+            pts_joined = pts_joined.dropna(subset=["index_right"])
+        else:
+            logger.info("No compatible neighbor found. Stopping iterative merge.")
+            break
+
+    return gdf
+
+
+def _enforce_sector_limit(gdf: gpd.GeoDataFrame, limit: int) -> gpd.GeoDataFrame:
+    """Force reduction to N sectors by keeping the largest by area."""
+    if len(gdf) > limit:
+        logger.info(f"Forcing reduction to {limit} sectors (keeping largest).")
+        gdf["area"] = gdf.geometry.area
+        return gdf.nlargest(limit, columns="area").reset_index(drop=True)
+    return gdf

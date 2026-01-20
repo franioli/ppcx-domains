@@ -15,7 +15,6 @@ from matplotlib import pyplot as plt
 from matplotlib.colors import Normalize
 from shapely.geometry import Polygon
 from sklearn.preprocessing import StandardScaler
-from smoothify import smoothify
 from sqlalchemy import create_engine
 
 from ppcluster import load_config, mcmc, setup_logger
@@ -24,14 +23,7 @@ from ppcluster.cvat import (
     read_polygons_from_cvat,
 )
 from ppcluster.griddata import create_2d_grid
-from ppcluster.postproc import (
-    aggregate_multiscale_clustering,
-    apply_morphological_operations,
-    keep_only_largest_clusters,
-    plot_clustering_grid,
-    remove_small_grid_components,
-    split_disconnected_components,
-)
+from ppcluster.postproc import aggregate_multiscale_clustering, plot_clustering_grid
 from ppcluster.preprocessing import (
     apply_2d_gaussian_filter,
     apply_dic_filters,
@@ -58,8 +50,6 @@ HEADLESS = True  # set to True when running in non-GUI environment
 
 if HEADLESS:
     plt.switch_backend("Agg")
-else:
-    plt.switch_backend("QtAgg")
 
 
 def run_mcmc_clustering(
@@ -294,131 +284,6 @@ def run_mcmc_clustering(
 
     plt.close("all")
     return result
-
-
-def apply_cluster_grid_cleaning(
-    X: np.ndarray,
-    Y: np.ndarray,
-    clusters: np.ndarray,
-    config: dict,
-    output_dir: Path,
-    base_name: str,
-    img: np.ndarray | None = None,
-) -> np.ndarray:
-    """
-    Apply morphological operations and cleaning to the cluster grid.
-    Refines clusters, removing noise and small components.
-
-    Args:
-        X, Y: 2D meshgrid arrays of point coordinates
-        clusters: 2D array of cluster labels on the grid
-        config: post-processing configuration parameters
-        output_dir: directory to save outputs
-        base_name: base name for output files
-        img: optional background image for plotting
-
-    Returns:
-        Refined cluster grid as 2D numpy array.
-    """
-
-    # Retrieve post-processing parameters
-    do_split = config.get("split_disconnected_components", True)
-    erosion_iters = config.get("erosion_iterations", 0)
-    dilation_iters = config.get("dilation_iterations", 0)
-    connectivity = config.get("connectivity", 8)
-    min_cluster_size = config.get("min_cluster_size", 0)
-    keep_only_largest_n = config.get("keep_only_largest_n", 0)
-
-    logger.info(
-        f"Post-proc params: erosion={erosion_iters}, "
-        f"dilation={dilation_iters}, min_size={min_cluster_size}"
-    )
-
-    # Store pre-postprocessing grid for comparison
-    cluster_before = clusters.copy()
-
-    # Split disconnected components first
-    if do_split:
-        clusters, _ = split_disconnected_components(
-            clusters,
-            connectivity=connectivity,
-            start_label=0,
-        )
-
-    # Remove very small components and merge to nearest neighbor
-    clusters = remove_small_grid_components(
-        label_grid=clusters,
-        min_size=20,  # initial removal threshold to clean noise (hard-coded)
-        connectivity=connectivity,
-        merge_strategy="merge",  # merge small components to nearest neighbor
-    )
-
-    # Apply morphological operations (erosion + dilation)
-    if erosion_iters > 0 or dilation_iters > 0:
-        clusters = apply_morphological_operations(
-            cluster_grid=clusters,
-            erosion_iterations=erosion_iters,
-            dilation_iterations=dilation_iters,
-            min_cluster_size=min_cluster_size,
-            connectivity=connectivity,
-        )
-    # Remove small components again after morph operations (do not merge)
-    if min_cluster_size > 0:
-        clusters = remove_small_grid_components(
-            label_grid=clusters,
-            min_size=min_cluster_size,
-            connectivity=connectivity,
-            merge_strategy="remove",  # or "merge" to assign to nearest neighbor
-        )
-
-    # Keep only N largest clusters (on grid)
-    if keep_only_largest_n > 0:
-        clusters = keep_only_largest_clusters(
-            label_grid=clusters,
-            n_largest=keep_only_largest_n,
-            connectivity=connectivity,
-        )
-
-    # Plot comparison before/after post-processing
-    if img is not None:
-        fig, (ax_before, ax_after) = plt.subplots(1, 2, figsize=(12, 6))
-        plot_clustering_grid(
-            ax=ax_before,
-            img=img,
-            cluster_grid=cluster_before,
-            X=X,
-            Y=Y,
-            title="Before Post-Processing",
-            show_legend=True,
-            show_stats=True,
-            alpha=0.5,
-        )
-        plot_clustering_grid(
-            ax=ax_after,
-            img=img,
-            cluster_grid=clusters,
-            X=X,
-            Y=Y,
-            title="After Post-Processing",
-            show_legend=True,
-            show_stats=True,
-            alpha=0.5,
-        )
-        plt.tight_layout()
-        plt.savefig(
-            output_dir / f"{base_name}_kinematic_clustering_postproc.jpg",
-            dpi=300,
-            bbox_inches="tight",
-        )
-        plt.close(fig)
-
-    # Save cleaned grid result to file for inspection
-    dump_data = {"X": X, "Y": Y, "kin_cluster_grid": clusters}
-    joblib.dump(
-        dump_data, output_dir / f"{base_name}_kinematic_clustering_cleaned.joblib"
-    )
-
-    return clusters
 
 
 def plot_kinematic_sectors(
@@ -1014,7 +879,8 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
     X, Y, kin_cluster_grid = create_2d_grid(x=x, y=y, labels=kin_cluster)
     raster_res = abs(float(X[0, 1] - X[0, 0]) if X.shape[1] > 1 else 1.0)
 
-    # Apply morphological cleaning to the cluster grid # NOTE: Replaced by better vector-based cleaning below
+    # Apply morphological cleaning to the cluster grid
+    # NOTE: Replaced by better vector-based cleaning below
     # kin_cluster_grid = apply_cluster_grid_cleaning(
     #     X=X,
     #     Y=Y,
@@ -1028,21 +894,7 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
     # ===  KINEMATIC SECTORS COMPUTATION ===
 
     # 1. Vectorize & Smooth
-
     logger.info("Vectorizing grid clusters to polygons...")
-
-    def _plot_sct(gdf, path):
-        fig, ax = plt.subplots()
-        gdf.plot(
-            ax=ax, column="cluster_id", legend=True, edgecolor="black", cmap="tab10"
-        )
-        ax.set_title(f"Sectors (n={len(gdf)})")
-        ax.invert_yaxis()
-        ax.set_aspect("equal")
-        ax.axis("off")
-        fig.savefig(path)
-        plt.close(fig)
-
     sectors = vectorize_grid_to_gdf(kin_cluster_grid, X, Y)
     sectors_cleaned = clean_morphokinematic_sectors(
         sectors,
@@ -1051,19 +903,53 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
         isolation_buffer=30.0,
         velocity_merge_threshold=1.6,
         target_number_of_sectors=4,
-        force_minimum_sectors=True,
-    )
-
-    # Classify the original points dataframe
-    sectors_cleaned = smoothify(
-        sectors_cleaned,
-        segment_length=raster_res,
+        smooth_geometries=True,
+        raster_res=raster_res,
         smooth_iterations=4,
         merge_collection=True,
         merge_field="cluster_id",
-        num_cores=4,
-        area_tolerance=0.5,
     )
+
+    # Plot raw clusters vs vectorized sectors
+    fig, (ax_raw, ax_vectorized) = plt.subplots(1, 2, figsize=(14, 7))
+    plot_clustering_grid(
+        ax=ax_raw,
+        img=img,
+        cluster_grid=kin_cluster_grid,
+        X=X,
+        Y=Y,
+        title="Raw clustering assignments",
+        show_legend=True,
+        show_stats=True,
+        alpha=0.6,
+    )
+    # Plot vectorized sectors
+    if not sectors_cleaned.empty:
+        ax_vectorized.imshow(img)
+        sectors_cleaned.plot(
+            ax=ax_vectorized,
+            column="cluster_id",
+            cmap="tab10",
+            alpha=0.25,
+            linewidth=0,
+        )
+        sectors_cleaned.plot(
+            ax=ax_vectorized,
+            column="cluster_id",
+            cmap="tab10",
+            facecolor="none",
+            linewidth=2.0,
+            alpha=1.0,
+        )
+        ax_vectorized.set_title(
+            f"Cleaned Vectorized Sectors (n={len(sectors_cleaned)})"
+        )
+        ax_vectorized.axis("off")
+    fig.tight_layout()
+    fig.savefig(
+        output_dir / f"{base_name}_kinematic_clustering_raw_vs_vectorized.png", dpi=150
+    )
+    plt.close(fig)
 
     # 2. Assign Labels (A, B, C...)
     # We use the centroid Y position to order sectors from bottom to top (A=lowest Y)
@@ -1074,23 +960,19 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
         ascending=postproc_config.sector_assignment.ascending,
     )
 
-    # === Compute sector statistics ===
-    # Classify the original points dataframe
+    # 3. Classify the original points dataframe and compute statistics
     pts_by_sector = classify_points_by_polygons(
         sectors_cleaned, dic_df, x_col="x", y_col="y"
     )
-
     # rename 'label' to 'sector'
     if "label" in pts_by_sector.columns and "sector" not in pts_by_sector.columns:
         pts_by_sector = pts_by_sector.rename(columns={"label": "sector"})
-
-    # Compute table
+    # Compute statistics
     mk_stats = compute_sector_stats(sectors_cleaned, pts_by_sector, value_col="V")
     mk_stats.to_csv(output_dir / f"{base_name}_kinematic_sector_stats.csv", index=False)
-
     logger.info(f"Saved sector statistics: {len(mk_stats)} sectors")
 
-    # --- Plot Kinematic Sectors ---
+    # 4. Plot summary figure
     logger.info("Creating summary figure...")
     sector_colors = postproc_config.sector_assignment.sector_colors
     sector_figure_path = plot_kinematic_sectors(
@@ -1108,7 +990,8 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
         shutil.copy(sector_figure_path, sector_figures_dir / f"{base_name}_sectors.png")
         logger.info(f"Copied summary figure to {sector_figures_dir}")
 
-    # Save artifacts
+    # 5. Save final results
+    logger.info("Saving final sector results...")
     artifacts = save_sector_results(
         output_dir=output_dir,
         base_name=base_name,

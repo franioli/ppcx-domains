@@ -14,6 +14,125 @@ from sklearn.metrics import adjusted_rand_score
 logger = logging.getLogger("ppcx")
 
 
+def apply_cluster_grid_cleaning(
+    X: np.ndarray,
+    Y: np.ndarray,
+    clusters: np.ndarray,
+    config: dict,
+    output_dir: Path,
+    base_name: str,
+    img: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    Apply morphological operations and cleaning to the cluster grid.
+    Refines clusters, removing noise and small components.
+
+    Args:
+        X, Y: 2D meshgrid arrays of point coordinates
+        clusters: 2D array of cluster labels on the grid
+        config: post-processing configuration parameters
+        output_dir: directory to save outputs
+        base_name: base name for output files
+        img: optional background image for plotting
+
+    Returns:
+        Refined cluster grid as 2D numpy array.
+    """
+
+    # Retrieve post-processing parameters
+    do_split = config.get("split_disconnected_components", True)
+    erosion_iters = config.get("erosion_iterations", 0)
+    dilation_iters = config.get("dilation_iterations", 0)
+    connectivity = config.get("connectivity", 8)
+    min_cluster_size = config.get("min_cluster_size", 0)
+    keep_only_largest_n = config.get("keep_only_largest_n", 0)
+
+    logger.info(
+        f"Post-proc params: erosion={erosion_iters}, "
+        f"dilation={dilation_iters}, min_size={min_cluster_size}"
+    )
+
+    # Store pre-postprocessing grid for comparison
+    cluster_before = clusters.copy()
+
+    # Split disconnected components first
+    if do_split:
+        clusters, _ = split_disconnected_components(
+            clusters,
+            connectivity=connectivity,
+            start_label=0,
+        )
+
+    # Remove very small components and merge to nearest neighbor
+    clusters = remove_small_grid_components(
+        label_grid=clusters,
+        min_size=20,  # initial removal threshold to clean noise (hard-coded)
+        connectivity=connectivity,
+        merge_strategy="merge",  # merge small components to nearest neighbor
+    )
+
+    # Apply morphological operations (erosion + dilation)
+    if erosion_iters > 0 or dilation_iters > 0:
+        clusters = apply_morphological_operations(
+            cluster_grid=clusters,
+            erosion_iterations=erosion_iters,
+            dilation_iterations=dilation_iters,
+            min_cluster_size=min_cluster_size,
+            connectivity=connectivity,
+        )
+    # Remove small components again after morph operations (do not merge)
+    if min_cluster_size > 0:
+        clusters = remove_small_grid_components(
+            label_grid=clusters,
+            min_size=min_cluster_size,
+            connectivity=connectivity,
+            merge_strategy="remove",  # or "merge" to assign to nearest neighbor
+        )
+
+    # Keep only N largest clusters (on grid)
+    if keep_only_largest_n > 0:
+        clusters = keep_only_largest_clusters(
+            label_grid=clusters,
+            n_largest=keep_only_largest_n,
+            connectivity=connectivity,
+        )
+
+    # Plot comparison before/after post-processing
+    if img is not None:
+        fig, (ax_before, ax_after) = plt.subplots(1, 2, figsize=(12, 6))
+        plot_clustering_grid(
+            ax=ax_before,
+            img=img,
+            cluster_grid=cluster_before,
+            X=X,
+            Y=Y,
+            title="Before Post-Processing",
+            show_legend=True,
+            show_stats=True,
+            alpha=0.5,
+        )
+        plot_clustering_grid(
+            ax=ax_after,
+            img=img,
+            cluster_grid=clusters,
+            X=X,
+            Y=Y,
+            title="After Post-Processing",
+            show_legend=True,
+            show_stats=True,
+            alpha=0.5,
+        )
+        plt.tight_layout()
+        plt.savefig(
+            output_dir / f"{base_name}_kinematic_clustering_postproc.jpg",
+            dpi=300,
+            bbox_inches="tight",
+        )
+        plt.close(fig)
+
+    return clusters
+
+
 # === GRID data filtering ===
 
 
