@@ -97,7 +97,8 @@ postprocessing:
     buffer_distance: 2.0
     simplify_tolerance: 0.0
   sector_assignment:
-    # method: "centroid"  # "centroid" | "max_overlap"
+    method: "y_centroid"
+    ascending: false      # False if sector A is at the bottom (lowest Y), True otherwise (the y axis is inverted in image coordinates (0 at top))
     sector_colors:
       A: "#b3140b"
       B: "#ee9c21"

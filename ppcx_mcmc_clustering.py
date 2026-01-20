@@ -5,15 +5,11 @@ from datetime import datetime
 from pathlib import Path
 
 import arviz as az
-import geopandas as gpd
 import joblib
-import matplotlib.patches as mpatches
 import numpy as np
 import pandas as pd
 import pymc as pm
 from matplotlib import pyplot as plt
-from matplotlib.colors import Normalize
-from shapely.geometry import Polygon
 from sklearn.preprocessing import StandardScaler
 from sqlalchemy import create_engine
 
@@ -33,9 +29,11 @@ from ppcluster.preprocessing import (
 from ppcluster.sectors import (
     assign_sector_labels,
     classify_points_by_polygons,
-    clean_morphokinematic_sectors,
+    clean_vector_sectors,
     compute_sector_stats,
-    vectorize_grid_to_gdf,
+    plot_kinematic_sectors,
+    save_sector_results,
+    vectorize_gridded_sectors,
 )
 from ppcluster.utils.database import (
     fetch_dic_analysis_ids,
@@ -284,319 +282,6 @@ def run_mcmc_clustering(
 
     plt.close("all")
     return result
-
-
-def plot_kinematic_sectors(
-    velocity_df: pd.DataFrame,
-    sector_gdf: gpd.GeoDataFrame,
-    sector_stats: pd.DataFrame,
-    img: np.ndarray,
-    sector_colors: dict | None,
-    output_dir: Path,
-    base_name: str,
-    figsize: tuple = (18, 7),
-    dpi: int = 300,
-) -> Path:
-    """
-    Plot morpho-kinematic sectors summary with velocity field and statistics table.
-    """
-
-    from matplotlib import colors as mcolors
-
-    # Configuration
-    label_column = "label"
-    min_cbar_percentile = 5.0
-    max_cbar_percentile = 95.0
-    stat_cols = [
-        "label",
-        "v_mean",
-        "v_std",
-        "v_median",
-        "v_mad",
-        "n_points",
-        "area_px2",
-        "compactness",
-    ]
-    max_labels_in_table = 12
-
-    if sector_colors is None:
-        sector_colors = {}
-
-    fig, axes = plt.subplots(
-        1,
-        2,
-        figsize=figsize,
-        gridspec_kw={"width_ratios": [1.3, 1.0], "wspace": 0.25},
-    )
-    ax_sectors, ax_table = axes
-
-    # 1) Velocity field with sectors overlay
-    mags = velocity_df["V"].to_numpy()
-    vmin = np.percentile(mags, min_cbar_percentile)
-    vmax = np.percentile(mags, max_cbar_percentile)
-
-    ax_sectors.imshow(img, cmap="gray")
-    norm = Normalize(vmin=vmin, vmax=vmax)
-    q = ax_sectors.quiver(
-        velocity_df["x"].to_numpy(),
-        velocity_df["y"].to_numpy(),
-        velocity_df["u"].to_numpy(),
-        velocity_df["v"].to_numpy(),
-        mags,
-        norm=norm,
-        scale=None,
-        scale_units="xy",
-        angles="xy",
-        cmap="viridis",
-        width=0.006,
-        headwidth=2.0,
-    )
-    ax_sectors.set_aspect("equal")
-    ax_sectors.set_xticks([])
-    ax_sectors.set_yticks([])
-    cbar = plt.colorbar(q, ax=ax_sectors, fraction=0.046, pad=0.03)
-    cbar.set_label("Velocity [px/day]", rotation=270, labelpad=12, fontsize=8)
-    cbar.ax.tick_params(labelsize=7)
-    ax_sectors.set_title("Velocity Field", fontsize=11)
-
-    # Sectors colors mapping
-    present_labels = sorted(sector_gdf[label_column].unique())
-    colors = {}
-    fallback_cmap = plt.get_cmap("tab10")
-    for i, label in enumerate(present_labels):
-        if label in sector_colors:
-            colors[label] = sector_colors[label]
-        else:
-            # Fallback color based on index
-            colors[label] = mcolors.to_hex(fallback_cmap(i % 10))
-
-    # Plot sectors
-    plot_gdf = sector_gdf.copy()
-    plot_gdf["color"] = plot_gdf["label"].map(colors)
-
-    if not plot_gdf.empty:
-        # 1. Plot the fill with high transparency to show velocity vectors
-        plot_gdf.plot(
-            ax=ax_sectors,
-            color=plot_gdf["color"],
-            alpha=0.1,
-            linewidth=0,
-        )
-        # 2. Plot the edges with full opacity to define limits
-        plot_gdf.plot(
-            ax=ax_sectors,
-            facecolor="none",
-            edgecolor=plot_gdf["color"],
-            linewidth=2.5,
-            alpha=1.0,
-        )
-
-    # Add legend manually to match style
-    legend_patches = [
-        mpatches.Patch(color=colors[label], label=label, alpha=0.8)
-        for label in present_labels
-        if label in colors
-    ]
-    if legend_patches:
-        ax_sectors.legend(
-            handles=legend_patches,
-            loc="upper right",
-            fontsize=8,
-            framealpha=0.9,
-        )
-
-    # Add letters to sectors
-    for _, row in plot_gdf.iterrows():
-        cent = row.geometry.centroid
-        ax_sectors.text(
-            cent.x,
-            cent.y,
-            row["label"],
-            fontsize=12,
-            weight="bold",
-            color="white",
-            ha="center",
-            va="center",
-        )
-
-    ax_sectors.set_aspect("equal")
-    ax_sectors.set_xticks([])
-    ax_sectors.set_yticks([])
-    ax_sectors.set_title("Morpho-Kinematic Sectors", fontsize=11)
-
-    # 3) Statistics table
-    available = [c for c in stat_cols if c in sector_stats.columns]
-    if "label" not in available:
-        logger.warning("sector_stats has no 'label' column; skipping table.")
-        display_df = pd.DataFrame()
-    else:
-        display_df = sector_stats[available].copy()
-
-    ax_table.axis("off")
-
-    if not display_df.empty:
-        # Formatting
-        for c in display_df.columns:
-            if c == "label":
-                continue
-            if c in {"n_points", "area_px2"}:
-                display_df[c] = display_df[c].round(0).astype(int)
-            else:
-                display_df[c] = display_df[c].round(2)
-
-        # Limit rows
-        if display_df.shape[0] > max_labels_in_table:
-            display_df = display_df.iloc[:max_labels_in_table, :]
-
-        table_df = display_df.set_index("label").T
-        table = ax_table.table(
-            cellText=table_df.values,
-            colLabels=list(table_df.columns),
-            rowLabels=list(table_df.index),
-            loc="center",
-            cellLoc="center",
-        )
-        table.auto_set_font_size(False)
-        table.set_fontsize(7)
-        table.scale(1.05, 1.6)
-
-        # Style table headers
-        for (i, j), cell in table.get_celld().items():
-            if i == 0 or j == -1:
-                cell.set_facecolor("#E8E8E8")
-                cell.set_text_props(weight="bold", size=7)
-            else:
-                cell.set_facecolor("white")
-
-    ax_table.set_title("Sector Statistics", fontsize=11, pad=6)
-
-    fig.suptitle(base_name, fontsize=13, weight="bold", y=0.985)
-
-    out_path = output_dir / f"{base_name}_sectors_summary.png"
-    fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
-    plt.close(fig)
-    logger.info(f"Saved summary figure to {out_path}")
-    return out_path
-
-
-def save_sector_results(
-    output_dir: Path,
-    base_name: str,
-    *,
-    gdf_sectors: gpd.GeoDataFrame,
-    mk_stats: pd.DataFrame,
-    posterior_probs: np.ndarray | None = None,
-    cluster_pred: np.ndarray | None = None,
-    uncertainty: np.ndarray | None = None,
-    img_shape: tuple[int, int] | None = None,
-    export_geojson: bool = True,
-    export_shapefile: bool = False,
-) -> dict[str, Path]:
-    """
-    Persist final sector results.
-
-    Saves:
-    - Bundle (.joblib): python dict with dataframes
-    - Arrays (.npz): raw numpy arrays
-    - GIS (.geojson/.shp): Merged geometry + stats, optionally with Y-inversion.
-    """
-    artifacts: dict[str, Path] = {}
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # 1) Pythonized bundle (Simplified: just dict of DF/GDF/Arrays)
-    try:
-        # Convert GDF to list-dict for plain pickling if needed, or just keep GDF
-        bundle = {
-            "gdf_sectors": gdf_sectors,
-            "mk_stats": mk_stats,
-            "posterior_probs": posterior_probs,
-            "cluster_pred": cluster_pred,
-            "uncertainty": uncertainty,
-        }
-        py_path = output_dir / f"{base_name}_sectors_bundle.joblib"
-        joblib.dump(bundle, py_path)
-        artifacts["python_bundle"] = py_path
-    except Exception as exc:
-        logger.warning(f"Failed saving joblib bundle: {exc}")
-
-    # 2) NumPy arrays
-    try:
-        np_path = output_dir / f"{base_name}_sectors_arrays.npz"
-        np.savez_compressed(
-            np_path,
-            cluster_pred=cluster_pred if cluster_pred is not None else np.array([]),
-            posterior_probs=posterior_probs
-            if posterior_probs is not None
-            else np.array([]),
-            uncertainty=uncertainty if uncertainty is not None else np.array([]),
-        )
-        artifacts["numpy_arrays"] = np_path
-    except Exception as exc:
-        logger.warning(f"Failed saving npz arrays: {exc}")
-
-    # 3) GIS export
-    if export_geojson or export_shapefile:
-        if gdf_sectors.empty:
-            logger.warning("No geometries to export for GIS.")
-            return artifacts
-
-        try:
-            # Merge stats into GDF for a rich export file
-            export_gdf = gdf_sectors.merge(mk_stats, on="label", how="left")
-
-            # Handle Y-Inversion for GIS compatibility (Image Origin vs Map Origin)
-            H = img_shape[0] if (img_shape and len(img_shape) >= 1) else None
-
-            if H is not None:
-                # Invert Y coordinate: y_new = H - 1 - y_old
-                def invert_y(geom):
-                    if geom.is_empty:
-                        return geom
-                    # shapely scalar transform
-                    return scale(
-                        translate(geom, yoff=-(H - 1)), yfact=-1, origin=(0, 0)
-                    )
-                    # Or manual rebuild to be safe without imports:
-                    # return Polygon([(x, H - 1 - y) for x, y in geom.exterior.coords])
-
-                # Manual reliable inversion loop for polygons
-                new_geoms = []
-                for geom in export_gdf.geometry:
-                    if geom.geom_type == "Polygon":
-                        new_g = Polygon(
-                            [(x, H - 1 - y) for x, y in geom.exterior.coords]
-                        )
-                        new_geoms.append(new_g)
-                    elif geom.geom_type == "MultiPolygon":
-                        # Handle multi-polygons if present
-                        parts = [
-                            Polygon([(x, H - 1 - y) for x, y in p.exterior.coords])
-                            for p in geom.geoms
-                        ]
-                        from shapely.ops import unary_union
-
-                        new_geoms.append(unary_union(parts))
-                    else:
-                        new_geoms.append(geom)  # Fallback
-
-                export_gdf.geometry = new_geoms
-
-            if export_geojson:
-                geojson_path = output_dir / f"{base_name}_sectors.geojson"
-                export_gdf.to_file(geojson_path, driver="GeoJSON")
-                artifacts["geojson"] = geojson_path
-
-            if export_shapefile:
-                shp_dir = output_dir / f"{base_name}_shp"
-                shp_dir.mkdir(exist_ok=True)
-                shp_path = shp_dir / f"{base_name}_sectors.shp"
-                export_gdf.to_file(shp_path)
-                artifacts["shapefile"] = shp_path
-
-        except Exception as exc:
-            logger.warning(f"Failed GIS export: {exc}")
-
-    return artifacts
 
 
 def main(reference_date: str | None = None, output_dir: str | Path | None = None):
@@ -895,13 +580,13 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
 
     # 1. Vectorize & Smooth
     logger.info("Vectorizing grid clusters to polygons...")
-    sectors = vectorize_grid_to_gdf(kin_cluster_grid, X, Y)
-    sectors_cleaned = clean_morphokinematic_sectors(
+    sectors = vectorize_gridded_sectors(kin_cluster_grid, X, Y)
+    sectors = clean_vector_sectors(
         sectors,
         dic_df,
         min_area_px2=100000.0,
         isolation_buffer=30.0,
-        velocity_merge_threshold=1.6,
+        velocity_merge_threshold=1,
         target_number_of_sectors=4,
         smooth_geometries=True,
         raster_res=raster_res,
@@ -924,16 +609,16 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
         alpha=0.6,
     )
     # Plot vectorized sectors
-    if not sectors_cleaned.empty:
+    if not sectors.empty:
         ax_vectorized.imshow(img)
-        sectors_cleaned.plot(
+        sectors.plot(
             ax=ax_vectorized,
             column="cluster_id",
             cmap="tab10",
             alpha=0.25,
             linewidth=0,
         )
-        sectors_cleaned.plot(
+        sectors.plot(
             ax=ax_vectorized,
             column="cluster_id",
             cmap="tab10",
@@ -941,9 +626,7 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
             linewidth=2.0,
             alpha=1.0,
         )
-        ax_vectorized.set_title(
-            f"Cleaned Vectorized Sectors (n={len(sectors_cleaned)})"
-        )
+        ax_vectorized.set_title(f"Cleaned Vectorized Sectors (n={len(sectors)})")
         ax_vectorized.axis("off")
     fig.tight_layout()
     fig.savefig(
@@ -954,21 +637,19 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
     # 2. Assign Labels (A, B, C...)
     # We use the centroid Y position to order sectors from bottom to top (A=lowest Y)
     # The y axis is inverted in image coordinates (0 at top), hence ascending=False
-    sectors_cleaned = assign_sector_labels(
-        sectors_cleaned,
+    sectors = assign_sector_labels(
+        sectors,
         order_by=postproc_config.sector_assignment.method,
         ascending=postproc_config.sector_assignment.ascending,
     )
 
     # 3. Classify the original points dataframe and compute statistics
-    pts_by_sector = classify_points_by_polygons(
-        sectors_cleaned, dic_df, x_col="x", y_col="y"
-    )
+    pts_by_sector = classify_points_by_polygons(sectors, dic_df, x_col="x", y_col="y")
     # rename 'label' to 'sector'
     if "label" in pts_by_sector.columns and "sector" not in pts_by_sector.columns:
         pts_by_sector = pts_by_sector.rename(columns={"label": "sector"})
     # Compute statistics
-    mk_stats = compute_sector_stats(sectors_cleaned, pts_by_sector, value_col="V")
+    mk_stats = compute_sector_stats(sectors, pts_by_sector, value_col="V")
     mk_stats.to_csv(output_dir / f"{base_name}_kinematic_sector_stats.csv", index=False)
     logger.info(f"Saved sector statistics: {len(mk_stats)} sectors")
 
@@ -977,7 +658,7 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
     sector_colors = postproc_config.sector_assignment.sector_colors
     sector_figure_path = plot_kinematic_sectors(
         velocity_df=pts_by_sector,
-        sector_gdf=sectors_cleaned,
+        sector_gdf=sectors,
         sector_stats=mk_stats,
         img=img,
         sector_colors=sector_colors,
@@ -995,7 +676,7 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
     artifacts = save_sector_results(
         output_dir=output_dir,
         base_name=base_name,
-        gdf_sectors=sectors_cleaned,
+        gdf_sectors=sectors,
         mk_stats=mk_stats,
         posterior_probs=posterior_probs,
         cluster_pred=cluster_pred,
