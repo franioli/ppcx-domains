@@ -4,11 +4,11 @@ from cvat_sdk import make_client
 from cvat_sdk.core.proxies.tasks import ResourceType
 from sqlalchemy import create_engine
 
-from ppcluster.utils import ConfigManager
+from ppcluster.config import load_config
 
 logger = logging.getLogger("ppcx")
 
-config = ConfigManager()
+config = load_config()
 db_engine = create_engine(config.db_url)
 
 cvat_host = "http://150.145.51.193"

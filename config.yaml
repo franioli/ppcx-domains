@@ -83,9 +83,9 @@ multiscale:
 
 # Post-processing parameters
 postprocessing:
-  erosion_iterations: 0      # Number of erosion iterations to disconnect narrow bridges
-  dilation_iterations: 0     # Number of dilation iterations to restore cluster size
   split_disconnected_components: true
+  erosion_iterations: 1      # Number of erosion iterations to disconnect narrow bridges
+  dilation_iterations: 1     # Number of dilation iterations to restore cluster size
   min_cluster_size: -1      # Minimum number of pixels for a cluster to survive
   # min_cluster_size_px: 100  # Minimum cluster size for second pass processing
   connectivity: 8           # 4 or 8 connectivity for component analysis (for all postproc steps)
@@ -101,15 +101,6 @@ postprocessing:
       B: "#ee9c21"
       C: "#f1ee30"
       D: "#5fb61c"
-
-# Morpho-kinematic analysis parameters
-morphokinematic:
-  minor_overlap_threshold: 0.9
-  sector_colors:
-    A: "#b3140b"
-    B: "#ee9c21"
-    C: "#f1ee30"
-    D: "#5fb61c"
 
 # Random seed for reproducibility
 random_seed: 8927

@@ -4,10 +4,9 @@ from datetime import datetime
 
 import pandas as pd
 import requests
+from omegaconf import DictConfig
 from PIL import Image
 from sqlalchemy import text
-
-from ppcluster.config import ConfigManager
 
 logger = logging.getLogger("ppcx")
 
@@ -17,32 +16,32 @@ logger = logging.getLogger("ppcx")
 def _resolve_api_host_port(
     app_host: str | None,
     app_port: str | None,
-    config: ConfigManager | None,
+    config: dict | DictConfig | None,
 ) -> tuple[str, str]:
     """
-    Resolve API host/port from explicit args or a ConfigManager.
+    Resolve API host/port from explicit args or a DictConfig.
     Priority: if kwargs (app_host/app_port) are passed, they override config values.
     """
-    host = config.get("api.host") if config is not None else None
-    port = config.get("api.port") if config is not None else None
+    host = config.get("host") if config is not None else None
+    port = config.get("port") if config is not None else None
 
     # kwargs override config
     if app_host is not None:
         if config is not None and host is not None and host != app_host:
             logger.debug(
-                f"Overriding api.host from config with provided app_host '{app_host}' (config had '{host}')"
+                f"Overriding host from config with provided app_host '{app_host}' (config had '{host}')"
             )
         host = app_host
     if app_port is not None:
         if config is not None and port is not None and str(port) != str(app_port):
             logger.debug(
-                f"Overriding api.port from config with provided app_port '{app_port}' (config had '{port}')"
+                f"Overriding port from config with provided app_port '{app_port}' (config had '{port}')"
             )
         port = app_port
 
     if host is None or port is None:
         raise ValueError(
-            "API host/port not provided. Pass app_host/app_port or a ConfigManager with api.host/api.port."
+            "API host/port not provided. Pass app_host/app_port or a configuration dictionary with host/port keys."
         )
     return str(host), str(port)
 
@@ -247,12 +246,12 @@ def get_dic_data(
     *,
     app_host: str | None = None,
     app_port: str | None = None,
-    config: ConfigManager | None = None,
+    config: DictConfig | None = None,
 ) -> pd.DataFrame:
     """
     Fetch DIC displacement data from the Django API endpoint as a DataFrame.
 
-    Provide either app_host/app_port explicitly or a ConfigManager (config) containing api.host/api.port.
+    Provide either app_host/app_port explicitly or a configuration object (config) containing api.host/api.port.
     """
     host, port = _resolve_api_host_port(app_host, app_port, config)
     url = f"http://{host}:{port}/API/dic/{dic_id}/"
@@ -284,7 +283,7 @@ def get_multi_dic_data(
     stack_results: bool = False,
     app_host: str | None = None,
     app_port: str | None = None,
-    config: ConfigManager | None = None,
+    config: DictConfig | None = None,
 ) -> pd.DataFrame | dict[int, pd.DataFrame]:
     """
     Fetch and concatenate DIC displacement data for multiple DIC IDs.
@@ -399,11 +398,11 @@ def get_image(
     *,
     app_host: str | None = None,
     app_port: str | None = None,
-    config: ConfigManager | None = None,
+    config: DictConfig | None = None,
 ) -> Image.Image:
     """
     Get an image by ID from the API and rotate if from Tele camera.
-    Provide either app_host/app_port or a ConfigManager (config).
+    Provide either app_host/app_port or a configuration object (config).
     """
     host, port = _resolve_api_host_port(app_host, app_port, config)
     url = f"http://{host}:{port}/API/images/{image_id}/"

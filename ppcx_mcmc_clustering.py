@@ -18,8 +18,7 @@ from shapely.geometry import Polygon
 from sklearn.preprocessing import StandardScaler
 from sqlalchemy import create_engine
 
-from ppcluster import mcmc, setup_logger
-from ppcluster.config import ConfigManager
+from ppcluster import load_config, mcmc, setup_logger
 from ppcluster.cvat import (
     filter_dataframe_by_polygons,
     read_polygons_from_cvat,
@@ -292,6 +291,131 @@ def run_mcmc_clustering(
 
     plt.close("all")
     return result
+
+
+def apply_cluster_grid_cleaning(
+    X: np.ndarray,
+    Y: np.ndarray,
+    clusters: np.ndarray,
+    config: dict,
+    output_dir: Path,
+    base_name: str,
+    img: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    Apply morphological operations and cleaning to the cluster grid.
+    Refines clusters, removing noise and small components.
+
+    Args:
+        X, Y: 2D meshgrid arrays of point coordinates
+        clusters: 2D array of cluster labels on the grid
+        config: post-processing configuration parameters
+        output_dir: directory to save outputs
+        base_name: base name for output files
+        img: optional background image for plotting
+
+    Returns:
+        Refined cluster grid as 2D numpy array.
+    """
+
+    # Retrieve post-processing parameters
+    do_split = config.get("split_disconnected_components", True)
+    erosion_iters = config.get("erosion_iterations", 0)
+    dilation_iters = config.get("dilation_iterations", 0)
+    connectivity = config.get("connectivity", 8)
+    min_cluster_size = config.get("min_cluster_size", 0)
+    keep_only_largest_n = config.get("keep_only_largest_n", 0)
+
+    logger.info(
+        f"Post-proc params: erosion={erosion_iters}, "
+        f"dilation={dilation_iters}, min_size={min_cluster_size}"
+    )
+
+    # Store pre-postprocessing grid for comparison
+    cluster_before = clusters.copy()
+
+    # Split disconnected components first
+    if do_split:
+        clusters, _ = split_disconnected_components(
+            clusters,
+            connectivity=connectivity,
+            start_label=0,
+        )
+
+    # Remove very small components and merge to nearest neighbor
+    clusters = remove_small_grid_components(
+        label_grid=clusters,
+        min_size=20,  # initial removal threshold to clean noise (hard-coded)
+        connectivity=connectivity,
+        merge_strategy="merge",  # merge small components to nearest neighbor
+    )
+
+    # Apply morphological operations (erosion + dilation)
+    if erosion_iters > 0 or dilation_iters > 0:
+        clusters = apply_morphological_operations(
+            cluster_grid=clusters,
+            erosion_iterations=erosion_iters,
+            dilation_iterations=dilation_iters,
+            min_cluster_size=min_cluster_size,
+            connectivity=connectivity,
+        )
+    # Remove small components again after morph operations (do not merge)
+    if min_cluster_size > 0:
+        clusters = remove_small_grid_components(
+            label_grid=clusters,
+            min_size=min_cluster_size,
+            connectivity=connectivity,
+            merge_strategy="remove",  # or "merge" to assign to nearest neighbor
+        )
+
+    # Keep only N largest clusters (on grid)
+    if keep_only_largest_n > 0:
+        clusters = keep_only_largest_clusters(
+            label_grid=clusters,
+            n_largest=keep_only_largest_n,
+            connectivity=connectivity,
+        )
+
+    # Plot comparison before/after post-processing
+    if img is not None:
+        fig, (ax_before, ax_after) = plt.subplots(1, 2, figsize=(12, 6))
+        plot_clustering_grid(
+            ax=ax_before,
+            img=img,
+            cluster_grid=cluster_before,
+            X=X,
+            Y=Y,
+            title="Before Post-Processing",
+            show_legend=True,
+            show_stats=True,
+            alpha=0.5,
+        )
+        plot_clustering_grid(
+            ax=ax_after,
+            img=img,
+            cluster_grid=clusters,
+            X=X,
+            Y=Y,
+            title="After Post-Processing",
+            show_legend=True,
+            show_stats=True,
+            alpha=0.5,
+        )
+        plt.tight_layout()
+        plt.savefig(
+            output_dir / f"{base_name}_kinematic_clustering_postproc.jpg",
+            dpi=300,
+            bbox_inches="tight",
+        )
+        plt.close(fig)
+
+    # Save cleaned grid result to file for inspection
+    dump_data = {"X": X, "Y": Y, "kin_cluster_grid": clusters}
+    joblib.dump(
+        dump_data, output_dir / f"{base_name}_kinematic_clustering_cleaned.joblib"
+    )
+
+    return clusters
 
 
 def create_summary_figure(
@@ -592,25 +716,27 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
     """
 
     # ===  DATA LOADING AND PREPROCESSING  === #
-    config = ConfigManager()
+    config = load_config()
 
     # Retrieve parameters from CLI or config
     if reference_date:
-        config.set("data.reference_date", reference_date)
-    reference_date = config.get("data.reference_date")
+        config.data.reference_date = reference_date
+
+    reference_date = config.data.reference_date
     if not reference_date:
         raise ValueError("reference_date must be specified either via CLI or config.")
+
     if output_dir:
-        config.set("data.output_dir", str(output_dir))
+        config.data.output_dir = str(output_dir)
 
     # Retrieve other config parameters
-    data_config = config.get("data", {})
-    random_seed = config.get("random_seed", 8927)
-    camera_name = data_config.get("camera_name")
-    variables_names = data_config.get("variables_names", ["V"])
+    data_config = config.data
+    random_seed = config.random_seed
+    camera_name = data_config.camera_name
+    variables_names = data_config.variables_names
 
     # Output base directory (output will be saved in a subfolder with camera name and date)
-    output_base_dir = Path(data_config.get("output_dir", "output"))
+    output_base_dir = Path(data_config.output_dir)
     output_dir = output_base_dir / f"{camera_name}_{reference_date}_mcmc"
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -618,11 +744,10 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
     base_name = f"{reference_date}"
 
     # Date range for data selection
-    days_before_to_include = data_config.get("days_before_to_include", 0)
-    days_after_to_include = data_config.get("days_after_to_include", 0)
-    dt_min = data_config.get("dt_min", 70)
-    dt_max = data_config.get("dt_max", 100)
-
+    days_before_to_include = data_config.days_before_to_include
+    days_after_to_include = data_config.days_after_to_include
+    dt_min = data_config.dt_min
+    dt_max = data_config.dt_max
     if days_before_to_include > 0 or days_after_to_include > 0:
         reference_start_date = datetime.strptime(
             reference_date, "%Y-%m-%d"
@@ -662,24 +787,18 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
 
     # Get master image
     master_image_id = dic_analyses["master_image_id"].iloc[0]
-    img = get_image(image_id=master_image_id, config=config)
+    img = get_image(image_id=master_image_id, config=config.api)
 
     # Read roi and spatial priors
-    roi = read_polygons_from_cvat(data_config.get("roi_path"), image_name=None)
-    sectors = read_polygons_from_cvat(
-        data_config.get("sector_prior_file"), image_name=None
-    )
+    roi = read_polygons_from_cvat(data_config.roi_path, image_name=None)
+    sectors = read_polygons_from_cvat(data_config.sector_prior_file, image_name=None)
 
     # Fetch DIC data
-    out = get_multi_dic_data(dic_ids, stack_results=False, config=config)
+    out = get_multi_dic_data(dic_ids, stack_results=False, config=config.api)
     logger.info(f"Found stack of {len(out)} DIC dataframes.")
 
     # Apply filter for each df in the dictionary and then stack them
-    preprocessing_config = config.get("preprocessing", {})
-    subsample_factor = preprocessing_config.get("subsample_factor", 1)
-    subsample_method = preprocessing_config.get("subsample_method", "random")
-    filter_kwargs = preprocessing_config.get("filter_kwargs", {})
-
+    preproc_config = config.preprocessing
     processed = []
     for src_id, df_src in out.items():
         try:
@@ -687,23 +806,25 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
             df_src = filter_dataframe_by_polygons(df_src, polygons=roi)
 
             # Apply other DIC filters if any
-            df_src = apply_dic_filters(df_src, **filter_kwargs)
+            df_src = apply_dic_filters(df_src, **preproc_config.filter_kwargs)
 
             # Append processed dataframe to the list
             processed.append(df_src)
         except Exception as exc:
-            logger.warning("Filtering failed for %s: %s", src_id, exc)
+            logger.warning(f"Filtering failed for {src_id}: {exc}")
     if not processed:
         raise RuntimeError("No dataframes left after filtering.")
 
     # Stack all processed dataframes
     dic_df = pd.concat(processed, ignore_index=True)
-    logger.info("Data shape after filtering and stacking: %s", dic_df.shape)
+    logger.info(f"Data shape after filtering and stacking: {dic_df.shape}")
 
     # Apply subsampling
-    if subsample_factor > 1:
+    if preproc_config.subsample_factor > 1:
         dic_df = spatial_subsample(
-            dic_df, n_subsample=subsample_factor, method=subsample_method
+            dic_df,
+            n_subsample=preproc_config.subsample_factor,
+            method=preproc_config.subsample_method,
         )
         logger.info(f"Data shape after subsampling: {dic_df.shape}")
 
@@ -714,22 +835,21 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
     # ===  SPATIAL PRIORS AND INITIAL VISUALIZATIONS  === #
 
     # Assign spatial priors
-    prior_config = config.get("priors", {})
-    prior_probability = prior_config.get("probability", None)
-    if not prior_probability:
+    prior_config = config.priors
+    if not prior_config.probability:
         # Default: uniform priors across sectors
         n_sectors = len(sectors)
         uniform_prob = 1.0 / n_sectors
-        prior_probability = {name: [uniform_prob] * n_sectors for name in sectors}
-    fade_method = prior_config.get("fade_method", "constant")
-    fade_method_options = prior_config.get("fade_options", {}).get(fade_method, {})
+        prior_config.probability = {
+            name: [uniform_prob] * n_sectors for name in sectors
+        }
     prior_probs_array = mcmc.assign_spatial_priors(
         x=dic_df["x"].to_numpy(),
         y=dic_df["y"].to_numpy(),
         polygons=sectors,
-        prior_probs=prior_probability,
-        fade_method=fade_method,
-        fade_options=fade_method_options,
+        prior_probs=prior_config.probability,
+        fade_method=prior_config.fade_method,
+        fade_options=prior_config.fade_options.get(prior_config.fade_method, {}),
     )
 
     fig, axes = mcmc.plot_spatial_priors(dic_df, prior_probs_array, img=img)
@@ -743,42 +863,35 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
     # ===  RUN MCMC CLUSTERING  === #
 
     # MCMC parameters
-    mcmc_config = config.get("mcmc", {})
-    sample_options = mcmc_config.get("sample_options", {})
     sample_args = {
-        "draws": sample_options.get("draws", 2000),
-        "tune": sample_options.get("tune", 1000),
-        "chains": sample_options.get("chains", 4),
-        "cores": sample_options.get("cores", 4),
-        "target_accept": sample_options.get("target_accept", 0.9),
+        "draws": config.mcmc.sample_options.draws,
+        "tune": config.mcmc.sample_options.tune,
+        "chains": config.mcmc.sample_options.chains,
+        "cores": config.mcmc.sample_options.cores,
+        "target_accept": config.mcmc.sample_options.target_accept,
         "random_seed": random_seed,
     }
-    model_options = mcmc_config.get("model_options", {})
-    mu_params = model_options.get("mu_params", {"mu": 0, "sigma": 1})
-    sigma_params = model_options.get("sigma_params", {"sigma": 1})
+    model_options = config.mcmc.model_options
+    mu_params = model_options.mu_params
+    sigma_params = model_options.sigma_params
 
     # Velocity transformation parameters
-    velocity_transform = mcmc_config.get(
-        "velocity_transform", None
-    )  # also: "power", "exponential", "sigmoid"
-    transform_params = mcmc_config.get(
-        "transform_params", {}
-    )  # also {"midpoint_percentile": 70, "steepness": 2.0},)
+    velocity_transform = config.mcmc.velocity_transform
+    transform_params = config.mcmc.transform_params
 
     # MRF regularization parameters
-    mrf_regularization = mcmc_config.get("mrf_regularization", True)
-    mrf_kwargs = mcmc_config.get("mrf_kwargs", {})
-    second_pass = mcmc_config.get("second_pass", "short")
-    second_pass_sample_args = mcmc_config.get("second_pass_sample_args", {})
+    mrf_regularization = config.mcmc.mrf_regularization
+    mrf_kwargs = config.mcmc.mrf_kwargs
+    second_pass = config.mcmc.second_pass
+    second_pass_sample_args = config.mcmc.second_pass_sample_args
 
     # Multiscale parameters
-    multiscale_config = config.get("multiscale", {})
-    sigma_values = multiscale_config.get("sigma_values", [0])
+    multiscale_config = config.multiscale
+    sigma_values = multiscale_config.sigma_values
+    aggregation_config = multiscale_config.aggregation
 
-    # Aggregation parameters
-    aggregation_config = multiscale_config.get("aggregation", {})
-    similarity_threshold = aggregation_config.get("similarity_threshold", 0.7)
-    overall_threshold = aggregation_config.get("overall_threshold", 0.8)
+    # Post-processing parameters
+    postproc_config = config.postprocessing
 
     # Loop through smoothing scales
     results = []
@@ -826,14 +939,11 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
     # ===  AGGREGATE MULTI-SCALE RESULTS  (if multiscale approach)=== #
 
     # Multiscale parameters (grouped)
-    aggregation_config = multiscale_config.get("aggregation", {})
-    similarity_threshold = aggregation_config.get("similarity_threshold", 0.7)
-    overall_threshold = aggregation_config.get("overall_threshold", 0.8)
     if len(sigma_values) > 1:
         aggregated_results = aggregate_multiscale_clustering(
             results,
-            similarity_threshold=similarity_threshold,
-            overall_threshold=overall_threshold,
+            similarity_threshold=aggregation_config.similarity_threshold,
+            overall_threshold=aggregation_config.overall_threshold,
             fig_path=output_dir
             / f"{reference_start_date}_{reference_end_date}_similarity_heatmap.jpg",
         )
@@ -874,130 +984,40 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
     y = dic_df["y"].to_numpy()
     kin_cluster = np.asarray(cluster_pred.copy())
 
-    # Save pre-postprocessing clustering for comparison
-    cluster_before_postproc = cluster_pred.copy()
-    X_before, Y_before, cluster_grid_before_postproc = create_2d_grid(
-        x=x, y=y, labels=cluster_before_postproc
-    )
-
-    # Post-processing parameters
-    # config.reload() # in case of interactive changes
-    postproc_config = config.get("postprocessing", {})
-    erosion_iters = postproc_config.get("erosion_iterations", 0)
-    dilation_iters = postproc_config.get("dilation_iterations", 0)
-    min_cluster_size = postproc_config.get("min_cluster_size", 50)
-    connectivity = postproc_config.get("connectivity", 4)
-    keep_only_largest_n = postproc_config.get("keep_only_largest_n", -1)
-    logger.info(
-        f"Post-processing params: erosion={erosion_iters}, "
-        f"dilation={dilation_iters}, min_size={min_cluster_size}"
-    )
-
-    # === STEP 1: Grid-level post-processing ===
-
     # Create 2D grid of clustering results
     X, Y, kin_cluster_grid = create_2d_grid(x=x, y=y, labels=kin_cluster)
 
-    # Split disconnected components first
-    if postproc_config.get("split_disconnected_components", True):
-        kin_cluster_grid, _ = split_disconnected_components(
-            kin_cluster_grid, connectivity=connectivity, start_label=0
-        )
-
-    # Remove very small components and merge to nearest neighbor
-    kin_cluster_grid = remove_small_grid_components(
-        label_grid=kin_cluster_grid,
-        min_size=20,
-        connectivity=connectivity,
-        merge_strategy="merge",  # or "merge" to assign to nearest neighbor
-    )
-
-    # Apply morphological operations (erosion + dilation)
-    if erosion_iters > 0 or dilation_iters > 0:
-        kin_cluster_grid = apply_morphological_operations(
-            cluster_grid=kin_cluster_grid,
-            erosion_iterations=erosion_iters,
-            dilation_iterations=dilation_iters,
-            min_cluster_size=min_cluster_size,
-            connectivity=connectivity,
-        )
-    # Remove small components again after morph operations (do not merge)
-    if min_cluster_size > 0:
-        kin_cluster_grid = remove_small_grid_components(
-            label_grid=kin_cluster_grid,
-            min_size=min_cluster_size,
-            connectivity=connectivity,
-            merge_strategy="remove",  # or "merge" to assign to nearest neighbor
-        )
-
-    # Keep only N largest clusters (on grid)
-    if keep_only_largest_n > 0:
-        kin_cluster_grid = keep_only_largest_clusters(
-            label_grid=kin_cluster_grid,
-            n_largest=keep_only_largest_n,
-            connectivity=connectivity,
-        )
-
-    # Plot comparison before/after post-processing
-    fig, (ax_before, ax_after) = plt.subplots(1, 2, figsize=(12, 6))
-    plot_clustering_grid(
-        ax=ax_before,
-        img=img,
-        cluster_grid=cluster_grid_before_postproc,
-        X=X_before,
-        Y=Y_before,
-        title="Before Post-Processing",
-        show_legend=True,
-        show_stats=True,
-        alpha=0.5,
-    )
-    plot_clustering_grid(
-        ax=ax_after,
-        img=img,
-        cluster_grid=kin_cluster_grid,
+    # Apply morphological cleaning to the cluster grid
+    kin_cluster_grid = apply_cluster_grid_cleaning(
         X=X,
         Y=Y,
-        title="After Post-Processing",
-        show_legend=True,
-        show_stats=True,
-        alpha=0.5,
+        clusters=kin_cluster_grid,
+        config=postproc_config,
+        output_dir=output_dir,
+        base_name=base_name,
+        img=img,
     )
-    plt.tight_layout()
-    plt.savefig(
-        output_dir / f"{base_name}_kinematic_clustering_postproc.jpg",
-        dpi=300,
-        bbox_inches="tight",
-    )
-    plt.close(fig)
 
-    # === STEP 2: Vectorize clusters to GeoDataFrame ===
-    # DEBUG --- save intermediate grid result to file for inspection
-    joblib.dump(
-        {
-            "X": X,
-            "Y": Y,
-            "kin_cluster_grid": kin_cluster_grid,
-        },
-        output_dir / f"{base_name}_kinematic_clustering_cleaned.joblib",
-    )
-    logger.info("Vectorizing grid clusters to polygons...")
+    # ===  Vectorize clusters to GeoDataFrame ===
 
-    # DIRECT REPLACEMENT OF vectorization, labeling, and overlap removal
     # 1. Vectorize & Smooth
+    logger.info("Vectorizing grid clusters to polygons...")
     gdf_sectors = vectorize_grid_to_gdf(kin_cluster_grid, X, Y, smooth_iterations=3)
 
     # 2. Assign Labels (A, B, C...)
     # We use the centroid Y position to order sectors from bottom to top (A=lowest Y)
     # The y axis is inverted in image coordinates (0 at top), hence ascending=False
     gdf_sectors = assign_sector_labels(
-        gdf_sectors, order_by="y_position", ascending=False
+        gdf_sectors,
+        order_by=postproc_config.sector_assignment.method,
+        ascending=postproc_config.sector_assignment.ascending,
     )
 
-    # 3. Colors mapping
+    # --- Plot Morpho-Kinematic Sectors ---
     # Try to load user-defined colors from config
     # Look in postprocessing -> sector_assignment -> sector_colors
     colors = {}
-    user_colors = postproc_config.get("sector_assignment", {}).get("sector_colors", {})
+    user_colors = postproc_config.sector_assignment.sector_colors
     for i, row in enumerate(gdf_sectors.itertuples()):
         label = row.label
         if label in user_colors:
@@ -1008,7 +1028,166 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
             colors[label] = mcolors.to_hex(def_cmap(i % 10))
     cmap = mcolors.ListedColormap([colors[label] for label in sorted(colors.keys())])
 
-    # --- Plot Morpho-Kinematic Sectors ---
+    # ==== NEW UNIFIED FIGURE ======
+    #  def create_summary_figure(
+    #     img: np.ndarray,
+    #     df: pd.DataFrame,
+    #     mk_stats: pd.DataFrame,
+    #     gdf_sectors: gpd.GeoDataFrame,
+    #     colors: dict[str, str],
+    #     base_name: str,
+    #     output_dir: Path,
+    #     *,
+    #     figsize: tuple[int, int] = (18, 7),
+    #     dpi: int = 200,
+    #     min_cbar_percentile: float = 5.0,
+    #     max_cbar_percentile: float = 95.0,
+    #     stat_cols: list[str] | None = None,
+    #     max_labels_in_table: int = 12,
+    # ) -> Path | None:
+
+    # if stat_cols is None:
+    #     stat_cols = [
+    #         "label",
+    #         "v_mean",
+    #         "v_std",
+    #         "v_median",
+    #         "n_points",
+    #         "area_px2",
+    #         "compactness",
+    #     ]
+
+    # available = [c for c in stat_cols if c in mk_stats.columns]
+    # if "label" not in available:
+    #     logger.warning("mk_stats has no 'label' column; skipping figure.")
+    #     return None
+
+    # summary_fig = plt.figure(figsize=figsize)
+    # gs = summary_fig.add_gridspec(
+    #     1,
+    #     3,
+    #     width_ratios=[1.05, 1.05, 0.9],
+    #     left=0.02,
+    #     right=0.98,
+    #     top=0.93,
+    #     bottom=0.07,
+    #     wspace=0.15,
+    # )
+
+    # ax_vf = summary_fig.add_subplot(gs[0, 0])
+    # ax_sectors = summary_fig.add_subplot(gs[0, 1])
+    # ax_table = summary_fig.add_subplot(gs[0, 2])
+
+    # # 1) Velocity field
+    # ax_vf.imshow(img, cmap="gray")
+    # mags = df["V"].to_numpy()
+    # vmin = np.percentile(mags, min_cbar_percentile)
+    # vmax = np.percentile(mags, max_cbar_percentile)
+    # norm = Normalize(vmin=vmin, vmax=vmax)
+    # q = ax_vf.quiver(
+    #     df["x"].to_numpy(),
+    #     df["y"].to_numpy(),
+    #     df["u"].to_numpy(),
+    #     df["v"].to_numpy(),
+    #     mags,
+    #     norm=norm,
+    #     scale=None,
+    #     scale_units="xy",
+    #     angles="xy",
+    #     cmap="viridis",
+    #     width=0.006,
+    #     headwidth=2.0,
+    # )
+    # ax_vf.set_aspect("equal")
+    # ax_vf.set_xticks([])
+    # ax_vf.set_yticks([])
+    # cbar = plt.colorbar(q, ax=ax_vf, fraction=0.046, pad=0.03)
+    # cbar.set_label("Velocity [px/day]", rotation=270, labelpad=12, fontsize=8)
+    # cbar.ax.tick_params(labelsize=7)
+    # ax_vf.set_title("Velocity Field", fontsize=11)
+
+    # # 2) Sector polygons
+    # ax_sectors.imshow(img, cmap="gray")
+
+    # # Plot sectors using GeoPandas
+    # # Create a color column based on label mapping
+    # plot_gdf = gdf_sectors.copy()
+    # plot_gdf["color"] = plot_gdf["label"].map(colors)
+
+    # plot_gdf.plot(
+    #     ax=ax_sectors,
+    #     color=plot_gdf["color"],
+    #     alpha=0.3,
+    #     edgecolor=plot_gdf["color"],
+    #     linewidth=2,
+    # )
+
+    # # Add legend manually to match style
+    # legend_patches = [
+    #     mpatches.Patch(color=colors[label], label=label, alpha=0.55)
+    #     for label in sorted(colors.keys())
+    #     if label in gdf_sectors["label"].values
+    # ]
+
+    # if legend_patches:
+    #     ax_sectors.legend(
+    #         handles=legend_patches,
+    #         loc="upper right",
+    #         fontsize=8,
+    #         framealpha=0.9,
+    #     )
+    # ax_sectors.set_aspect("equal")
+    # ax_sectors.set_xticks([])
+    # ax_sectors.set_yticks([])
+    # ax_sectors.set_title("Morpho-Kinematic Sectors", fontsize=11)
+
+    # # 3) Statistics table
+    # ax_table.axis("off")
+    # display_df = mk_stats[available].copy()
+
+    # # Formatting
+    # for c in display_df.columns:
+    #     if c == "label":
+    #         continue
+    #     if c in {"n_points", "area_px2"}:
+    #         display_df[c] = display_df[c].round(0).astype(int)
+    #     else:
+    #         display_df[c] = display_df[c].round(2)
+
+    # # Limit rows
+    # if display_df.shape[0] > max_labels_in_table:
+    #     display_df = display_df.iloc[:max_labels_in_table, :]
+
+    # table_df = display_df.set_index("label").T
+    # table = ax_table.table(
+    #     cellText=table_df.values,
+    #     colLabels=list(table_df.columns),
+    #     rowLabels=list(table_df.index),
+    #     loc="center",
+    #     cellLoc="center",
+    # )
+    # table.auto_set_font_size(False)
+    # table.set_fontsize(7)
+    # table.scale(1.05, 1.6)
+
+    # # Style table headers
+    # for (i, j), cell in table.get_celld().items():
+    #     if i == 0 or j == -1:
+    #         cell.set_facecolor("#E8E8E8")
+    #         cell.set_text_props(weight="bold", size=7)
+    #     else:
+    #         cell.set_facecolor("white")
+
+    # ax_table.set_title("Sector Statistics", fontsize=11, pad=6)
+
+    # summary_fig.suptitle(base_name, fontsize=13, weight="bold", y=0.985)
+
+    # out_path = output_dir / f"{base_name}_sectors_summary.png"
+    # summary_fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
+    # plt.close(summary_fig)
+    # logger.info("Saved summary figure to %s", out_path)
+
+    # ===== OLD APPROACH FOR REFERENCE =====#
     fig, ax = plt.subplots(figsize=(8, 8))
     ax.imshow(img, alpha=0.5, cmap="gray")
     gdf_sectors.plot(

@@ -9,7 +9,7 @@ from ppcluster import (
 )
 
 # Import specific functions and classes
-from ppcluster.config import ConfigManager  # noqa: F401
+from ppcluster.config import load_config  # noqa: F401
 from ppcluster.utils.logger import get_logger, set_log_level, setup_logger  # noqa: F401
 
 # Create the logger but DO NOT add StreamHandlers/FileHandlers here.
@@ -21,7 +21,7 @@ logger.setLevel(logging.INFO)
 __all__ = [
     "mcmc",
     "utils",
-    "ConfigManager",
+    "load_config",
     "get_logger",
     "set_log_level",
     "setup_logger",

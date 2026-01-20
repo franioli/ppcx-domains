@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 from dotenv import find_dotenv, load_dotenv
 from omegaconf import DictConfig, OmegaConf
@@ -14,118 +12,184 @@ logger = logging.getLogger("ppcx")
 
 load_dotenv(find_dotenv(usecwd=True), override=False)
 
+# -----------------------------------------------------------------------------
+# Default Configuration Definition
+# -----------------------------------------------------------------------------
+_DEFAULT_CONFIG = {
+    "data": {
+        "output_dir": "output",
+        "reference_date": None,
+        "camera_name": "PPCX_Tele",
+        "days_before_to_include": 0,
+        "days_after_to_include": 0,
+        "dt_min": 70,
+        "dt_max": 100,
+        "roi_path": "data/roi.xml",
+        "sector_prior_file": None,
+        "variables_names": ["V"],
+    },
+    "preprocessing": {
+        "subsample_factor": 1,
+        "subsample_method": "regular",
+        "filter_kwargs": {
+            "min_velocity": 0.5,
+            "filter_outliers": False,
+            "tails_percentile": 0.005,
+            "apply_2d_median": False,
+            "median_window_size": 5,
+            "median_threshold_factor": 3,
+            "apply_2d_gaussian": False,
+            "gaussian_sigma": 1.0,
+        },
+    },
+    "priors": {
+        "probability": None,
+        "fade_method": "constant",
+        "fade_options": {
+            "idw": {"power": 2},
+            "linear": {"max_distance": 100},
+            "exponential": {"decay_rate": 0.001},
+        },
+    },
+    "mcmc": {
+        "sample_options": {
+            "target_accept": 0.9,
+            "draws": 2000,
+            "tune": 1000,
+            "chains": 4,
+            "cores": 4,
+            "random_seed": 8927,
+        },
+        "model_options": {
+            "mu_params": {"mu": 0, "sigma": 1},
+            "sigma_params": {"sigma": 1},
+        },
+        "velocity_transform": None,
+        "transform_params": {},
+        "mrf_regularization": True,
+        "mrf_kwargs": {"n_neighbors": 8, "length_scale": 50, "beta": 2.0, "n_iter": 5},
+        "second_pass": "short",
+        "second_pass_sample_args": {
+            "draws": 500,
+            "tune": 300,
+            "chains": 4,
+            "cores": 4,
+            "target_accept": 0.9,
+        },
+    },
+    "multiscale": {
+        "sigma_values": [0],
+        "aggregation": {
+            "similarity_threshold": 0.7,
+            "overall_threshold": 0.8,
+        },
+    },
+    "postprocessing": {
+        "split_disconnected_components": True,
+        "erosion_iterations": 0,
+        "dilation_iterations": 0,
+        "min_cluster_size": 50,
+        "connectivity": 8,
+        "keep_only_largest_n": -1,
+        "sector_assignment": {
+            "method": "y_position",  # We use the centroid Y position to order sectors from bottom to top (A=lowest Y)
+            "ascending": False,  # The y axis is inverted in image coordinates (0 at top), hence ascending=False
+            "sector_colors": {
+                "A": "#b3140b",
+                "B": "#ee9c21",
+                "C": "#f1ee30",
+                "D": "#5fb61c",
+            },
+        },
+        "vectorization": {
+            "method": "smoothify",
+            "buffer_distance": 2.0,
+            "simplify_tolerance": 0.0,
+        },
+    },
+    "random_seed": 8927,
+    "database": {
+        "host": "localhost",
+        "port": 5432,
+        "name": "planpincieux",
+        "user": "postgres",
+        "password": "password",
+    },
+    "api": {
+        "host": "localhost",
+        "port": 8080,
+        "image_view": "images",
+    },
+    # Interpolated strings for convenience
+    "db_url": "postgresql://${database.user}:${database.password}@${database.host}:${database.port}/${database.name}",
+    "api_url": "http://${api.host}:${api.port}",
+}
+
 
 def _find_config_path() -> Path:
     """Find config.yaml via env var or by searching common locations."""
-    # 1) Explicit override
     env_path = os.getenv("PPCX_CONFIG")
     if env_path:
-        return Path(env_path).expanduser().resolve()
-    # 2) CWD (works for `python make_collapses_plots.py` from repo folder)
-    for name in ("config.yaml", "config.yml"):
-        p = Path.cwd() / name
-        if p.exists():
-            return p.resolve()
-    # 3) Near this file (works if run from other dirs)
+        path = Path(env_path).expanduser().resolve()
+        if path.exists():
+            return path
+
+    candidates = ["config.yaml", "config.yml"]
+    search_dirs = [Path.cwd()]
+
     here = Path(__file__).resolve()
-    for base in [here.parent, *here.parents]:
-        for name in ("config.yaml", "config.yml"):
+    search_dirs.extend([here.parent, *here.parents])
+
+    for base in search_dirs:
+        for name in candidates:
             p = base / name
             if p.exists():
                 return p.resolve()
-    # Fallback (may raise later if missing)
+
+    # Fallback to CWD even if missing
     return (Path.cwd() / "config.yaml").resolve()
 
 
-# Determine config path
-CONFIG_PATH = _find_config_path()
+def load_config(config_path: Path | str | None = None) -> DictConfig:
+    """
+    Load configuration: Defaults -> File -> Env Vars.
+    Returns an OmegaConf DictConfig object.
+    """
+    # 1. Start with defaults
+    cfg = OmegaConf.create(_DEFAULT_CONFIG)
 
+    # 2. Merge from file
+    config_path = Path(config_path) if config_path else _find_config_path()
 
-@dataclass
-class ConfigManager:
-    """Singleton configuration manager using OmegaConf and dataclass properties."""
+    if config_path.exists():
+        file_cfg = OmegaConf.load(config_path)
+        cfg = OmegaConf.merge(cfg, file_cfg)
+        logger.debug(f"Loaded config from {config_path}")
+    else:
+        logger.debug(f"Config file {config_path} not found. Using defaults.")
 
-    _instance: ConfigManager | None = field(default=None, init=False, repr=False)
-    _config: DictConfig | None = field(default=None, init=False, repr=False)
-    config_path: Path = field(default=CONFIG_PATH)
+    # 3. Merge from Environment Variables (Specific Overrides)
+    # Map Env Var Name -> Config Key (dot notation)
+    env_overrides = {
+        "DB_HOST": "database.host",
+        "DB_PORT": "database.port",
+        "DB_NAME": "database.name",
+        "DB_USER": "database.user",
+        "DB_PASSWORD": "database.password",
+        "APP_HOST": "api.host",
+        "APP_PORT": "api.port",
+        "GET_IMAGE_VIEW": "api.image_view",
+    }
 
-    def __repr__(self) -> str:
-        return f"ConfigManager(config_path={self.config_path}, config={self.config})"
+    for env_key, cfg_key in env_overrides.items():
+        val = os.getenv(env_key)
+        if val is not None:
+            OmegaConf.update(cfg, cfg_key, val)
 
-    def __new__(cls, config_path: Path = CONFIG_PATH):
-        """Create a singleton instance of ConfigManager."""
-        if cls._instance is None:
-            # If no instance exists, create one
-            cls._instance = super().__new__(cls)
+    # Ensure we return a DictConfig (OmegaConf.load can return a ListConfig for top-level lists)
+    if not isinstance(cfg, DictConfig):
+        raise TypeError(
+            f"Loaded configuration must be a DictConfig, got {type(cfg).__name__!r}"
+        )
 
-            # Set the config_path only on first creation
-            cls._instance.config_path = config_path
-
-        # Return the singleton instance
-        return cls._instance
-
-    def __post_init__(self):
-        if self._config is None:
-            self._config = self._load_config(self.config_path)
-
-    def _load_config(self, config_path: Path) -> DictConfig:
-        """Load configuration from YAML file with environment variable overrides."""
-        if not config_path.exists():
-            raise FileNotFoundError(f"Config file not found: {config_path}")
-        config = OmegaConf.load(config_path)
-
-        # Override with environment variables if they exist
-        env_overrides = {
-            "database.host": os.getenv("DB_HOST"),
-            "database.port": os.getenv("DB_PORT"),
-            "database.name": os.getenv("DB_NAME"),
-            "database.user": os.getenv("DB_USER"),
-            "database.password": os.getenv("DB_PASSWORD"),
-            "api.host": os.getenv("APP_HOST"),
-            "api.port": os.getenv("APP_PORT"),
-            "api.image_view": os.getenv("GET_IMAGE_VIEW"),
-        }
-        for key, value in env_overrides.items():
-            if value is not None:
-                OmegaConf.update(config, key, value)
-        return config if isinstance(config, DictConfig) else DictConfig(config)
-
-    @property
-    def config(self) -> DictConfig:
-        """Get the configuration object."""
-        if self._config is None:
-            self._config = self._load_config(self.config_path)
-        return self._config
-
-    def get(self, key: str, default: Any = None) -> Any:
-        """Get a configuration value by dot notation key."""
-        try:
-            return OmegaConf.select(self.config, key)
-        except Exception:
-            return default
-
-    def set(self, key: str, value: Any) -> None:
-        """Set a configuration value by dot notation key."""
-        OmegaConf.update(self.config, key, value)
-
-    def reload(self) -> None:
-        """Reload the configuration file from disk."""
-        self._config = self._load_config(self.config_path)
-        logger.info(f"Configuration reloaded from {self.config_path}")
-
-    @property
-    def db_url(self) -> str:
-        """Get database connection URL."""
-        db = self.config.database
-        return f"postgresql://{db.user}:{db.password}@{db.host}:{db.port}/{db.name}"
-
-    @property
-    def api_url(self) -> str:
-        """Get API base URL."""
-        api = self.config.api
-        return f"http://{api.host}:{api.port}"
-
-    def get_api_url(self, endpoint: str = "") -> str:
-        """Get API base URL or specific endpoint URL."""
-        base_url = self.api_url
-        return f"{base_url}/{endpoint.lstrip('/')}" if endpoint else base_url
+    return cfg

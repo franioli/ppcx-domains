@@ -17,9 +17,9 @@ from matplotlib import colormaps as cm
 from matplotlib import patches as mpatches
 from matplotlib import pyplot as plt
 from matplotlib.colors import Normalize
+from omegaconf import DictConfig
 
-from ppcluster import logger
-from ppcluster.config import ConfigManager
+from ppcluster import load_config, logger
 
 
 def parse_arguments():
@@ -165,8 +165,8 @@ def load_sector_results(folder: Path, base_name: str | None = None):
 
 def create_velocity_time_series(
     results_list: list,
-    config: ConfigManager,
     output_path: Path,
+    config: DictConfig,
 ):
     """
     Create time series plots of velocity statistics per sector.
@@ -174,6 +174,7 @@ def create_velocity_time_series(
     Args:
         results_list: List of result dictionaries from load_sector_results
         output_path: Path to save the figure
+        config: DictConfig instance with configuration
     """
     # Collect data for each sector
     dates = []
@@ -338,7 +339,7 @@ def create_velocity_time_series(
 def create_sectors_evolution_figure(
     results_list: list,
     output_path: Path,
-    config: ConfigManager,
+    config: DictConfig,
     max_dates: int = 12,
     ncols: int = 4,
 ):
@@ -348,7 +349,7 @@ def create_sectors_evolution_figure(
     Args:
         results_list: List of result dictionaries
         output_path: Path to save the figure
-        config: ConfigManager instance for loading images
+        config: DictConfig instance for loading images
         max_dates: Maximum number of dates to show
         ncols: Number of columns in the subplot grid
     """
@@ -469,7 +470,7 @@ def export_statistics_table(results_list: list, output_path: Path):
 
 
 def main(args: argparse.Namespace, config_path: Path | None = None):
-    config = ConfigManager(config_path) if config_path else ConfigManager()
+    config = load_config(config_path)
 
     input_dir = args.dir
     if not input_dir.exists():
