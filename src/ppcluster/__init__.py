@@ -12,4 +12,17 @@ from ppcluster import (
 from ppcluster.config import ConfigManager  # noqa: F401
 from ppcluster.utils.logger import get_logger, set_log_level, setup_logger  # noqa: F401
 
-logger = setup_logger(logging.INFO, name="ppcx", force=True)
+# Create the logger but DO NOT add StreamHandlers/FileHandlers here.
+# Only set a default level (INFO), but no output will happen yet.
+logger = logging.getLogger("ppcx")
+logger.addHandler(logging.NullHandler())
+logger.setLevel(logging.INFO)
+
+__all__ = [
+    "mcmc",
+    "utils",
+    "ConfigManager",
+    "get_logger",
+    "set_log_level",
+    "setup_logger",
+]

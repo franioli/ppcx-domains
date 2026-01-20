@@ -11,16 +11,75 @@ import re
 from pathlib import Path
 
 import joblib
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib import colormaps as cm
 from matplotlib import patches as mpatches
+from matplotlib import pyplot as plt
 from matplotlib.colors import Normalize
 
 from ppcluster import logger
 from ppcluster.config import ConfigManager
-from ppcluster.mksectors import draw_polygon
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="Analyze time series of clustering results"
+    )
+    parser.add_argument(
+        "--dir",
+        "-d",
+        type=Path,
+        required=True,
+        help="Base directory containing result folders (e.g., output)",
+    )
+    parser.add_argument(
+        "--out",
+        "-o",
+        type=Path,
+        default=None,
+        help="Output directory for time series plots (default: input_dir/time_series)",
+    )
+    parser.add_argument(
+        "--folder-pattern",
+        default=r".*_\d{4}-\d{2}-\d{2}_mcmc$",
+        help="Regex pattern for result folder names",
+    )
+    parser.add_argument(
+        "--max-dates",
+        type=int,
+        default=31,
+        help="Maximum number of dates to show in evolution figure",
+    )
+    return parser.parse_args()
+
+
+def draw_polygon(
+    ax_draw: plt.Axes,
+    poly_coords: np.ndarray | None,
+    color_hex: str,
+    *,
+    fill_alpha: float = 0.1,
+    zorder: int = 1,
+) -> None:
+    if poly_coords is None or len(poly_coords) < 3:
+        return
+    ax_draw.fill(
+        poly_coords[:, 0],
+        poly_coords[:, 1],
+        color=color_hex,
+        alpha=fill_alpha,
+        lw=0,
+        zorder=zorder,
+    )
+    ax_draw.plot(
+        np.r_[poly_coords[:, 0], poly_coords[0, 0]],
+        np.r_[poly_coords[:, 1], poly_coords[0, 1]],
+        color=color_hex,
+        lw=2,
+        zorder=zorder + 1,
+    )
+    cx, cy = np.mean(poly_coords, axis=0)
 
 
 def find_result_folders(base_dir: Path, pattern: str = r".*_\d{4}-\d{2}-\d{2}_mcmc$"):
@@ -468,33 +527,5 @@ def main(args: argparse.Namespace, config_path: Path | None = None):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Analyze time series of clustering results"
-    )
-    parser.add_argument(
-        "--dir",
-        "-d",
-        type=Path,
-        required=True,
-        help="Base directory containing result folders (e.g., output)",
-    )
-    parser.add_argument(
-        "--out",
-        "-o",
-        type=Path,
-        default=None,
-        help="Output directory for time series plots (default: input_dir/time_series)",
-    )
-    parser.add_argument(
-        "--folder-pattern",
-        default=r".*_\d{4}-\d{2}-\d{2}_mcmc$",
-        help="Regex pattern for result folder names",
-    )
-    parser.add_argument(
-        "--max-dates",
-        type=int,
-        default=31,
-        help="Maximum number of dates to show in evolution figure",
-    )
-    args = parser.parse_args()
+    args = parse_arguments()
     main(args=args)

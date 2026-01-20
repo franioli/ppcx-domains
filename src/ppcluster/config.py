@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from dotenv import find_dotenv, load_dotenv
 from omegaconf import DictConfig, OmegaConf
@@ -10,10 +12,7 @@ from omegaconf import DictConfig, OmegaConf
 logger = logging.getLogger("ppcx")
 
 
-def _init_env() -> None:
-    """Load environment variables from the nearest .env (like VS Code does)."""
-    # Search upward from current working dir
-    load_dotenv(find_dotenv(usecwd=True), override=False)
+load_dotenv(find_dotenv(usecwd=True), override=False)
 
 
 def _find_config_path() -> Path:
@@ -38,9 +37,6 @@ def _find_config_path() -> Path:
     return (Path.cwd() / "config.yaml").resolve()
 
 
-# Load env early
-_init_env()
-
 # Determine config path
 CONFIG_PATH = _find_config_path()
 
@@ -49,7 +45,7 @@ CONFIG_PATH = _find_config_path()
 class ConfigManager:
     """Singleton configuration manager using OmegaConf and dataclass properties."""
 
-    _instance: Optional["ConfigManager"] = field(default=None, init=False, repr=False)
+    _instance: ConfigManager | None = field(default=None, init=False, repr=False)
     _config: DictConfig | None = field(default=None, init=False, repr=False)
     config_path: Path = field(default=CONFIG_PATH)
 

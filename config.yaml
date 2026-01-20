@@ -1,6 +1,6 @@
 # Data selection parameters
 data:
-  output_dir: "output_2021"
+  output_dir: "output"
   reference_date: "2021-08-15"
   camera_name: "PPCX_Tele"
   days_before_to_include: 0
@@ -86,10 +86,21 @@ postprocessing:
   erosion_iterations: 0      # Number of erosion iterations to disconnect narrow bridges
   dilation_iterations: 0     # Number of dilation iterations to restore cluster size
   split_disconnected_components: true
-  min_cluster_size: 100      # Minimum number of pixels for a cluster to survive
+  min_cluster_size: -1      # Minimum number of pixels for a cluster to survive
   # min_cluster_size_px: 100  # Minimum cluster size for second pass processing
   connectivity: 8           # 4 or 8 connectivity for component analysis (for all postproc steps)
-  keep_only_largest_n: 4    # Keep only the largest N clusters, -1 to keep all
+  keep_only_largest_n: -1    # Keep only the largest N clusters, -1 to keep all
+  vectorization:
+    method: "smoothify"  # "convex_hull" | "cell_union" | "alphashape" | "smoothify"
+    buffer_distance: 2.0
+    simplify_tolerance: 0.0
+  sector_assignment:
+    # method: "centroid"  # "centroid" | "max_overlap"
+    sector_colors:
+      A: "#b3140b"
+      B: "#ee9c21"
+      C: "#f1ee30"
+      D: "#5fb61c"
 
 # Morpho-kinematic analysis parameters
 morphokinematic:

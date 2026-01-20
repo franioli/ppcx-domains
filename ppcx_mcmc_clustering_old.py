@@ -5,7 +5,6 @@ from datetime import datetime
 from pathlib import Path
 
 import arviz as az
-import geopandas as gpd
 import joblib
 import matplotlib.colors as mcolors
 import matplotlib.patches as mpatches
@@ -14,7 +13,6 @@ import pandas as pd
 import pymc as pm
 from matplotlib import pyplot as plt
 from matplotlib.colors import Normalize
-from shapely.geometry import Polygon
 from sklearn.preprocessing import StandardScaler
 from sqlalchemy import create_engine
 
@@ -26,10 +24,14 @@ from ppcluster.cvat import (
 )
 from ppcluster.griddata import create_2d_grid
 from ppcluster.mksectors import (
+    SectorPolygons,
     assign_sector_labels,
-    classify_points,
+    classify_points_by_sectors,
     compute_sector_stats,
-    vectorize_grid_to_gdf,
+    draw_polygon,
+    remove_polygon_overlaps,
+    validate_no_overlaps,
+    vectorize_clusters,
 )
 from ppcluster.postproc import (
     aggregate_multiscale_clustering,
@@ -298,7 +300,7 @@ def create_summary_figure(
     img: np.ndarray,
     df: pd.DataFrame,
     mk_stats: pd.DataFrame,
-    gdf_sectors: gpd.GeoDataFrame,
+    polygons: SectorPolygons,
     colors: dict[str, str],
     base_name: str,
     output_dir: Path,
@@ -313,8 +315,17 @@ def create_summary_figure(
     """
     Create summary figure with:
         1) Velocity field + vectors
-        2) Sector polygons (from GeoDataFrame)
+        2) Sector polygons
         3) Compact statistics table
+
+    Args:
+        img: background image
+        df: dataframe with columns x,y,u,v,V
+        mk_stats: stats dataframe from compute_sector_stats
+        polygons: SectorPolygons (letter -> coords)
+        colors: map {letter: hex_color}
+        cluster_to_letter: cluster id -> letter mapping
+        stat_cols: optional column subset for table
     """
     try:
         if stat_cols is None:
@@ -323,6 +334,7 @@ def create_summary_figure(
                 "v_mean",
                 "v_std",
                 "v_median",
+                "v_mad",
                 "n_points",
                 "area_px2",
                 "compactness",
@@ -379,30 +391,19 @@ def create_summary_figure(
 
         # 2) Sector polygons
         ax_sectors.imshow(img, cmap="gray")
-
-        # Plot sectors using GeoPandas
-        # Create a color column based on label mapping
-        plot_gdf = gdf_sectors.copy()
-        plot_gdf["color"] = plot_gdf["label"].map(colors)
-
-        plot_gdf.plot(
-            ax=ax_sectors,
-            color=plot_gdf["color"],
-            alpha=0.3,
-            edgecolor=plot_gdf["color"],
-            linewidth=2,
-        )
-
-        # Add legend manually to match style
-        legend_patches = [
-            mpatches.Patch(color=colors[label], label=label, alpha=0.55)
-            for label in sorted(colors.keys())
-            if label in gdf_sectors["label"].values
-        ]
-
+        legend_patches = {}
+        for letter in sorted(colors.keys()):
+            coords = polygons.get(letter)
+            if coords is None:
+                continue
+            draw_polygon(ax_sectors, coords, colors[letter], fill_alpha=0.13, zorder=1)
+            legend_patches[letter] = mpatches.Patch(
+                color=colors[letter], label=f"{letter}", alpha=0.55
+            )
         if legend_patches:
             ax_sectors.legend(
-                handles=legend_patches,
+                handles=list(legend_patches.values()),
+                labels=list(legend_patches.keys()),
                 loc="upper right",
                 fontsize=8,
                 framealpha=0.9,
@@ -415,8 +416,7 @@ def create_summary_figure(
         # 3) Statistics table
         ax_table.axis("off")
         display_df = mk_stats[available].copy()
-
-        # Formatting
+        # formatting
         for c in display_df.columns:
             if c == "label":
                 continue
@@ -425,7 +425,7 @@ def create_summary_figure(
             else:
                 display_df[c] = display_df[c].round(2)
 
-        # Limit rows
+        # limit columns (sector labels) if too many
         if display_df.shape[0] > max_labels_in_table:
             display_df = display_df.iloc[:max_labels_in_table, :]
 
@@ -440,15 +440,12 @@ def create_summary_figure(
         table.auto_set_font_size(False)
         table.set_fontsize(7)
         table.scale(1.05, 1.6)
-
-        # Style table headers
         for (i, j), cell in table.get_celld().items():
             if i == 0 or j == -1:
                 cell.set_facecolor("#E8E8E8")
                 cell.set_text_props(weight="bold", size=7)
             else:
                 cell.set_facecolor("white")
-
         ax_table.set_title("Sector Statistics", fontsize=11, pad=6)
 
         summary_fig.suptitle(base_name, fontsize=13, weight="bold", y=0.985)
@@ -468,7 +465,8 @@ def save_sector_results(
     output_dir: Path,
     base_name: str,
     *,
-    gdf_sectors: gpd.GeoDataFrame,
+    sector_polygons: SectorPolygons,
+    cluster_to_letter: dict[int, str],
     mk_stats: pd.DataFrame,
     posterior_probs: np.ndarray | None = None,
     cluster_pred: np.ndarray | None = None,
@@ -478,22 +476,29 @@ def save_sector_results(
     export_shapefile: bool = False,
 ) -> dict[str, Path]:
     """
-    Persist final sector results.
+    Persist final sector results in reusable formats.
 
     Saves:
-    - Bundle (.joblib): python dict with dataframes
-    - Arrays (.npz): raw numpy arrays
-    - GIS (.geojson/.shp): Merged geometry + stats, optionally with Y-inversion.
+    - Python bundle (.joblib): mappings, arrays, stats (as dict)
+    - NumPy bundle (.npz): arrays only
+    - GeoJSON (+ optional Shapefile) with Y inverted for GIS (origin bottom-left)
+
+    Args:
+        img_shape: (H, W) used to invert Y for GIS export (y_qgis = H-1 - y)
+
+    Returns:
+        Dict of artifact name -> Path (existing exports only).
     """
     artifacts: dict[str, Path] = {}
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) Pythonized bundle (Simplified: just dict of DF/GDF/Arrays)
+    # 1) Pythonized bundle
     try:
-        # Convert GDF to list-dict for plain pickling if needed, or just keep GDF
         bundle = {
-            "gdf_sectors": gdf_sectors,
-            "mk_stats": mk_stats,
+            "cluster_to_letter": cluster_to_letter,
+            "letter_to_cluster": {v: k for k, v in cluster_to_letter.items()},
+            "sector_vertices": {lab: coords for lab, coords in sector_polygons.items()},
+            "mk_stats": mk_stats.to_dict(orient="list"),
             "posterior_probs": posterior_probs,
             "cluster_pred": cluster_pred,
             "uncertainty": uncertainty,
@@ -519,63 +524,57 @@ def save_sector_results(
     except Exception as exc:
         logger.warning(f"Failed saving npz arrays: {exc}")
 
-    # 3) GIS export
+    # 3) Geo export (GeoJSON / Shapefile)
     if export_geojson or export_shapefile:
-        if gdf_sectors.empty:
+        if not sector_polygons.geometries:
             logger.warning("No geometries to export for GIS.")
             return artifacts
-
         try:
-            # Merge stats into GDF for a rich export file
-            export_gdf = gdf_sectors.merge(mk_stats, on="label", how="left")
+            import geopandas as gpd
+            from shapely.geometry import Polygon
 
-            # Handle Y-Inversion for GIS compatibility (Image Origin vs Map Origin)
             H = img_shape[0] if (img_shape and len(img_shape) >= 1) else None
 
-            if H is not None:
-                # Invert Y coordinate: y_new = H - 1 - y_old
-                def invert_y(geom):
-                    if geom.is_empty:
-                        return geom
-                    # shapely scalar transform
-                    return scale(
-                        translate(geom, yoff=-(H - 1)), yfact=-1, origin=(0, 0)
-                    )
-                    # Or manual rebuild to be safe without imports:
-                    # return Polygon([(x, H - 1 - y) for x, y in geom.exterior.coords])
+            records = []
+            for lab, geom in sector_polygons.geometries.items():
+                if geom is None or geom.is_empty:
+                    continue
+                # Invert Y for GIS if possible
+                if H is not None:
+                    inv_exterior = [
+                        (x, H - 1 - y) for x, y in geom.exterior.coords[:-1]
+                    ]
+                    geom_qgis = Polygon(inv_exterior)
+                else:
+                    geom_qgis = geom
+                records.append(
+                    {
+                        "sector": lab,
+                        "n_points": int(
+                            mk_stats.loc[mk_stats["label"] == lab, "n_points"].iloc[0]
+                            if lab in mk_stats["label"].values
+                            else 0
+                        ),
+                        "area_px2": float(geom.area),
+                        "compactness": float(
+                            (4 * np.pi * geom.area) / (geom.length**2 + 1e-12)
+                        ),
+                        "geometry": geom_qgis,
+                    }
+                )
 
-                # Manual reliable inversion loop for polygons
-                new_geoms = []
-                for geom in export_gdf.geometry:
-                    if geom.geom_type == "Polygon":
-                        new_g = Polygon(
-                            [(x, H - 1 - y) for x, y in geom.exterior.coords]
-                        )
-                        new_geoms.append(new_g)
-                    elif geom.geom_type == "MultiPolygon":
-                        # Handle multi-polygons if present
-                        parts = [
-                            Polygon([(x, H - 1 - y) for x, y in p.exterior.coords])
-                            for p in geom.geoms
-                        ]
-                        from shapely.ops import unary_union
-
-                        new_geoms.append(unary_union(parts))
-                    else:
-                        new_geoms.append(geom)  # Fallback
-
-                export_gdf.geometry = new_geoms
+            gdf = gpd.GeoDataFrame(records, geometry="geometry", crs=None)
 
             if export_geojson:
                 geojson_path = output_dir / f"{base_name}_sectors.geojson"
-                export_gdf.to_file(geojson_path, driver="GeoJSON")
+                gdf.to_file(geojson_path, driver="GeoJSON")
                 artifacts["geojson"] = geojson_path
 
             if export_shapefile:
                 shp_dir = output_dir / f"{base_name}_shp"
                 shp_dir.mkdir(exist_ok=True)
                 shp_path = shp_dir / f"{base_name}_sectors.shp"
-                export_gdf.to_file(shp_path)
+                gdf.to_file(shp_path)
                 artifacts["shapefile"] = shp_path
 
         except Exception as exc:
@@ -904,13 +903,14 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
             kin_cluster_grid, connectivity=connectivity, start_label=0
         )
 
-    # Remove very small components and merge to nearest neighbor
-    kin_cluster_grid = remove_small_grid_components(
-        label_grid=kin_cluster_grid,
-        min_size=20,
-        connectivity=connectivity,
-        merge_strategy="merge",  # or "merge" to assign to nearest neighbor
-    )
+    # Remove small components at grid level
+    if min_cluster_size > 0:
+        kin_cluster_grid = remove_small_grid_components(
+            label_grid=kin_cluster_grid,
+            min_size=min_cluster_size,
+            connectivity=connectivity,
+            merge_strategy="merge",  # or "merge" to assign to nearest neighbor
+        )
 
     # Apply morphological operations (erosion + dilation)
     if erosion_iters > 0 or dilation_iters > 0:
@@ -921,7 +921,7 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
             min_cluster_size=min_cluster_size,
             connectivity=connectivity,
         )
-    # Remove small components again after morph operations (do not merge)
+    # Remove small components again after morph operations
     if min_cluster_size > 0:
         kin_cluster_grid = remove_small_grid_components(
             label_grid=kin_cluster_grid,
@@ -970,7 +970,13 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
     )
     plt.close(fig)
 
-    # === STEP 2: Vectorize clusters to GeoDataFrame ===
+    # === STEP 2: Vectorize clusters to polygons ===
+    from ppcluster.mksectors import (
+        vectorize_grid_to_gdf,
+        assign_sector_labels,
+        classify_points,
+        compute_sector_stats,
+    )
     # DEBUG --- save intermediate grid result to file for inspection
     joblib.dump(
         {
@@ -980,60 +986,79 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
         },
         output_dir / f"{base_name}_kinematic_clustering_cleaned.joblib",
     )
+
     logger.info("Vectorizing grid clusters to polygons...")
-
-    # DIRECT REPLACEMENT OF vectorization, labeling, and overlap removal
-    # 1. Vectorize & Smooth
-    gdf_sectors = vectorize_grid_to_gdf(kin_cluster_grid, X, Y, smooth_iterations=3)
-
-    # 2. Assign Labels (A, B, C...)
-    # We use the centroid Y position to order sectors from bottom to top (A=lowest Y)
-    # The y axis is inverted in image coordinates (0 at top), hence ascending=False
-    gdf_sectors = assign_sector_labels(
-        gdf_sectors, order_by="y_position", ascending=False
+    vct_config = postproc_config.get("vectorization", {})
+    polygons_from_clusters = vectorize_clusters(
+        kin_cluster_grid,
+        X,
+        Y,
+        method=vct_config.get("method", "smoothify"),
+        buffer_distance=vct_config.get("buffer_distance", 2.0),
+        simplify_tolerance=vct_config.get("simplify_tolerance", 0),
     )
 
-    # 3. Colors mapping
-    # Try to load user-defined colors from config
-    # Look in postprocessing -> sector_assignment -> sector_colors
-    colors = {}
-    user_colors = postproc_config.get("sector_assignment", {}).get("sector_colors", {})
-    for i, row in enumerate(gdf_sectors.itertuples()):
-        label = row.label
-        if label in user_colors:
-            colors[label] = user_colors[label]
-        else:
-            # Fallback to tab10 colormap if specific label not found in config
-            def_cmap = plt.get_cmap("tab10")
-            colors[label] = mcolors.to_hex(def_cmap(i % 10))
-    cmap = mcolors.ListedColormap([colors[label] for label in sorted(colors.keys())])
+    # === STEP 3: Assign sector letters (A, B, C, D...) ===
+    logger.info("Assigning sector letters to clusters...")
+    assignment_result = assign_sector_labels(
+        cluster_grid=kin_cluster_grid,
+        Y=Y,
+        polygons=polygons_from_clusters,
+        order_by="y_position",  # Options: 'y_position', 'area', 'cluster_id'
+        reverse_order=True,  # True = bottom-to-top (largest Y first)
+        label_prefix="",  # Use '' for A,B,C... or 'S' for S0,S1,S2...
+    )
+    cluster_to_letter = assignment_result["cluster_to_letter"]
+    ordered_clusters_ids = assignment_result["ordered_cluster_ids"]
+    sector_polygons = assignment_result["sector_polygons"]
 
-    # --- Plot Morpho-Kinematic Sectors ---
+    # Remove overlaps between sector polygons  (A has priority, then B, then C, etc.)
+    logger.info("Removing overlaps between sector polygons...")
+    ordered_sector_letters = [cluster_to_letter[cid] for cid in ordered_clusters_ids]
+    sector_polygons = remove_polygon_overlaps(
+        polygons=sector_polygons,
+        ordered_labels=ordered_sector_letters,
+        buffer_after_difference=1.0,  # Small buffer to smooth jagged edges
+    )
+    if validate_no_overlaps(sector_polygons, tolerance=1):
+        logger.info("✓ All sector polygons are non-overlapping")
+    else:
+        logger.warning("⚠ Some overlaps may remain (check validation)")
+
+    # Define colors for sectors
+    morphokinematic_config = config.get("morphokinematic", {})
+    sector_colors = morphokinematic_config.get("sector_colors", None)
+    default_cmap = plt.get_cmap("tab10")
+    colors = {}
+    for idx, letter in enumerate(sorted(cluster_to_letter.values())):
+        if sector_colors is not None and letter in sector_colors:
+            colors[letter] = sector_colors[letter]
+        else:
+            colors[letter] = mcolors.to_hex(default_cmap(idx % default_cmap.N))
+
+    # Plot morpho-kinematic sectors
     fig, ax = plt.subplots(figsize=(8, 8))
     ax.imshow(img, alpha=0.5, cmap="gray")
-    gdf_sectors.plot(
-        ax=ax,
-        column="label",
-        cmap=cmap,
-        alpha=0.4,
-        edgecolor="black",
-        linewidth=2,
-    )
-    for _, row in gdf_sectors.iterrows():
-        cent = row.geometry.centroid
-        ax.text(
-            cent.x,
-            cent.y,
-            row["label"],
-            fontsize=12,
-            weight="bold",
-            color="white",
-            ha="center",
-            va="center",
+    legend_patches = {}
+    for letter in sorted(cluster_to_letter.values()):
+        poly = sector_polygons.get(letter)
+        if poly is not None:
+            draw_polygon(ax, poly, colors[letter], fill_alpha=0.15, zorder=1)
+            legend_patches[letter] = mpatches.Patch(
+                color=colors[letter], label=f"Sector {letter}", alpha=0.5
+            )
+    if legend_patches:
+        ax.legend(
+            handles=list(legend_patches.values()),
+            labels=list(legend_patches.keys()),
+            loc="upper right",
+            fontsize=10,
+            framealpha=0.9,
         )
     ax.set_title("Morpho-Kinematic Sectors", fontsize=12)
     ax.set_aspect("equal")
-    ax.axis("off")
+    ax.set_xticks([])
+    ax.set_yticks([])
     fig.savefig(
         output_dir / f"{base_name}_morphokinematic_sectors.png",
         dpi=300,
@@ -1041,14 +1066,35 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
     )
     plt.close(fig)
 
-    # === Compute sector statistics ===
-    # Classify the original points dataframe
-    velocity_df = classify_points(gdf_sectors, dic_df.copy(), x_col="x", y_col="y")
-
-    # Compute table
-    mk_stats = compute_sector_stats(gdf_sectors, velocity_df, value_col="V")
+    # Compute sector statistics
+    velocity_df = dic_df.copy()
+    x = velocity_df["x"].to_numpy()
+    y = velocity_df["y"].to_numpy()
+    v = velocity_df["V"].to_numpy()
+    point_sector_labels = classify_points_by_sectors(
+        polygons=sector_polygons,
+        x=x,
+        y=y,
+    )
+    assigned_mask = point_sector_labels != ""
+    x_assigned = x[assigned_mask]
+    y_assigned = y[assigned_mask]
+    v_assigned = v[assigned_mask]
+    labels_assigned = point_sector_labels[assigned_mask]
+    logger.info(
+        f"Using {len(x_assigned)} / {len(x)} assigned points for statistics "
+        f"({100 * len(x_assigned) / len(x):.1f}%)"
+    )
+    mk_stats = compute_sector_stats(
+        polygons=sector_polygons,
+        point_labels=labels_assigned,
+        x=x_assigned,
+        y=y_assigned,
+        v=v_assigned,
+    )
     mk_stats.to_csv(
-        output_dir / f"{base_name}_morphokinematic_sector_stats.csv", index=False
+        output_dir / f"{base_name}_morphokinematic_sector_stats.csv",
+        index=False,
     )
 
     logger.info(f"Saved sector statistics: {len(mk_stats)} sectors")
@@ -1059,7 +1105,7 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
         img=img,
         df=velocity_df,
         mk_stats=mk_stats,
-        gdf_sectors=gdf_sectors,
+        polygons=sector_polygons,
         colors=colors,
         base_name=base_name,
         output_dir=output_dir,
@@ -1070,17 +1116,18 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
         summary_dir = output_base_dir / "summary_figures"
         summary_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy(summary_path, summary_dir / f"{base_name}_sectors.png")
-        logger.info(f"Copied summary figure to {summary_dir}")
+        logger.info("Copied summary figure to %s", summary_dir)
 
-    # Save artifacts
+    # After mk_stats creation (right after saving CSV)
     artifacts = save_sector_results(
         output_dir=output_dir,
         base_name=base_name,
-        gdf_sectors=gdf_sectors,
+        sector_polygons=sector_polygons,
+        cluster_to_letter=cluster_to_letter,
         mk_stats=mk_stats,
         posterior_probs=posterior_probs,
         cluster_pred=cluster_pred,
-        uncertainty=entropy,
+        uncertainty=entropy,  # or use 'uncertainty' if available
         img_shape=img.size if img is not None else None,
         export_geojson=True,
         export_shapefile=False,

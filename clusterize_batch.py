@@ -1,73 +1,77 @@
 import argparse
-import concurrent.futures
+import logging
 import random
 import subprocess
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from joblib import Parallel, delayed
+from tqdm import tqdm
+
+logger = logging.getLogger("ppcx")
+
 
 def parse_args():
-    p = argparse.ArgumentParser(
+    parser = argparse.ArgumentParser(
         description="Batch launcher for ppcx_mcmc_clustering.py -- run many reference dates."
     )
-    group = p.add_mutually_exclusive_group(required=True)
-    group.add_argument(
-        "--dates",
-        help="Comma separated list of reference dates (YYYY-MM-DD). Example: 2020-01-01,2020-02-02",
-    )
-    group.add_argument(
-        "--date-range",
-        action="store_true",
-        help="Run all consecutive dates between --start and --end (inclusive).",
-    )
-    group.add_argument(
-        "--dates-file",
-        help="File with one date (YYYY-MM-DD) per line.",
-    )
-    group.add_argument(
-        "--random",
-        type=int,
-        help="Pick N random dates between --start and --end (inclusive).",
-    )
-
-    p.add_argument(
-        "--start", help="Start date for random sampling or date range (YYYY-MM-DD)."
-    )
-    p.add_argument(
-        "--end", help="End date for random sampling or date range (YYYY-MM-DD)."
-    )
-    p.add_argument(
-        "--season",
-        help="Optional season to restrict random sampling, format 'M-M' (months numeric 1-12 inclusive). Example: --season 6-10 for Jun-Oct.",
-    )
-    p.add_argument(
-        "--exclude-months",
-        help="Optional months to exclude from random sampling. Format: comma separated months/ranges, e.g. '1-5,11-12' to exclude Jan-May and Nov-Dec.",
-    )
-    p.add_argument(
+    parser.add_argument(
         "--script-path",
         default="ppcx_mcmc_clustering.py",
         help="Path to the clustering script to run (default: ppcx_mcmc_clustering.py).",
     )
-    p.add_argument(
-        "--python",
-        default=sys.executable,
-        help="Python interpreter to invoke (default: current interpreter).",
+    dates_group = parser.add_mutually_exclusive_group(required=True)
+    dates_group.add_argument(
+        "--dates",
+        help="Comma separated list of reference dates (YYYY-MM-DD). Example: 2020-01-01,2020-02-02",
     )
-    p.add_argument(
+    dates_group.add_argument(
+        "--date-range",
+        action="store_true",
+        help="Run all consecutive dates between --start and --end (inclusive).",
+    )
+    dates_group.add_argument(
+        "--dates-file",
+        help="File with one date (YYYY-MM-DD) per line.",
+    )
+    dates_group.add_argument(
+        "--random",
+        type=int,
+        help="Pick N random dates between --start and --end (inclusive).",
+    )
+    parser.add_argument(
+        "--start", help="Start date for random sampling or date range (YYYY-MM-DD)."
+    )
+    parser.add_argument(
+        "--end", help="End date for random sampling or date range (YYYY-MM-DD)."
+    )
+    parser.add_argument(
+        "--season",
+        help="Optional season to restrict random sampling, format 'M-M' (months numeric 1-12 inclusive). Example: --season 6-10 for Jun-Oct.",
+    )
+    parser.add_argument(
+        "--exclude-months",
+        help="Optional months to exclude from random sampling. Format: comma separated months/ranges, e.g. '1-5,11-12' to exclude Jan-May and Nov-Dec.",
+    )
+    parser.add_argument(
         "--max-workers",
         type=int,
         default=1,
         help="Number of parallel processes to run simultaneously (default 1).",
     )
-    p.add_argument(
+    parser.add_argument(
+        "--python",
+        default=sys.executable,
+        help="Python interpreter to invoke (default: current interpreter).",
+    )
+    parser.add_argument(
         "--timeout",
         type=int,
         default=None,
         help="Timeout (seconds) for each run subprocess (default none).",
     )
-    return p.parse_args()
+    return parser.parse_args()
 
 
 def _load_dates_from_file(path: Path):
@@ -169,36 +173,51 @@ def _cleanup_partial_results(date: str):
                     try:
                         shutil.rmtree(folder)
                         removed.append(str(folder))
-                        print(f"[CLEANUP] Removed {folder}")
+                        logger.info(f"[CLEANUP] Removed {folder}")
                     except Exception as exc:
-                        print(f"[CLEANUP] Failed to remove {folder}: {exc}")
+                        logger.warning(f"[CLEANUP] Failed to remove {folder}: {exc}")
 
     if not removed:
-        print(f"[CLEANUP] No partial results found for {date}")
+        logger.debug(f"[CLEANUP] No partial results found for {date}")
 
 
 def run_one_date(
-    python: str, script: str, date: str, timeout=None, cleanup_on_failure=False
-):
-    cmd = [python, script, "--reference-date", date]
-    print(f"[RUN] {' '.join(cmd)}")
+    python: str,
+    script: str,
+    date: str,
+    timeout=None,
+    cleanup_on_failure=False,
+) -> bool:
+    cmd = [python, script, "--date", date]
+    logger.info(f"START {date}")
+
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        ok = proc.returncode == 0
-        if not ok:
-            print(
-                f"[ERR] Date {date} exited {proc.returncode}. stdout/stderr:\n{proc.stdout}\n{proc.stderr}"
-            )
-            if cleanup_on_failure:
-                _cleanup_partial_results(date)
-        else:
-            print(f"[OK] Date {date} completed.")
-        return ok, proc.stdout + proc.stderr
-    except subprocess.TimeoutExpired:
-        print(f"[ERR] Timeout for date {date}")
+
+        if proc.returncode == 0:
+            logger.info(f"SUCCESS {date}")
+            return True
+
+        # Log minimal info on error, detailed info can be inspected if needed
+        logger.error(
+            f"FAILURE {date} (exit code {proc.returncode})\n"
+            f"STDERR snippet: {proc.stderr[-500:] if proc.stderr else 'Empty'}"
+        )
         if cleanup_on_failure:
             _cleanup_partial_results(date)
-        return False, "timeout"
+        return False
+
+    except subprocess.TimeoutExpired:
+        logger.error(f"TIMEOUT {date} (> {timeout}s)")
+        if cleanup_on_failure:
+            _cleanup_partial_results(date)
+        return False
+
+    except Exception as e:
+        logger.error(f"EXCEPTION {date}: {e}")
+        if cleanup_on_failure:
+            _cleanup_partial_results(date)
+        return False
 
 
 def main():
@@ -246,39 +265,24 @@ def main():
         except Exception as exc:
             raise SystemExit(f"Could not sample dates: {exc}") from None
 
-    # run jobs (parallel or sequential)
-    results = {}
-    if args.max_workers == 1:
-        for d in dates:
-            ok, output = run_one_date(
-                args.python, args.script_path, d, timeout=args.timeout
-            )
-            results[d] = ok
-    else:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_workers) as ex:
-            futs = {
-                ex.submit(
-                    run_one_date, args.python, args.script_path, d, args.timeout
-                ): d
-                for d in dates
-            }
-            for fut in concurrent.futures.as_completed(futs):
-                d = futs[fut]
-                try:
-                    ok, _ = fut.result()
-                except Exception as exc:
-                    ok = False
-                    print(f"[ERR] Exception running {d}: {exc}")
-                results[d] = ok
+    # Run jobs (parallel or sequential) with joblib
+    # use prefer='processes' (default) if you want stronger isolation
+    # prefer='threads' is efficient if the tasks are I/O bound (waiting for subprocess).
+    logger.info(f"Running {len(dates)} jobs with max_workers={args.max_workers}...")
+    results = Parallel(n_jobs=args.max_workers, prefer="processes")(
+        delayed(run_one_date)(args.python, args.script_path, d, timeout=args.timeout)
+        for d in tqdm(dates)
+    )
 
     # summary
-    succ = [d for d, ok in results.items() if ok]
-    fail = [d for d, ok in results.items() if not ok]
-    print(f"Done. Success: {len(succ)} failed: {len(fail)}")
-    if succ:
-        print("Succeeded dates:", ", ".join(succ))
-    if fail:
-        print("Failed dates:", ", ".join(fail))
+    success_count = sum(results)
+    total = len(results)
+    logger.info("-" * 40)
+    logger.info(f"SUMMARY: {success_count}/{total} succeeded.")
+    if success_count < total:
+        failed = [d for d, ok in zip(dates, results, strict=True) if not ok]
+        logger.error(f"Failed dates ({len(failed)}): {', '.join(failed)}")
+    logger.info("-" * 40)
 
 
 if __name__ == "__main__":
