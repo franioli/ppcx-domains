@@ -11,6 +11,7 @@ import rasterio.features
 from affine import Affine
 from matplotlib import pyplot as plt
 from matplotlib.colors import Normalize
+from shapely import MultiPolygon
 from shapely.geometry import Polygon, shape
 from smoothify import smoothify
 
@@ -78,6 +79,7 @@ def clean_vector_sectors(
     velocity_merge_threshold: float = 1.6,
     target_number_of_sectors: int = 4,
     force_minimum_sectors: bool = True,
+    fill_holes_area: float = 0.0,
     smooth_geometries: bool = True,
     raster_res: float | None = None,
     smooth_iterations: int = 4,
@@ -116,7 +118,11 @@ def clean_vector_sectors(
     if force_minimum_sectors:
         gdf = _enforce_sector_limit(gdf, target_number_of_sectors)
 
-    # 6. Smooth Geometries (optional)
+    # 6. Fill Holes (if requested)
+    if fill_holes_area > 0.0:
+        gdf = _fill_polygon_holes(gdf, fill_holes_area)
+
+    # 7. Smooth Geometries (optional)
     if smooth_geometries:
         gdf = smoothify(
             gdf,
@@ -850,4 +856,30 @@ def _enforce_sector_limit(gdf: gpd.GeoDataFrame, limit: int) -> gpd.GeoDataFrame
         logger.info(f"Forcing reduction to {limit} sectors (keeping largest).")
         gdf["area"] = gdf.geometry.area
         return gdf.nlargest(limit, columns="area").reset_index(drop=True)
+    return gdf
+
+
+def _fill_polygon_holes(gdf: gpd.GeoDataFrame, threshold: float) -> gpd.GeoDataFrame:
+    """Fills holes within polygons that are smaller than the threshold area."""
+
+    def _fill(geom):
+        if geom is None or geom.is_empty:
+            return geom
+
+        if geom.geom_type == "Polygon":
+            # Keep interiors (holes) only if they are larger than threshold
+            # Smaller holes are removed (effectively filled)
+            new_interiors = [i for i in geom.interiors if Polygon(i).area > threshold]
+            return Polygon(geom.exterior, new_interiors)
+
+        elif geom.geom_type == "MultiPolygon":
+            parts = [_fill(p) for p in geom.geoms]
+            return MultiPolygon(parts)
+
+        return geom
+
+    logger.info(f"Filling polygon holes smaller than {threshold}")
+
+    gdf = gdf.copy()
+    gdf["geometry"] = gdf.geometry.apply(_fill)
     return gdf

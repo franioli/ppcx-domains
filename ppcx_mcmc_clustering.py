@@ -588,9 +588,10 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
         isolation_buffer=30.0,
         velocity_merge_threshold=1,
         target_number_of_sectors=4,
+        fill_holes_area=80000.0,
         smooth_geometries=True,
         raster_res=raster_res,
-        smooth_iterations=4,
+        smooth_iterations=3,
         merge_collection=True,
         merge_field="cluster_id",
     )
