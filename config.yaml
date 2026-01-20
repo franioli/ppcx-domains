@@ -24,6 +24,9 @@ preprocessing:
     median_threshold_factor: 3
     apply_2d_gaussian: false
     gaussian_sigma: 1.0
+    apply_lamma_filter: true
+    lamma_method: "Neighbours"
+    lamma_k: 24
 
 # Prior probability for each sector
 priors: 
@@ -45,8 +48,8 @@ priors:
 mcmc:
   sample_options:
     target_accept: 0.9
-    draws: 2000
-    tune: 1000
+    draws: 1500
+    tune: 500
     chains: 4
     cores: 4
   model_options:
@@ -69,7 +72,7 @@ mcmc:
   second_pass: "short"  # "skip" | "short" | "full"
   second_pass_sample_args:
     draws: 500
-    tune: 300
+    tune: 200
     chains: 4
     cores: 4
     target_accept: 0.9
@@ -87,7 +90,6 @@ postprocessing:
   erosion_iterations: 1      # Number of erosion iterations to disconnect narrow bridges
   dilation_iterations: 1     # Number of dilation iterations to restore cluster size
   min_cluster_size: -1      # Minimum number of pixels for a cluster to survive
-  # min_cluster_size_px: 100  # Minimum cluster size for second pass processing
   connectivity: 8           # 4 or 8 connectivity for component analysis (for all postproc steps)
   keep_only_largest_n: -1    # Keep only the largest N clusters, -1 to keep all
   vectorization:
@@ -101,9 +103,6 @@ postprocessing:
       B: "#ee9c21"
       C: "#f1ee30"
       D: "#5fb61c"
-
-# Random seed for reproducibility
-random_seed: 8927
 
 # Database configuration
 database:

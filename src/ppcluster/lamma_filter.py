@@ -1,11 +1,14 @@
 """Filters for displacement/vector fields taken from LAMMA v.2024.10.03"""
 
+import multiprocessing
 import warnings
 
 import joblib as jb
 import numpy as np
 from scipy.spatial import Delaunay
 from sklearn.neighbors import KDTree
+
+CPUs = multiprocessing.cpu_count()
 
 
 def vector_field_filter(values, nodes, method="Delaunay", k=None):

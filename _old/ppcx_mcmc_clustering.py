@@ -25,7 +25,7 @@ from ppcluster.cvat import (
     read_polygons_from_cvat,
 )
 from ppcluster.griddata import create_2d_grid, map_grid_to_points
-from ppcluster.mksectors import (
+from ppcluster.sectors import (
     auto_assign_mk_sectors,
     compute_mk_sector_stats,
     draw_polygon,

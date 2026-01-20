@@ -3,6 +3,7 @@
 .directory
 smb_mount.sh
 sandbox/
+_sandbox/
 figures/
 data/
 output/

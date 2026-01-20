@@ -6,7 +6,7 @@ import pandas as pd
 from scipy import ndimage
 
 from ppcluster.griddata import create_2d_grid_from_df
-from ppcluster.lamma_filter import vector_field_filter  # noqa: F401
+from ppcluster.lamma_filter import vector_field_filter
 
 logger = logging.getLogger("ppcx")
 RANDOM_SEED = 8927
@@ -17,14 +17,17 @@ RANDOM_SEED = 8927
 
 def apply_dic_filters(
     df: pd.DataFrame,
-    filter_outliers: bool | None = True,
-    tails_percentile: float | None = 0.01,
-    min_velocity: float | None = 0.0,
-    apply_2d_median: bool | None = False,
-    median_window_size: int | None = 5,
-    median_threshold_factor: float | None = 3.0,
-    apply_2d_gaussian: bool | None = False,
-    gaussian_sigma: float | None = 1.0,
+    min_velocity: float | None = None,
+    filter_outliers: bool = True,
+    tails_percentile: float = 0.01,
+    apply_2d_median: bool = False,
+    median_window_size: int = 5,
+    median_threshold_factor: float = 3.0,
+    apply_2d_gaussian: bool = False,
+    gaussian_sigma: float = 1.0,
+    apply_lamma_filter: bool = False,
+    lamma_method: str = "Neighbours",
+    lamma_k: int = 4,
 ) -> pd.DataFrame:
     """
     Apply all DIC data filters in sequence.
@@ -45,17 +48,25 @@ def apply_dic_filters(
     logger.info(f"Starting DIC filtering pipeline with {len(df)} points")
     df_filtered = df.copy()
 
-    # 1. Apply percentile-based outlier filtering
+    # Apply percentile-based outlier filtering
     if filter_outliers and tails_percentile is not None and tails_percentile > 0:
         df_filtered = filter_outliers_by_percentile(
             df_filtered, tails_percentile=tails_percentile
         )
 
-    # 2. Apply minimum velocity filtering
+    # Apply minimum velocity filtering
     if min_velocity is not None and min_velocity >= 0:
         df_filtered = filter_by_min_velocity(df_filtered, min_velocity=min_velocity)
 
-    # 3. Apply 2D median filter
+    # Apply LAMMA vector field filter
+    if apply_lamma_filter:
+        df_filtered = apply_2d_lamma_filter(
+            df_filtered,
+            method=lamma_method,
+            k=lamma_k,
+        )
+
+    # Apply 2D median filter
     if apply_2d_median:
         df_filtered = apply_2d_median_filter(
             df_filtered,
@@ -63,7 +74,7 @@ def apply_dic_filters(
             threshold_factor=median_threshold_factor,
         )
 
-    # 4. Apply 2D Gaussian smoothing to velocity magnitude
+    # Apply 2D Gaussian smoothing to velocity magnitude
     if apply_2d_gaussian:
         df_filtered = apply_2d_gaussian_filter(df_filtered, sigma=gaussian_sigma)
 
@@ -142,7 +153,9 @@ def apply_2d_gaussian_filter(df: pd.DataFrame, sigma: float = 1.0) -> pd.DataFra
     """
 
     if sigma <= 0:
-        logger.info("Gaussian smoothing disabled (sigma <= 0)")
+        logger.info(
+            "Gaussian smoothing disabled (sigma <= 0). Returning original DataFrame."
+        )
         return df
 
     logger.info(f"Applying 2D Gaussian filter (u,v,V): sigma={sigma}")
@@ -299,9 +312,61 @@ def apply_2d_median_filter(
 def apply_2d_lamma_filter(
     df: pd.DataFrame,
     method: str = "Neighbours",
-    k: int | None = None,
+    k: int | None = 4,
 ) -> pd.DataFrame:
-    pass
+    """
+    Apply the LAMMA vector field filter to the DataFrame.
+
+    Adapts the specific I/O of lamma.vector_field_filter to the pandas DataFrame.
+
+    Args:
+        df: Input DataFrame containing 'x', 'y' coordinates and 'u', 'v' velocity components.
+        method: Filtering method ('Delaunay', 'Neighbours', 'Radius').
+        k: Number of neighbors or radius (depending on method).
+
+    Returns:
+        Filtered DataFrame with updated 'u', 'v' and 'V'.
+    """
+    if df.empty:
+        return df
+
+    logger.info(f"Applying LAMMA filter: method={method}, k={k}")
+
+    # Prepare inputs for LAMMA
+    # Nodes: coordinates [x, y]
+    nodes = df[["x", "y"]].to_numpy()
+
+    # Values: list of arrays [u, v]
+    # Ensure they are flat arrays as expected by some paths in lamma,
+    # though vector_field_filter handles shape checks.
+    u = df["u"].to_numpy()
+    v = df["v"].to_numpy()
+    values = [u, v]
+
+    try:
+        # Call LAMMA function
+        # Interface: vector_field_filter(values, nodes, method="Delaunay", k=None)
+        # Returns: out[0]->DX, out[1]->DY, out[2]->DZ, out[3]->nodes
+        out = vector_field_filter(values, nodes, method=method, k=k)
+
+        u_filtered = out[0]
+        v_filtered = out[1]
+
+        # Create output DataFrame
+        df_out = df.copy()
+        df_out["u"] = u_filtered
+        df_out["v"] = v_filtered
+
+        # Recompute magnitude V
+        df_out["V"] = np.sqrt(df_out["u"] ** 2 + df_out["v"] ** 2)
+
+        logger.info("LAMMA filtering completed.")
+        return df_out
+
+    except Exception as e:
+        logger.error(f"Failed to apply LAMMA filter: {e}")
+        # Return original on failure or re-raise
+        return df
 
 
 # === SPATIAL SUBSAMPLING ===
