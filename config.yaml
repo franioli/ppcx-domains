@@ -26,7 +26,7 @@ preprocessing:
     gaussian_sigma: 1.0
     apply_lamma_filter: true
     lamma_method: "Neighbours"
-    lamma_k: 24
+    lamma_k: 8
 
 # Prior probability for each sector
 priors: 

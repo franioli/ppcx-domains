@@ -9,7 +9,16 @@ from pathlib import Path
 from joblib import Parallel, delayed
 from tqdm import tqdm
 
-logger = logging.getLogger("ppcx")
+from ppcluster.utils.logger import setup_logger
+
+logger = setup_logger(
+    level=logging.INFO,
+    name="ppcx",
+    force=True,
+    log_to_file=True,
+    log_folder="logs",
+    redirect_to_stdout=True,
+)
 
 
 def parse_args():
