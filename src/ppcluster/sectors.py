@@ -3,13 +3,14 @@ from pathlib import Path
 from typing import Literal
 
 import geopandas as gpd
-import joblib
 import matplotlib.patches as mpatches
 import numpy as np
 import pandas as pd
 import rasterio.features
 from affine import Affine
+from matplotlib import colors as mcolors
 from matplotlib import pyplot as plt
+from matplotlib.axes import Axes
 from matplotlib.colors import Normalize
 from shapely import MultiPolygon
 from shapely.geometry import Polygon, shape
@@ -81,11 +82,12 @@ def clean_vector_sectors(
     force_minimum_sectors: bool = True,
     fill_holes_area: float = 0.0,
     smooth_geometries: bool = True,
-    raster_res: float | None = None,
     smooth_iterations: int = 4,
+    smooth_method: Literal["smoothify", "simplify"] = "smoothify",
+    raster_res: float | None = None,
     merge_collection: bool = True,
     merge_field: str = "cluster_id",
-    area_tolerance: float = 0.5,
+    area_tolerance: float = 0.01,
 ) -> gpd.GeoDataFrame:
     """
     Clean polygon sectors by removing isolated ones, merging contained ones,
@@ -97,40 +99,49 @@ def clean_vector_sectors(
     logger.info(f"Starting sector cleaning with {len(gdf_sectors)} sectors.")
 
     # 0. Ensure we work with single polygons
-    gdf = _split_disconnected_polygons(gdf_sectors)
+    gdf = split_disconnected_polygons(gdf_sectors)
     logger.info(f"After exploding multipolygons: {len(gdf)} sectors.")
 
     # 3. Merge Contained Polygons (Hole-Filling)
-    gdf = _merge_contained_sectors(gdf)
+    gdf = merge_contained_sectors(gdf)
 
     # 1. Pre-processing
-    gdf = _filter_small_sectors(gdf, min_area_px2)
+    gdf = filter_small_sectors(gdf, min_area_px2)
 
     # 2. Remove Isolated Polygons
-    gdf = _remove_isolated_sectors(gdf, isolation_buffer)
+    gdf = remove_isolated_sectors(gdf, isolation_buffer)
 
     # 4. Iterative Statistical Merging
-    gdf = _merge_sectors_by_velocity(
+    gdf = merge_sectors_by_velocity(
         gdf, df_points, velocity_merge_threshold, target_number_of_sectors
     )
 
     # 5. Final Force Limit
     if force_minimum_sectors:
-        gdf = _enforce_sector_limit(gdf, target_number_of_sectors)
+        gdf = enforce_sector_limit(gdf, target_number_of_sectors)
 
     # 6. Fill Holes (if requested)
     if fill_holes_area > 0.0:
-        gdf = _fill_polygon_holes(gdf, fill_holes_area)
+        gdf = fill_polygon_holes(gdf, fill_holes_area)
 
     # 7. Smooth Geometries (optional)
     if smooth_geometries:
-        gdf = smoothify(
+        # Auto-select raster_res from points if needed
+        if smooth_method == "smoothify" and raster_res is None:
+            raster_res = max(
+                np.sqrt(df_points["x"].ptp() * df_points["y"].ptp() / len(df_points)),
+                5.0,
+            )
+            logger.info(f"Auto-selected raster_res={raster_res:.2f} for smoothing.")
+
+        gdf = smooth_polygons(
             gdf,
-            segment_length=raster_res,
+            smooth_method=smooth_method,
+            raster_res=raster_res,
             smooth_iterations=smooth_iterations,
+            target_number_of_sectors=target_number_of_sectors,
             merge_collection=merge_collection,
             merge_field=merge_field,
-            num_cores=target_number_of_sectors,
             area_tolerance=area_tolerance,
         )
 
@@ -237,7 +248,7 @@ def assign_sector_labels(
     gdf = gdf.sort_values("sort_key", ascending=ascending).reset_index(drop=True)
 
     # Assign letters
-    gdf["label"] = [get_label(i) for i in range(len(gdf))]
+    gdf["sector"] = [get_label(i) for i in range(len(gdf))]
 
     # Cleanup
     return gdf.drop(columns=["sort_key"])
@@ -284,14 +295,14 @@ def compute_sector_stats(
     stats_list = []
 
     for _, row in sector_gdf.iterrows():
-        label = row["label"]
+        sector_label = row["sector"]
         geom = row["geometry"]
 
         if geom is None or geom.is_empty:
             continue
 
         # Points in this sector
-        points_in = points_df[points_df["sector"] == label]
+        points_in = points_df[points_df["sector"] == sector_label]
         n_points = len(points_in)
 
         # Geometric properties
@@ -334,7 +345,7 @@ def compute_sector_stats(
 
         stats_list.append(
             {
-                "label": label,
+                "sector": sector_label,
                 "n_points": n_points,
                 "area_px2": area,
                 "point_density_pts_per_px2": density,
@@ -351,8 +362,8 @@ def compute_sector_stats(
 
     df = pd.DataFrame(stats_list)
 
-    # Sort by label
-    df = df.sort_values("label").reset_index(drop=True)
+    # Sort by sector
+    df = df.sort_values("sector").reset_index(drop=True)
 
     logger.info(
         f"Computed stats for {len(df)} sectors (total points: {df['n_points'].sum()})"
@@ -361,7 +372,199 @@ def compute_sector_stats(
     return df
 
 
-def plot_kinematic_sectors(
+def plot_sectors(
+    sectors: gpd.GeoDataFrame,
+    img: np.ndarray | None = None,
+    velocity_df: pd.DataFrame | None = None,
+    sector_colors: dict | None = None,
+    min_cbar_percentile: float = 5.0,
+    max_cbar_percentile: float = 95.0,
+    label_column: str = "sector",
+    add_sector_labels: bool = True,
+    title: str = "Kinematic Sectors",
+    ax: Axes | None = None,
+) -> Axes | None:
+    """
+    Plot velocity field and overlay sector geometries on a given axis.
+    """
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 8))
+
+    if sector_colors is None:
+        sector_colors = {}
+
+    if sectors.empty:
+        logger.warning("No sectors to plot.")
+        return ax
+    else:
+        plt_gdf = sectors.copy()
+
+    # Plot background image if provided
+    if img is not None:
+        ax.imshow(img, cmap="gray")
+
+    # Plot Velocity field if provided
+    if velocity_df is not None and not velocity_df.empty:
+        mags = velocity_df["V"].to_numpy()
+        vmin = np.percentile(mags, min_cbar_percentile)
+        vmax = np.percentile(mags, max_cbar_percentile)
+        norm = Normalize(vmin=vmin, vmax=vmax)
+        q = ax.quiver(
+            velocity_df["x"].to_numpy(),
+            velocity_df["y"].to_numpy(),
+            velocity_df["u"].to_numpy(),
+            velocity_df["v"].to_numpy(),
+            mags,
+            norm=norm,
+            scale=None,
+            scale_units="xy",
+            angles="xy",
+            cmap="viridis",
+            width=0.006,
+            headwidth=2.0,
+        )
+        ax.set_aspect("equal")
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+        # Colorbar
+        cbar = plt.colorbar(q, ax=ax, fraction=0.046, pad=0.03)
+        cbar.set_label("Velocity [px/day]", rotation=270, labelpad=12, fontsize=8)
+        cbar.ax.tick_params(labelsize=7)
+        ax.set_title("Velocity Field", fontsize=11)
+
+    # Plot Sectors Overlay
+    present_labels = sorted(plt_gdf[label_column].unique())
+    colors = {}
+    fallback_cmap = plt.get_cmap("tab10")
+    for i, label in enumerate(present_labels):
+        if label in sector_colors:
+            colors[label] = sector_colors[label]
+        else:
+            colors[label] = mcolors.to_hex(fallback_cmap(i % 10))
+
+    # Fill (transparent)
+    plt_gdf["color"] = plt_gdf[label_column].map(colors)
+    plt_gdf.plot(
+        ax=ax,
+        color=plt_gdf["color"],
+        alpha=0.1,
+        linewidth=0,
+    )
+    # Edges (opaque)
+    plt_gdf.plot(
+        ax=ax,
+        facecolor="none",
+        edgecolor=plt_gdf["color"],
+        linewidth=2.5,
+        alpha=1.0,
+    )
+
+    # Manual Legend
+    legend_patches = [
+        mpatches.Patch(color=colors[label], label=label, alpha=0.8)
+        for label in present_labels
+        if label in colors
+    ]
+    if legend_patches:
+        ax.legend(
+            handles=legend_patches,
+            loc="upper right",
+            fontsize=8,
+            framealpha=0.9,
+        )
+
+    # Labels on centroids
+    if add_sector_labels:
+        for _, row in plt_gdf.iterrows():
+            cent = row.geometry.centroid
+            ax.text(
+                cent.x,
+                cent.y,
+                row[label_column],
+                fontsize=12,
+                weight="bold",
+                color="white",
+                ha="center",
+                va="center",
+            )
+
+    ax.set_aspect("equal")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_title(title, fontsize=11)
+
+    return ax
+
+
+def render_sector_stats_table(
+    ax: Axes,
+    sector_stats: pd.DataFrame,
+    max_rows: int = 12,
+) -> None:
+    """
+    Render a formatted statistics table on a given axis.
+    """
+    stat_cols = [
+        "sector",
+        "v_mean",
+        "v_std",
+        "v_median",
+        "v_mad",
+        "n_points",
+        "area_px2",
+        "compactness",
+    ]
+
+    available = [c for c in stat_cols if c in sector_stats.columns]
+    if "label" not in available:
+        logger.warning("sector_stats has no 'label' column; skipping table.")
+        display_df = pd.DataFrame()
+    else:
+        display_df = sector_stats[available].copy()
+
+    ax.axis("off")
+    ax.set_title("Sector Statistics", fontsize=11, pad=6)
+
+    if display_df.empty:
+        return
+
+    # Formatting
+    for c in display_df.columns:
+        if c == "sector":
+            continue
+        if c in {"n_points", "area_px2"}:
+            display_df[c] = display_df[c].round(0).astype(int)
+        else:
+            display_df[c] = display_df[c].round(2)
+
+    # Limit rows
+    if display_df.shape[0] > max_rows:
+        display_df = display_df.iloc[:max_rows, :]
+
+    table_df = display_df.set_index("sector").T
+    table = ax.table(
+        cellText=table_df.values,
+        colLabels=list(table_df.columns),
+        rowLabels=list(table_df.index),
+        loc="center",
+        cellLoc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(7)
+    table.scale(1.05, 1.6)
+
+    # Style table headers
+    for (i, j), cell in table.get_celld().items():
+        if i == 0 or j == -1:
+            cell.set_facecolor("#E8E8E8")
+            cell.set_text_props(weight="bold", size=7)
+        else:
+            cell.set_facecolor("white")
+
+
+def plot_sectors_summary(
     velocity_df: pd.DataFrame,
     sector_gdf: gpd.GeoDataFrame,
     sector_stats: pd.DataFrame,
@@ -374,29 +577,8 @@ def plot_kinematic_sectors(
 ) -> Path:
     """
     Plot morpho-kinematic sectors summary with velocity field and statistics table.
+    coordinates the sub-plotting functions.
     """
-
-    from matplotlib import colors as mcolors
-
-    # Configuration
-    label_column = "label"
-    min_cbar_percentile = 5.0
-    max_cbar_percentile = 95.0
-    stat_cols = [
-        "label",
-        "v_mean",
-        "v_std",
-        "v_median",
-        "v_mad",
-        "n_points",
-        "area_px2",
-        "compactness",
-    ]
-    max_labels_in_table = 12
-
-    if sector_colors is None:
-        sector_colors = {}
-
     fig, axes = plt.subplots(
         1,
         2,
@@ -405,277 +587,31 @@ def plot_kinematic_sectors(
     )
     ax_sectors, ax_table = axes
 
-    # 1) Velocity field with sectors overlay
-    mags = velocity_df["V"].to_numpy()
-    vmin = np.percentile(mags, min_cbar_percentile)
-    vmax = np.percentile(mags, max_cbar_percentile)
-
-    ax_sectors.imshow(img, cmap="gray")
-    norm = Normalize(vmin=vmin, vmax=vmax)
-    q = ax_sectors.quiver(
-        velocity_df["x"].to_numpy(),
-        velocity_df["y"].to_numpy(),
-        velocity_df["u"].to_numpy(),
-        velocity_df["v"].to_numpy(),
-        mags,
-        norm=norm,
-        scale=None,
-        scale_units="xy",
-        angles="xy",
-        cmap="viridis",
-        width=0.006,
-        headwidth=2.0,
+    # 1. Plot Map
+    plot_sectors(
+        sectors=sector_gdf,
+        img=img,
+        velocity_df=velocity_df,
+        sector_colors=sector_colors,
+        add_sector_labels=True,
+        title="Kinematic Sectors",
+        ax=ax_sectors,
     )
-    ax_sectors.set_aspect("equal")
-    ax_sectors.set_xticks([])
-    ax_sectors.set_yticks([])
-    cbar = plt.colorbar(q, ax=ax_sectors, fraction=0.046, pad=0.03)
-    cbar.set_label("Velocity [px/day]", rotation=270, labelpad=12, fontsize=8)
-    cbar.ax.tick_params(labelsize=7)
-    ax_sectors.set_title("Velocity Field", fontsize=11)
 
-    # Sectors colors mapping
-    present_labels = sorted(sector_gdf[label_column].unique())
-    colors = {}
-    fallback_cmap = plt.get_cmap("tab10")
-    for i, label in enumerate(present_labels):
-        if label in sector_colors:
-            colors[label] = sector_colors[label]
-        else:
-            # Fallback color based on index
-            colors[label] = mcolors.to_hex(fallback_cmap(i % 10))
-
-    # Plot sectors
-    plot_gdf = sector_gdf.copy()
-    plot_gdf["color"] = plot_gdf["label"].map(colors)
-
-    if not plot_gdf.empty:
-        # 1. Plot the fill with high transparency to show velocity vectors
-        plot_gdf.plot(
-            ax=ax_sectors,
-            color=plot_gdf["color"],
-            alpha=0.1,
-            linewidth=0,
-        )
-        # 2. Plot the edges with full opacity to define limits
-        plot_gdf.plot(
-            ax=ax_sectors,
-            facecolor="none",
-            edgecolor=plot_gdf["color"],
-            linewidth=2.5,
-            alpha=1.0,
-        )
-
-    # Add legend manually to match style
-    legend_patches = [
-        mpatches.Patch(color=colors[label], label=label, alpha=0.8)
-        for label in present_labels
-        if label in colors
-    ]
-    if legend_patches:
-        ax_sectors.legend(
-            handles=legend_patches,
-            loc="upper right",
-            fontsize=8,
-            framealpha=0.9,
-        )
-
-    # Add letters to sectors
-    for _, row in plot_gdf.iterrows():
-        cent = row.geometry.centroid
-        ax_sectors.text(
-            cent.x,
-            cent.y,
-            row["label"],
-            fontsize=12,
-            weight="bold",
-            color="white",
-            ha="center",
-            va="center",
-        )
-
-    ax_sectors.set_aspect("equal")
-    ax_sectors.set_xticks([])
-    ax_sectors.set_yticks([])
-    ax_sectors.set_title("Morpho-Kinematic Sectors", fontsize=11)
-
-    # 3) Statistics table
-    available = [c for c in stat_cols if c in sector_stats.columns]
-    if "label" not in available:
-        logger.warning("sector_stats has no 'label' column; skipping table.")
-        display_df = pd.DataFrame()
-    else:
-        display_df = sector_stats[available].copy()
-
-    ax_table.axis("off")
-
-    if not display_df.empty:
-        # Formatting
-        for c in display_df.columns:
-            if c == "label":
-                continue
-            if c in {"n_points", "area_px2"}:
-                display_df[c] = display_df[c].round(0).astype(int)
-            else:
-                display_df[c] = display_df[c].round(2)
-
-        # Limit rows
-        if display_df.shape[0] > max_labels_in_table:
-            display_df = display_df.iloc[:max_labels_in_table, :]
-
-        table_df = display_df.set_index("label").T
-        table = ax_table.table(
-            cellText=table_df.values,
-            colLabels=list(table_df.columns),
-            rowLabels=list(table_df.index),
-            loc="center",
-            cellLoc="center",
-        )
-        table.auto_set_font_size(False)
-        table.set_fontsize(7)
-        table.scale(1.05, 1.6)
-
-        # Style table headers
-        for (i, j), cell in table.get_celld().items():
-            if i == 0 or j == -1:
-                cell.set_facecolor("#E8E8E8")
-                cell.set_text_props(weight="bold", size=7)
-            else:
-                cell.set_facecolor("white")
-
-    ax_table.set_title("Sector Statistics", fontsize=11, pad=6)
+    # 2. Plot Table
+    render_sector_stats_table(ax=ax_table, sector_stats=sector_stats)
 
     fig.suptitle(base_name, fontsize=13, weight="bold", y=0.985)
 
-    out_path = output_dir / f"{base_name}_sectors_summary.png"
+    out_path = output_dir / f"{base_name}_kinematic_sectors_summary.png"
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
     logger.info(f"Saved summary figure to {out_path}")
     return out_path
 
 
-def save_sector_results(
-    output_dir: Path,
-    base_name: str,
-    *,
-    gdf_sectors: gpd.GeoDataFrame,
-    mk_stats: pd.DataFrame,
-    posterior_probs: np.ndarray | None = None,
-    cluster_pred: np.ndarray | None = None,
-    uncertainty: np.ndarray | None = None,
-    img_shape: tuple[int, int] | None = None,
-    export_geojson: bool = True,
-    export_shapefile: bool = False,
-) -> dict[str, Path]:
-    """
-    Persist final sector results.
-
-    Saves:
-    - Bundle (.joblib): python dict with dataframes
-    - Arrays (.npz): raw numpy arrays
-    - GIS (.geojson/.shp): Merged geometry + stats, optionally with Y-inversion.
-    """
-    artifacts: dict[str, Path] = {}
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # 1) Pythonized bundle (Simplified: just dict of DF/GDF/Arrays)
-    try:
-        # Convert GDF to list-dict for plain pickling if needed, or just keep GDF
-        bundle = {
-            "gdf_sectors": gdf_sectors,
-            "mk_stats": mk_stats,
-            "posterior_probs": posterior_probs,
-            "cluster_pred": cluster_pred,
-            "uncertainty": uncertainty,
-        }
-        py_path = output_dir / f"{base_name}_sectors_bundle.joblib"
-        joblib.dump(bundle, py_path)
-        artifacts["python_bundle"] = py_path
-    except Exception as exc:
-        logger.warning(f"Failed saving joblib bundle: {exc}")
-
-    # 2) NumPy arrays
-    try:
-        np_path = output_dir / f"{base_name}_sectors_arrays.npz"
-        np.savez_compressed(
-            np_path,
-            cluster_pred=cluster_pred if cluster_pred is not None else np.array([]),
-            posterior_probs=posterior_probs
-            if posterior_probs is not None
-            else np.array([]),
-            uncertainty=uncertainty if uncertainty is not None else np.array([]),
-        )
-        artifacts["numpy_arrays"] = np_path
-    except Exception as exc:
-        logger.warning(f"Failed saving npz arrays: {exc}")
-
-    # 3) GIS export
-    if export_geojson or export_shapefile:
-        if gdf_sectors.empty:
-            logger.warning("No geometries to export for GIS.")
-            return artifacts
-
-        try:
-            # Merge stats into GDF for a rich export file
-            export_gdf = gdf_sectors.merge(mk_stats, on="label", how="left")
-
-            # Handle Y-Inversion for GIS compatibility (Image Origin vs Map Origin)
-            H = img_shape[0] if (img_shape and len(img_shape) >= 1) else None
-
-            if H is not None:
-                # Invert Y coordinate: y_new = H - 1 - y_old
-                def invert_y(geom):
-                    if geom.is_empty:
-                        return geom
-                    # shapely scalar transform
-                    return scale(
-                        translate(geom, yoff=-(H - 1)), yfact=-1, origin=(0, 0)
-                    )
-                    # Or manual rebuild to be safe without imports:
-                    # return Polygon([(x, H - 1 - y) for x, y in geom.exterior.coords])
-
-                # Manual reliable inversion loop for polygons
-                new_geoms = []
-                for geom in export_gdf.geometry:
-                    if geom.geom_type == "Polygon":
-                        new_g = Polygon(
-                            [(x, H - 1 - y) for x, y in geom.exterior.coords]
-                        )
-                        new_geoms.append(new_g)
-                    elif geom.geom_type == "MultiPolygon":
-                        # Handle multi-polygons if present
-                        parts = [
-                            Polygon([(x, H - 1 - y) for x, y in p.exterior.coords])
-                            for p in geom.geoms
-                        ]
-                        from shapely.ops import unary_union
-
-                        new_geoms.append(unary_union(parts))
-                    else:
-                        new_geoms.append(geom)  # Fallback
-
-                export_gdf.geometry = new_geoms
-
-            if export_geojson:
-                geojson_path = output_dir / f"{base_name}_sectors.geojson"
-                export_gdf.to_file(geojson_path, driver="GeoJSON")
-                artifacts["geojson"] = geojson_path
-
-            if export_shapefile:
-                shp_dir = output_dir / f"{base_name}_shp"
-                shp_dir.mkdir(exist_ok=True)
-                shp_path = shp_dir / f"{base_name}_sectors.shp"
-                export_gdf.to_file(shp_path)
-                artifacts["shapefile"] = shp_path
-
-        except Exception as exc:
-            logger.warning(f"Failed GIS export: {exc}")
-
-    return artifacts
-
-
 # ================= Helper Functions for Cleaning =================#
-def _split_disconnected_polygons(gdf_in: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+def split_disconnected_polygons(gdf_in: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """
     Explodes MultiPolygons into individual Polygons and assigns unique cluster IDs.
     """
@@ -690,7 +626,7 @@ def _split_disconnected_polygons(gdf_in: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return out.reset_index(drop=True)
 
 
-def _filter_small_sectors(
+def filter_small_sectors(
     gdf: gpd.GeoDataFrame, min_area_px2: float
 ) -> gpd.GeoDataFrame:
     """Explode multipolygons and remove those smaller than threshold."""
@@ -706,7 +642,7 @@ def _filter_small_sectors(
     return gdf_clean
 
 
-def _remove_isolated_sectors(
+def remove_isolated_sectors(
     gdf: gpd.GeoDataFrame, isolation_buffer: float
 ) -> gpd.GeoDataFrame:
     """Remove polygons that do not intersect with any other polygon (buffered)."""
@@ -724,7 +660,7 @@ def _remove_isolated_sectors(
     return gdf.loc[keep_indices].reset_index(drop=True)
 
 
-def _merge_contained_sectors(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+def merge_contained_sectors(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """Diffusely merge polygons contained within others or filling holes."""
     gdf = gdf.copy()
     changed = True
@@ -755,7 +691,7 @@ def _merge_contained_sectors(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return gdf
 
 
-def _merge_sectors_by_velocity(
+def merge_sectors_by_velocity(
     gdf: gpd.GeoDataFrame,
     df_points: pd.DataFrame,
     threshold: float,
@@ -850,7 +786,7 @@ def _merge_sectors_by_velocity(
     return gdf
 
 
-def _enforce_sector_limit(gdf: gpd.GeoDataFrame, limit: int) -> gpd.GeoDataFrame:
+def enforce_sector_limit(gdf: gpd.GeoDataFrame, limit: int) -> gpd.GeoDataFrame:
     """Force reduction to N sectors by keeping the largest by area."""
     if len(gdf) > limit:
         logger.info(f"Forcing reduction to {limit} sectors (keeping largest).")
@@ -859,7 +795,7 @@ def _enforce_sector_limit(gdf: gpd.GeoDataFrame, limit: int) -> gpd.GeoDataFrame
     return gdf
 
 
-def _fill_polygon_holes(gdf: gpd.GeoDataFrame, threshold: float) -> gpd.GeoDataFrame:
+def fill_polygon_holes(gdf: gpd.GeoDataFrame, threshold: float) -> gpd.GeoDataFrame:
     """Fills holes within polygons that are smaller than the threshold area."""
 
     def _fill(geom):
@@ -882,4 +818,37 @@ def _fill_polygon_holes(gdf: gpd.GeoDataFrame, threshold: float) -> gpd.GeoDataF
 
     gdf = gdf.copy()
     gdf["geometry"] = gdf.geometry.apply(_fill)
+    return gdf
+
+
+def smooth_polygons(
+    gdf: gpd.GeoDataFrame,
+    smooth_method: Literal["smoothify", "simplify"] = "smoothify",
+    raster_res: float | None = None,
+    smooth_iterations: int = 4,
+    target_number_of_sectors: int = 4,
+    merge_collection: bool = True,
+    merge_field: str = "cluster_id",
+    area_tolerance: float = 0.01,
+) -> gpd.GeoDataFrame:
+    """Smooth polygon geometries using specified method."""
+    logger.info(f"Smoothing polygons using method '{smooth_method}'")
+
+    if smooth_method == "smoothify":
+        gdf = smoothify(
+            gdf,
+            segment_length=raster_res,
+            smooth_iterations=smooth_iterations,
+            merge_collection=merge_collection,
+            merge_field=merge_field,
+            num_cores=target_number_of_sectors,
+            area_tolerance=area_tolerance,
+        )
+    elif smooth_method == "simplify":
+        gdf["geometry"] = gdf.geometry.simplify(
+            tolerance=raster_res if raster_res else 1.0, preserve_topology=True
+        )
+    else:
+        logger.warning(f"Unknown smooth_method '{smooth_method}'; skipping smoothing.")
+
     return gdf

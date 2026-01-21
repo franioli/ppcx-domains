@@ -93,9 +93,7 @@ postprocessing:
   connectivity: 8           # 4 or 8 connectivity for component analysis (for all postproc steps)
   keep_only_largest_n: -1    # Keep only the largest N clusters, -1 to keep all
   vectorization:
-    method: "smoothify"  # "convex_hull" | "cell_union" | "alphashape" | "smoothify"
-    buffer_distance: 2.0
-    simplify_tolerance: 0.0
+
   sector_assignment:
     method: "y_centroid"
     ascending: false      # False if sector A is at the bottom (lowest Y), True otherwise (the y axis is inverted in image coordinates (0 at top))

@@ -38,7 +38,7 @@ def parse_arguments():
         "-o",
         type=Path,
         default=None,
-        help="Output directory for time series plots (default: input_dir/time_series)",
+        help="Output directory for time series plots (default: input_dir/kinematic_sectors_time_series)",
     )
     parser.add_argument(
         "--folder-pattern",
@@ -54,41 +54,16 @@ def parse_arguments():
     return parser.parse_args()
 
 
-def draw_polygon(
-    ax_draw: plt.Axes,
-    poly_coords: np.ndarray | None,
-    color_hex: str,
-    *,
-    fill_alpha: float = 0.1,
-    zorder: int = 1,
-) -> None:
-    if poly_coords is None or len(poly_coords) < 3:
-        return
-    ax_draw.fill(
-        poly_coords[:, 0],
-        poly_coords[:, 1],
-        color=color_hex,
-        alpha=fill_alpha,
-        lw=0,
-        zorder=zorder,
-    )
-    ax_draw.plot(
-        np.r_[poly_coords[:, 0], poly_coords[0, 0]],
-        np.r_[poly_coords[:, 1], poly_coords[0, 1]],
-        color=color_hex,
-        lw=2,
-        zorder=zorder + 1,
-    )
-    cx, cy = np.mean(poly_coords, axis=0)
-
-
-def find_result_folders(base_dir: Path, pattern: str = r".*_\d{4}-\d{2}-\d{2}_mcmc$"):
+def find_result_folders(
+    base_dir: Path,
+    pattern: str = r".*_\d{4}-\d{2}-\d{2}$",
+):
     """
     Find all result folders matching the pattern.
 
     Args:
         base_dir: Base directory to search
-        pattern: Regex pattern for folder names (default matches CAMERA_YYYY-MM-DD_mcmc)
+        pattern: Regex pattern for folder names (default matches CAMERA_YYYY-MM-DD)
 
     Returns:
         List of (date, folder_path) tuples sorted by date
@@ -163,7 +138,7 @@ def load_sector_results(folder: Path, base_name: str | None = None):
         return None
 
 
-def create_velocity_time_series(
+def ____velocity_time_series(
     results_list: list,
     output_path: Path,
     config: DictConfig,
@@ -217,7 +192,7 @@ def create_velocity_time_series(
     fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
 
     # Get colormap
-    colors = config.get("morphokinematic").get("sector_colors", {})
+    colors = config.postprocessing.sector_assignment.get("sector_colors", {})
     if not colors:
         # Use default colormap if no colors are specified
         cmap = plt.get_cmap("tab10")
@@ -284,6 +259,107 @@ def create_velocity_time_series(
     fig.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
     logger.info(f"Saved velocity time series to {output_path}")
+
+    # Combined plot velocity-area for each sector separately
+    fig, axes = plt.subplots(4, 1, figsize=(14, 8))
+    for ax, sector in zip(axes, sorted(sector_data.keys()), strict=False):
+        data = sector_data[sector]
+        v_median = np.array(data["v_median"])
+        v_mad = np.array(data["v_mad"])
+        area = np.array(data["area_px2"])
+        norm = Normalize(vmin=np.min(area), vmax=np.max(area))
+        color = cm.get_cmap("Reds")
+        colors_area = color(norm(area))
+        ax.errorbar(
+            dates_dt,
+            v_median,
+            yerr=v_mad,
+            markersize=0,
+            linestyle="-",
+            linewidth=0.5,
+            label=f"Sector {sector}",
+            color="k",
+            alpha=0.7,
+        )
+        ax.scatter(
+            dates_dt,
+            v_median,
+            s=70,
+            c=colors_area,
+            label="Area (px²)",
+            edgecolors="k",
+            zorder=3,
+        )
+        ax.set_ylabel("Velocity [px/day]", fontsize=11)
+        ax.set_title(
+            f"Sector {sector}: Median Velocity with Area Indication",
+            fontsize=12,
+            weight="bold",
+        )
+        ax.legend(loc="best", fontsize=9)
+        ax.grid(True, alpha=0.3)
+
+        # force y-limits for better comparison
+        ax.set_ylim([0, 20])
+
+    fig.tight_layout()
+    fig.savefig(
+        output_path.parent / "velocity_area_time_series.png",
+        dpi=200,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
+
+
+def ____create_velocity_time_series(
+    results_list: list,
+    output_path: Path,
+    config: DictConfig,
+):
+    """
+    Create time series plots of velocity statistics per sector.
+
+    Args:
+        results_list: List of result dictionaries from load_sector_results
+        output_path: Path to save the figure
+        config: DictConfig instance with configuration
+    """
+    # Collect data for each sector
+    dates = []
+    sector_data = {}
+
+    for result in results_list:
+        if result is None:
+            continue
+
+        date = result["date"]
+        dates.append(date)
+        stats = result["stats"]
+
+        for _, row in stats.iterrows():
+            sector = row["label"]
+            if sector not in sector_data:
+                sector_data[sector] = {
+                    "v_median": [],
+                    "v_mad": [],
+                    "v_mean": [],
+                    "v_std": [],
+                    "n_points": [],
+                    "area_px2": [],
+                }
+
+            sector_data[sector]["v_median"].append(row.get("v_median", np.nan))
+            sector_data[sector]["v_mad"].append(row.get("v_mad", np.nan))
+            sector_data[sector]["v_mean"].append(row.get("v_mean", np.nan))
+            sector_data[sector]["v_std"].append(row.get("v_std", np.nan))
+            sector_data[sector]["n_points"].append(row.get("n_points", 0))
+            sector_data[sector]["area_px2"].append(row.get("area_px2", 0))
+
+    if not dates:
+        logger.warning("No valid dates found for time series")
+        return
+
+    dates_dt = pd.to_datetime(dates)
 
     # Combined plot velocity-area for each sector separately
     fig, axes = plt.subplots(4, 1, figsize=(14, 8))
@@ -476,7 +552,7 @@ def main(args: argparse.Namespace, config_path: Path | None = None):
     if not input_dir.exists():
         raise FileNotFoundError(f"Input directory not found: {input_dir}")
 
-    output_dir = args.out or (input_dir / "time_series")
+    output_dir = args.out or (input_dir / "kinematic_sectors_time_series")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Find result folders
@@ -513,12 +589,12 @@ def main(args: argparse.Namespace, config_path: Path | None = None):
 
     # Create sectors evolution figure
     logger.info("Creating sectors evolution figure...")
-    create_sectors_evolution_figure(
-        valid_results,
-        output_dir / "sectors_evolution.png",
-        max_dates=args.max_dates,
-        config=config,
-    )
+    # create_sectors_evolution_figure(
+    #     valid_results,
+    #     output_dir / "sectors_evolution.png",
+    #     max_dates=args.max_dates,
+    #     config=config,
+    # )
 
     # Export combined statistics table
     logger.info("Exporting combined statistics table...")

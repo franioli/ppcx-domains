@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import pymc as pm
 from matplotlib import pyplot as plt
+from omegaconf import OmegaConf
 from sklearn.preprocessing import StandardScaler
 from sqlalchemy import create_engine
 
@@ -31,8 +32,8 @@ from ppcluster.sectors import (
     classify_points_by_polygons,
     clean_vector_sectors,
     compute_sector_stats,
-    plot_kinematic_sectors,
-    save_sector_results,
+    plot_sectors,
+    plot_sectors_summary,
     vectorize_gridded_sectors,
 )
 from ppcluster.utils.database import (
@@ -42,7 +43,7 @@ from ppcluster.utils.database import (
     get_multi_dic_data,
 )
 
-logger = setup_logger(level=logging.INFO, name="ppcx", force=True)
+logger = setup_logger(level=logging.INFO, name="ppcx")
 
 HEADLESS = True  # set to True when running in non-GUI environment
 
@@ -313,11 +314,16 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
 
     # Output base directory (output will be saved in a subfolder with camera name and date)
     output_base_dir = Path(data_config.output_dir)
-    output_dir = output_base_dir / f"{camera_name}_{reference_date}_mcmc"
+    output_dir = output_base_dir / f"{camera_name}_{reference_date}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Define base name for outputs
+    # Define base names for outputs
     base_name = f"{reference_date}"
+    mcmc_base_name = f"{reference_date}_mcmc"
+
+    # Save a copy of the used config in the output dir with omegaconfig dump
+    config_path = output_dir / f"{base_name}_config.yaml"
+    OmegaConf.save(config, config_path)
 
     # Date range for data selection
     days_before_to_include = data_config.days_before_to_include
@@ -349,7 +355,7 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
     if len(dic_ids) < 1:
         raise ValueError("No DIC analyses found for the given criteria")
 
-    # Get DIC analysis metadata
+    # Get DIC analysis metadata and save to CSV
     dic_analyses = get_dic_analysis_by_ids(db_engine=db_engine, dic_ids=dic_ids)
     logger.info("Fetched DIC analysis:")
     for _, row in dic_analyses.iterrows():
@@ -358,6 +364,9 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
         )
     date_start = dic_analyses.iloc[0]["master_timestamp"].strftime("%Y-%m-%d")
     date_end = dic_analyses.iloc[0]["slave_timestamp"].strftime("%Y-%m-%d")
+    dic_analyses.to_csv(
+        output_dir / f"{date_start}_{date_end}_selected_dic_analyses.csv", index=False
+    )
     logger.info("Selected DIC analyses:")
     logger.info(dic_analyses.head())
 
@@ -404,39 +413,14 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
         )
         logger.info(f"Data shape after subsampling: {dic_df.shape}")
 
-    # print sample of data
+    # Save preprocessed DIC data
+    dic_df.to_csv(output_dir / f"{base_name}_preprocessed_dic_data.csv", index=False)
     logger.info("Sample of preprocessed DIC data:")
     logger.info(dic_df.head())
 
-    # ===  SPATIAL PRIORS AND INITIAL VISUALIZATIONS  === #
+    # ===  MCMC CLUSTERING   === #
 
-    # Assign spatial priors
-    prior_config = config.priors
-    if not prior_config.probability:
-        # Default: uniform priors across sectors
-        n_sectors = len(sectors)
-        uniform_prob = 1.0 / n_sectors
-        prior_config.probability = {
-            name: [uniform_prob] * n_sectors for name in sectors
-        }
-    prior_probs_array = mcmc.assign_spatial_priors(
-        x=dic_df["x"].to_numpy(),
-        y=dic_df["y"].to_numpy(),
-        polygons=sectors,
-        prior_probs=prior_config.probability,
-        fade_method=prior_config.fade_method,
-        fade_options=prior_config.fade_options.get(prior_config.fade_method, {}),
-    )
-
-    fig, axes = mcmc.plot_spatial_priors(dic_df, prior_probs_array, img=img)
-    fig.savefig(
-        output_dir / f"{base_name}_mcmc_spatial_priors.jpg",
-        dpi=150,
-        bbox_inches="tight",
-    )
-    plt.close(fig)
-
-    # ===  RUN MCMC CLUSTERING  === #
+    # --- Gather parameters ---
 
     # MCMC parameters
     sample_args = {
@@ -469,13 +453,39 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
     # Post-processing parameters
     postproc_config = config.postprocessing
 
-    # Loop through smoothing scales
+    # --- Assign spatial priors ---
+    prior_config = config.priors
+    if not prior_config.probability:
+        # Default: uniform priors across sectors
+        n_sectors = len(sectors)
+        uniform_prob = 1.0 / n_sectors
+        prior_config.probability = {
+            name: [uniform_prob] * n_sectors for name in sectors
+        }
+    prior_probs_array = mcmc.assign_spatial_priors(
+        x=dic_df["x"].to_numpy(),
+        y=dic_df["y"].to_numpy(),
+        polygons=sectors,
+        prior_probs=prior_config.probability,
+        fade_method=prior_config.fade_method,
+        fade_options=prior_config.fade_options.get(prior_config.fade_method, {}),
+    )
+
+    fig, axes = mcmc.plot_spatial_priors(dic_df, prior_probs_array, img=img)
+    fig.savefig(
+        output_dir / f"{mcmc_base_name}_spatial_priors.jpg",
+        dpi=150,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
+
+    # --- Loop through smoothing scales ---
     results = []
     for sigma in sigma_values:
         logger.info(f"Processing with Gaussian smoothing sigma={sigma}...")
 
         # Create scale-specific base name
-        scale_base_name = f"{date_start}_{date_end}_mcmc_sigma{sigma}"
+        scale_base_name = f"{mcmc_base_name}_sigma{sigma}"
 
         # Apply Gaussian smoothing if needed (skipped for sigma=0)
         df_run = apply_2d_gaussian_filter(dic_df, sigma=sigma)
@@ -512,7 +522,7 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
         # Append to results list
         results.append(result)
 
-    # ===  AGGREGATE MULTI-SCALE RESULTS  (if multiscale approach)=== #
+    # --- Aggregate multi-scale results (if multiscale approach) ---
 
     # Multiscale parameters (grouped)
     if len(sigma_values) > 1:
@@ -520,8 +530,7 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
             results,
             similarity_threshold=aggregation_config.similarity_threshold,
             overall_threshold=aggregation_config.overall_threshold,
-            fig_path=output_dir
-            / f"{reference_start_date}_{reference_end_date}_similarity_heatmap.jpg",
+            fig_path=output_dir / f"{mcmc_base_name}_similarity_heatmap.jpg",
         )
         cluster_pred = aggregated_results["combined_cluster_pred"]
         posterior_probs = aggregated_results["avg_posterior_probs"]
@@ -539,7 +548,7 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
         stability_score = None
         valid_scales = None
 
-    # ===  Save final clustering results
+    # --- Save final clustering results ---
     cluster_aggregation_outs = {
         "cluster_pred": cluster_pred,
         "posterior_probs": posterior_probs,
@@ -550,7 +559,7 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
     }
     joblib.dump(
         cluster_aggregation_outs,
-        output_dir / f"{base_name}_kinematic_clustering_results_raw.joblib",
+        output_dir / f"{mcmc_base_name}_clustering_results_raw.joblib",
     )
 
     # ===  POST-PROCESSING AND CLEANING OF FINAL CLUSTERING  === #
@@ -581,6 +590,9 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
     # 1. Vectorize & Smooth
     logger.info("Vectorizing grid clusters to polygons...")
     sectors = vectorize_gridded_sectors(kin_cluster_grid, X, Y)
+    sectors.to_file(
+        output_dir / f"{base_name}_kinematic_sectors_raw.geojson", driver="GeoJSON"
+    )
     sectors = clean_vector_sectors(
         sectors,
         dic_df,
@@ -609,26 +621,16 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
         show_stats=True,
         alpha=0.6,
     )
-    # Plot vectorized sectors
-    if not sectors.empty:
-        ax_vectorized.imshow(img)
-        sectors.plot(
-            ax=ax_vectorized,
-            column="cluster_id",
-            cmap="tab10",
-            alpha=0.25,
-            linewidth=0,
-        )
-        sectors.plot(
-            ax=ax_vectorized,
-            column="cluster_id",
-            cmap="tab10",
-            facecolor="none",
-            linewidth=2.0,
-            alpha=1.0,
-        )
-        ax_vectorized.set_title(f"Cleaned Vectorized Sectors (n={len(sectors)})")
-        ax_vectorized.axis("off")
+    plot_sectors(
+        ax=ax_vectorized,
+        sectors=sectors,
+        img=img,
+        velocity_df=None,
+        sector_colors=postproc_config.sector_assignment.sector_colors,
+        label_column="cluster_id",
+        add_sector_labels=False,
+        title=f"Cleaned vectorized sectors (n={len(sectors)})",
+    )
     fig.tight_layout()
     fig.savefig(
         output_dir / f"{base_name}_kinematic_clustering_raw_vs_vectorized.png", dpi=150
@@ -646,21 +648,27 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
 
     # 3. Classify the original points dataframe and compute statistics
     pts_by_sector = classify_points_by_polygons(sectors, dic_df, x_col="x", y_col="y")
-    # rename 'label' to 'sector'
-    if "label" in pts_by_sector.columns and "sector" not in pts_by_sector.columns:
-        pts_by_sector = pts_by_sector.rename(columns={"label": "sector"})
-    # Compute statistics
-    mk_stats = compute_sector_stats(sectors, pts_by_sector, value_col="V")
-    mk_stats.to_csv(output_dir / f"{base_name}_kinematic_sector_stats.csv", index=False)
-    logger.info(f"Saved sector statistics: {len(mk_stats)} sectors")
+
+    sector_stats = compute_sector_stats(sectors, pts_by_sector, value_col="V")
+    sector_stats.to_csv(
+        output_dir / f"{base_name}_kinematic_sector_stats.csv", index=False
+    )
+    logger.info(f"Saved sector statistics: {len(sector_stats)} sectors")
+
+    # Merge stats into GDF for a rich export file
+    sectors = sectors.merge(sector_stats, on="sector", how="left")
+    sectors.to_file(
+        output_dir / f"{base_name}_kinematic_sectors_final.geojson", driver="GeoJSON"
+    )
+    logger.info(f"Saved final kinematic sectors GeoJSON with stats to {output_dir}")
 
     # 4. Plot summary figure
     logger.info("Creating summary figure...")
     sector_colors = postproc_config.sector_assignment.sector_colors
-    sector_figure_path = plot_kinematic_sectors(
+    sector_figure_path = plot_sectors_summary(
         velocity_df=pts_by_sector,
         sector_gdf=sectors,
-        sector_stats=mk_stats,
+        sector_stats=sector_stats,
         img=img,
         sector_colors=sector_colors,
         output_dir=output_dir,
@@ -672,22 +680,25 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
         shutil.copy(sector_figure_path, sector_figures_dir / f"{base_name}_sectors.png")
         logger.info(f"Copied summary figure to {sector_figures_dir}")
 
-    # 5. Save final results
+    # ==== SAVE FINAL RESULTS ==== #
     logger.info("Saving final sector results...")
-    artifacts = save_sector_results(
-        output_dir=output_dir,
-        base_name=base_name,
-        gdf_sectors=sectors,
-        mk_stats=mk_stats,
-        posterior_probs=posterior_probs,
-        cluster_pred=cluster_pred,
-        uncertainty=entropy,
-        img_shape=img.size if img is not None else None,
-        export_geojson=True,
-        export_shapefile=False,
-    )
-    for k, pth in artifacts.items():
-        logger.info(f"Saved {k}: {pth}")
+
+    # 1) Pythonized bundle with all dataframes and arrays
+    try:
+        bundle = {
+            "sectors": sectors,
+            "sector_stats": sector_stats,
+            "pts_by_sector": pts_by_sector,
+            "posterior_probs": posterior_probs,
+            "cluster_pred": cluster_pred,
+            "uncertainty": entropy,
+        }
+        py_path = output_dir / f"{base_name}_results_bundle.joblib"
+        joblib.dump(bundle, py_path)
+    except Exception as exc:
+        logger.warning(f"Failed saving joblib bundle: {exc}")
+
+    logger.info("Processing complete.")
 
 
 if __name__ == "__main__":
