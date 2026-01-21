@@ -843,7 +843,7 @@ def smooth_polygons(
     gdf: gpd.GeoDataFrame,
     smooth_method: Literal["smoothify", "simplify"] = "smoothify",
     raster_res: float | None = None,
-    smooth_iterations: int = 4,
+    smooth_iterations: int = 3,
     **kwargs,
 ) -> gpd.GeoDataFrame:
     """Smooth polygon geometries using specified method."""
@@ -854,7 +854,6 @@ def smooth_polygons(
             gdf,
             segment_length=raster_res,
             smooth_iterations=smooth_iterations,
-            merge_collection=False,
             **kwargs,
         )
     elif smooth_method == "simplify":
