@@ -163,19 +163,18 @@ def run_mcmc_clustering(
     if mrf_regularization:
         x_pos = df_input["x"].to_numpy()
         y_pos = df_input["y"].to_numpy()
-        mkw = dict(n_neighbors=8, length_scale=50, beta=2.0, n_iter=5)
-        if mrf_kwargs:
-            mkw.update(mrf_kwargs)
+        # mrf_kwargs = {"n_neighbors": 24, "length_scale": 200, "beta": 5, "n_iter": 5} # hard-coded values for debug
         prior_mrf, q_mrf = mcmc.mrf_regularization(
-            data_array_scaled, idata, prior_probs, x_pos, y_pos, **mkw
+            data_array_scaled, idata, prior_probs, x_pos, y_pos, **mrf_kwargs
         )
         prior_used = prior_mrf
-
-        # visualize refined priors
         try:
             fig, _ = mcmc.plot_spatial_priors(df_input, prior_mrf, img=img)
             fig.savefig(
-                output_dir / f"{base_name}_mrf_priors.jpg", dpi=150, bbox_inches="tight"
+                output_dir
+                / f"{base_name}_mrf_priors_neig{mrf_kwargs['n_neighbors']}_ls{mrf_kwargs['length_scale']}_beta{mrf_kwargs['beta']}.jpg",
+                dpi=150,
+                bbox_inches="tight",
             )
             plt.close(fig)
         except Exception as exc:
@@ -303,6 +302,17 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
     if not reference_date:
         raise ValueError("reference_date must be specified either via CLI or config.")
 
+    # Automatically update 'year' in config so that interpolated paths (output_dir, priors) match the date
+    try:
+        current_year = str(datetime.strptime(reference_date, "%Y-%m-%d").year)
+        if config.data.year != current_year:
+            logger.info(
+                f"Updating config.data.year: {config.data.year} -> {current_year}"
+            )
+            config.data.year = current_year
+    except ValueError:
+        logger.warning(f"Could not parse year from reference_date: {reference_date}")
+
     if output_dir:
         config.data.output_dir = str(output_dir)
 
@@ -374,9 +384,24 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
     master_image_id = dic_analyses["master_image_id"].iloc[0]
     img = get_image(image_id=master_image_id, config=config.api)
 
-    # Read roi and spatial priors
+    # Read roi for data filtering
     roi = read_polygons_from_cvat(data_config.roi_path, image_name=None)
-    sectors = read_polygons_from_cvat(data_config.sector_prior_file, image_name=None)
+
+    # Read sectors for spatial priors
+    prior_file_pattern = data_config.sector_prior_file
+    sector_prior_files = list(
+        Path(prior_file_pattern).parent.glob(Path(prior_file_pattern).name)
+    )
+    if len(sector_prior_files) == 0:
+        raise FileNotFoundError(
+            f"No sector prior file found matching: {data_config.sector_prior_file}"
+        )
+    if len(sector_prior_files) > 1:
+        logger.warning(
+            f"Multiple sector prior files matched. Using the first one found: {list(sector_prior_files)}"
+        )
+    sector_prior_file = sector_prior_files[0]
+    sectors = read_polygons_from_cvat(sector_prior_file, image_name=None)
 
     # Fetch DIC data
     out = get_multi_dic_data(dic_ids, stack_results=False, config=config.api)
@@ -604,8 +629,8 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
         fill_holes_area=80000.0,
         smooth_geometries=True,
         smooth_method="smoothify",
-        smooth_iterations=3,
-        raster_res=raster_res,
+        smooth_iterations=1,
+        raster_res=2 * raster_res,
     )
 
     # Plot raw clusters vs vectorized sectors

@@ -1,22 +1,23 @@
 # Data selection parameters
 data:
-  output_dir: "output"
-  reference_date: "2021-08-15"
+  year: "2017"
+  reference_date: ""
   camera_name: "PPCX_Tele"
   days_before_to_include: 0
   days_after_to_include: 0
   dt_min: 70  # Minimum time difference between images in hours
   dt_max: 100  # Maximum time difference between images in hours
   roi_path: "data/roi.xml"
-  sector_prior_file: "data/prior_data/2020_4domains_job_24_2025_11_27_13_43_22.zip"
+  sector_prior_file: "data/prior_data/${data.year}_4domains*.zip"
   variables_names: ["V"] # List of variable names to process
+  output_dir: "output/${data.year}"
 
 # Data preprocessing parameters
 preprocessing:
   subsample_factor: 1 # 2 means keep every 2nd point, 1 means no subsampling
   subsample_method: "regular"  # or 'random'
   filter_kwargs:
-    min_velocity: 0.5
+    min_velocity: 0.5  # Minimum velocity threshold (units depend on input data)
     filter_outliers: false
     tails_percentile: 0.005
     apply_2d_median: false
@@ -62,9 +63,9 @@ mcmc:
   transform_params: {} # e.g., {"midpoint_percentile": 70, "steepness": 2.0}
   mrf_regularization: true
   mrf_kwargs:
-    n_neighbors: 8
-    length_scale: 50
-    beta: 2.0
+    n_neighbors: 24
+    length_scale: 200
+    beta: 5
     n_iter: 5
   # Second pass speed choices:
     # 1) "short": short sampling + warm-start (recommended default):

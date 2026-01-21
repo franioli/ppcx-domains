@@ -18,6 +18,7 @@ data*/
 nohup.out
 .log
 .logs/
+progress*
 
 # SMB credentials - never commit these!
 smb_credentials.txt
