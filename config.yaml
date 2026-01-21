@@ -86,14 +86,7 @@ multiscale:
 
 # Post-processing parameters
 postprocessing:
-  split_disconnected_components: true
-  erosion_iterations: 1      # Number of erosion iterations to disconnect narrow bridges
-  dilation_iterations: 1     # Number of dilation iterations to restore cluster size
-  min_cluster_size: -1      # Minimum number of pixels for a cluster to survive
-  connectivity: 8           # 4 or 8 connectivity for component analysis (for all postproc steps)
-  keep_only_largest_n: -1    # Keep only the largest N clusters, -1 to keep all
-  vectorization:
-
+  # TODO: ADD HERE THE NEW VECTORIZATION PARAMETERS (now hardcoded in ppcx_mcmc_clustering.py)
   sector_assignment:
     method: "y_centroid"
     ascending: false      # False if sector A is at the bottom (lowest Y), True otherwise (the y axis is inverted in image coordinates (0 at top))

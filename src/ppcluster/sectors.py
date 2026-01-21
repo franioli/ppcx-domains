@@ -591,7 +591,8 @@ def plot_sectors_summary(
     output_dir: Path,
     base_name: str,
     figsize: tuple = (18, 7),
-    dpi: int = 300,
+    dpi: int = 200,
+    save_svg: bool = False,
 ) -> Path:
     """
     Plot morpho-kinematic sectors summary with velocity field and statistics table.
@@ -623,8 +624,12 @@ def plot_sectors_summary(
 
     out_path = output_dir / f"{base_name}_kinematic_sectors_summary.png"
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
+    if save_svg:
+        fig.savefig(out_path.with_suffix(".svg"), bbox_inches="tight")
+
     plt.close(fig)
     logger.info(f"Saved summary figure to {out_path}")
+
     return out_path
 
 

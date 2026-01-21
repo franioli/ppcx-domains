@@ -633,7 +633,7 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
     )
     fig.tight_layout()
     fig.savefig(
-        output_dir / f"{base_name}_kinematic_clustering_raw_vs_vectorized.png", dpi=150
+        output_dir / f"{base_name}_kinematic_clustering_raw_vs_vectorized.jpg", dpi=150
     )
     plt.close(fig)
 
@@ -673,6 +673,9 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
         sector_colors=sector_colors,
         output_dir=output_dir,
         base_name=base_name,
+        figsize=(18, 7),
+        dpi=300,
+        save_svg=True,
     )
     if sector_figure_path is not None:
         sector_figures_dir = output_base_dir / "kinematic_sectors"
@@ -686,14 +689,18 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
     # 1) Pythonized bundle with all dataframes and arrays
     try:
         bundle = {
-            "sectors": sectors,
-            "sector_stats": sector_stats,
-            "pts_by_sector": pts_by_sector,
+            "reference_date": reference_date,
+            "date_start": date_start,
+            "date_end": date_end,
+            "dic_dataframe": dic_df,
             "posterior_probs": posterior_probs,
             "cluster_pred": cluster_pred,
             "uncertainty": entropy,
+            "sectors": sectors,
+            "sector_stats": sector_stats,
+            "pts_by_sector": pts_by_sector,
         }
-        py_path = output_dir / f"{base_name}_results_bundle.joblib"
+        py_path = output_dir / f"{base_name}_results.joblib"
         joblib.dump(bundle, py_path)
     except Exception as exc:
         logger.warning(f"Failed saving joblib bundle: {exc}")
