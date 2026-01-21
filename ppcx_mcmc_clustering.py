@@ -586,6 +586,7 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
     # )
 
     # ===  KINEMATIC SECTORS COMPUTATION ===
+    # TODO: move parameters to config file!!
 
     # 1. Vectorize & Smooth
     logger.info("Vectorizing grid clusters to polygons...")
@@ -602,10 +603,9 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
         target_number_of_sectors=4,
         fill_holes_area=80000.0,
         smooth_geometries=True,
-        raster_res=raster_res,
+        smooth_method="smoothify",
         smooth_iterations=3,
-        merge_collection=True,
-        merge_field="cluster_id",
+        raster_res=raster_res,
     )
 
     # Plot raw clusters vs vectorized sectors

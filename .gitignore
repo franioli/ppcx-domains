@@ -4,6 +4,7 @@
 smb_mount.sh
 sandbox/
 _sandbox/
+sandbox
 figures/
 data/
 output/

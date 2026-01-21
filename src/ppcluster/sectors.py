@@ -82,12 +82,9 @@ def clean_vector_sectors(
     force_minimum_sectors: bool = True,
     fill_holes_area: float = 0.0,
     smooth_geometries: bool = True,
-    smooth_iterations: int = 4,
     smooth_method: Literal["smoothify", "simplify"] = "smoothify",
+    smooth_iterations: int = 4,
     raster_res: float | None = None,
-    merge_collection: bool = True,
-    merge_field: str = "cluster_id",
-    area_tolerance: float = 0.01,
 ) -> gpd.GeoDataFrame:
     """
     Clean polygon sectors by removing isolated ones, merging contained ones,
@@ -102,19 +99,28 @@ def clean_vector_sectors(
     gdf = split_disconnected_polygons(gdf_sectors)
     logger.info(f"After exploding multipolygons: {len(gdf)} sectors.")
 
-    # 3. Merge Contained Polygons (Hole-Filling)
-    gdf = merge_contained_sectors(gdf)
+    # 1. Merge Contained Polygons
+    try:
+        gdf = merge_contained_sectors(gdf)
+    except Exception as e:
+        logger.error(f"Error during contained polygon merging: {e}")
 
-    # 1. Pre-processing
+    # 2. Filter Small Sectors
     gdf = filter_small_sectors(gdf, min_area_px2)
 
-    # 2. Remove Isolated Polygons
-    gdf = remove_isolated_sectors(gdf, isolation_buffer)
+    # 3. Remove Isolated Polygons
+    try:
+        gdf = remove_isolated_sectors(gdf, isolation_buffer)
+    except Exception as e:
+        logger.error(f"Error during isolated sector removal: {e}")
 
     # 4. Iterative Statistical Merging
-    gdf = merge_sectors_by_velocity(
-        gdf, df_points, velocity_merge_threshold, target_number_of_sectors
-    )
+    try:
+        gdf = merge_sectors_by_velocity(
+            gdf, df_points, velocity_merge_threshold, target_number_of_sectors
+        )
+    except Exception as e:
+        logger.error(f"Error during velocity-based merging: {e}")
 
     # 5. Final Force Limit
     if force_minimum_sectors:
@@ -122,7 +128,10 @@ def clean_vector_sectors(
 
     # 6. Fill Holes (if requested)
     if fill_holes_area > 0.0:
-        gdf = fill_polygon_holes(gdf, fill_holes_area)
+        try:
+            gdf = fill_polygon_holes(gdf, fill_holes_area)
+        except Exception as e:
+            logger.error(f"Error during hole filling: {e}")
 
     # 7. Smooth Geometries (optional)
     if smooth_geometries:
@@ -139,10 +148,9 @@ def clean_vector_sectors(
             smooth_method=smooth_method,
             raster_res=raster_res,
             smooth_iterations=smooth_iterations,
-            target_number_of_sectors=target_number_of_sectors,
-            merge_collection=merge_collection,
-            merge_field=merge_field,
-            area_tolerance=area_tolerance,
+            merge_collection=False,
+            area_tolerance=0.01,  # % of original area allowed as error
+            num_cores=target_number_of_sectors,
         )
 
     return gdf
@@ -380,7 +388,7 @@ def plot_sectors(
     min_cbar_percentile: float = 5.0,
     max_cbar_percentile: float = 95.0,
     label_column: str = "sector",
-    add_sector_labels: bool = True,
+    add_sector_labels: bool = False,
     title: str = "Kinematic Sectors",
     ax: Axes | None = None,
 ) -> Axes | None:
@@ -435,6 +443,12 @@ def plot_sectors(
         ax.set_title("Velocity Field", fontsize=11)
 
     # Plot Sectors Overlay
+    if label_column not in plt_gdf.columns:
+        logger.warning(
+            f"Label column '{label_column}' not found in sectors GeoDataFrame."
+        )
+        return ax
+
     present_labels = sorted(plt_gdf[label_column].unique())
     colors = {}
     fallback_cmap = plt.get_cmap("tab10")
@@ -451,6 +465,7 @@ def plot_sectors(
         color=plt_gdf["color"],
         alpha=0.1,
         linewidth=0,
+        aspect=None,
     )
     # Edges (opaque)
     plt_gdf.plot(
@@ -459,6 +474,7 @@ def plot_sectors(
         edgecolor=plt_gdf["color"],
         linewidth=2.5,
         alpha=1.0,
+        aspect=None,
     )
 
     # Manual Legend
@@ -490,10 +506,10 @@ def plot_sectors(
                 va="center",
             )
 
-    ax.set_aspect("equal")
     ax.set_xticks([])
     ax.set_yticks([])
     ax.set_title(title, fontsize=11)
+    ax.set_aspect("equal")
 
     return ax
 
@@ -502,7 +518,7 @@ def render_sector_stats_table(
     ax: Axes,
     sector_stats: pd.DataFrame,
     max_rows: int = 12,
-) -> None:
+) -> Axes:
     """
     Render a formatted statistics table on a given axis.
     """
@@ -518,8 +534,8 @@ def render_sector_stats_table(
     ]
 
     available = [c for c in stat_cols if c in sector_stats.columns]
-    if "label" not in available:
-        logger.warning("sector_stats has no 'label' column; skipping table.")
+    if "sector" not in available:
+        logger.warning("sector_stats has no 'sector' column; skipping table.")
         display_df = pd.DataFrame()
     else:
         display_df = sector_stats[available].copy()
@@ -528,7 +544,7 @@ def render_sector_stats_table(
     ax.set_title("Sector Statistics", fontsize=11, pad=6)
 
     if display_df.empty:
-        return
+        return ax
 
     # Formatting
     for c in display_df.columns:
@@ -562,6 +578,8 @@ def render_sector_stats_table(
             cell.set_text_props(weight="bold", size=7)
         else:
             cell.set_facecolor("white")
+
+    return ax
 
 
 def plot_sectors_summary(
@@ -826,10 +844,7 @@ def smooth_polygons(
     smooth_method: Literal["smoothify", "simplify"] = "smoothify",
     raster_res: float | None = None,
     smooth_iterations: int = 4,
-    target_number_of_sectors: int = 4,
-    merge_collection: bool = True,
-    merge_field: str = "cluster_id",
-    area_tolerance: float = 0.01,
+    **kwargs,
 ) -> gpd.GeoDataFrame:
     """Smooth polygon geometries using specified method."""
     logger.info(f"Smoothing polygons using method '{smooth_method}'")
@@ -839,12 +854,11 @@ def smooth_polygons(
             gdf,
             segment_length=raster_res,
             smooth_iterations=smooth_iterations,
-            merge_collection=merge_collection,
-            merge_field=merge_field,
-            num_cores=target_number_of_sectors,
-            area_tolerance=area_tolerance,
+            merge_collection=False,
+            **kwargs,
         )
     elif smooth_method == "simplify":
+        logger.warning("This approach has not been tested yet. Use with caution.")
         gdf["geometry"] = gdf.geometry.simplify(
             tolerance=raster_res if raster_res else 1.0, preserve_topology=True
         )
