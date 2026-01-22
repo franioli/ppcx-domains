@@ -9,7 +9,7 @@ data:
   dt_max: 100  # Maximum time difference between images in hours
   roi_path: "data/roi.xml"
   sector_prior_file: "data/prior_data/${data.year}_4domains*.zip"
-  variables_names: ["V"] # List of variable names to process
+  variables_names: ["V"] # The feature vector used for clustering (Velocity)
   output_dir: "output/${data.year}"
 
 # Data preprocessing parameters
@@ -43,13 +43,13 @@ priors:
     linear:
       max_distance: 100
     exponential:
-      "decay_rate": 0.001
+      decay_rate: 0.001 # Higher values lead to faster decay
 
 # MCMC parameters
 mcmc:
   sample_options:
-    target_accept: 0.9
-    draws: 1500
+    target_accept: 0.9 # Higher (0.9+) reduces divergent transitions but slows sampling
+    draws: 1500 # Increase (>2000) if posterior distributions are rough/unconverged
     tune: 500
     chains: 4
     cores: 4
@@ -59,17 +59,38 @@ mcmc:
       sigma: 1
     sigma_params:
       sigma: 1
-  velocity_transform: null  # "power" | "exponential" | "sigmoid" | null
+  velocity_transform: null  # # Use if velocity distribution is heavily skewed (non-Gaussian) ["power" | "exponential" | "sigmoid" | null]
   transform_params: {} # e.g., {"midpoint_percentile": 70, "steepness": 2.0}
+
+  # --- Markov Random Field (MRF) Regularization ---
+  # Balances spatial smoothing (neighbors) against data fidelity (velocity/location).
   mrf_regularization: true
   mrf_kwargs:
-    n_neighbors: 24
+    # Graph Density: Controls connectivity.
+    # - High (16+): Smoother results, effective for sparse/noisy data.
+    # - Low (4-6): Local influence only, better for small sharp features.
+    n_neighbors: 16
+
+      # Spatial Decay: How influence drops with physical distance.
+    # - Increase: Distant neighbors bridge gaps (good for sparse data).
+    # - Decrease: Only immediate vicinity exerts influence.
     length_scale: 200
-    beta: 5
-    n_iter: 5
-  # Second pass speed choices:
-    # 1) "short": short sampling + warm-start (recommended default):
-    # 2) "skip": fastest, rely only on MRF priors, no re-sampling
+
+    # Interaction Strength (The Main Knob):
+    # - High (3.0 - 5.0) -> Prioritize Smoothing. 
+    #   Forces points to match neighbors. Removes "salt-and-pepper" noise, cleaner chunks.
+    # - Low (0.5 - 1.0) -> Prioritize Fidelity.
+    #   Respects raw velocity/location data. Preserves sharp transitions but leaves noise.
+    beta: 3
+
+    # Number of Iterations for MRF prior weight updates:
+    # - Low (5-10): Local smoothing, preserves small features.
+    # - High (>20): Global info propagation, very smooth results.
+    n_iter: 10
+
+  # Second pass sampling speed choices:
+  # - "short": short sampling + warm-start (recommended default):
+  # - "skip": fastest, rely only on MRF priors, no re-sampling
   second_pass: "short"  # "skip" | "short" | "full"
   second_pass_sample_args:
     draws: 500
@@ -89,13 +110,13 @@ multiscale:
 postprocessing:
   # TODO: ADD HERE THE NEW VECTORIZATION PARAMETERS (now hardcoded in ppcx_mcmc_clustering.py)
   sector_assignment:
-    method: "y_centroid"
+    method: "y_centroid"  # Sorts resulting clusters by elevation to ensure consistent labeling (A, B, C...)
     ascending: false      # False if sector A is at the bottom (lowest Y), True otherwise (the y axis is inverted in image coordinates (0 at top))
     sector_colors:
-      A: "#b3140b"
-      B: "#ee9c21"
-      C: "#f1ee30"
-      D: "#5fb61c"
+      A: "#b3140b"      # Red
+      B: "#ee9c21"      # Orange
+      C: "#f1ee30"      # Yellow
+      D: "#5fb61c"      # Green
 
 # Database configuration
 database:

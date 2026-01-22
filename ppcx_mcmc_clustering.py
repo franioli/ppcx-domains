@@ -657,9 +657,7 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
         title=f"Cleaned vectorized sectors (n={len(sectors)})",
     )
     fig.tight_layout()
-    fig.savefig(
-        output_dir / f"{base_name}_kinematic_clustering_raw_vs_vectorized.jpg", dpi=150
-    )
+    fig.savefig(output_dir / f"{base_name}_clustering_raw_vs_vectorized.jpg", dpi=150)
     plt.close(fig)
 
     # 2. Assign Labels (A, B, C...)
@@ -671,34 +669,39 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
         ascending=postproc_config.sector_assignment.ascending,
     )
 
+    # Drop all but essential columns
+    sectors = sectors[["geometry", "sector"]].copy()
+
     # 3. Classify the original points dataframe and compute statistics
     pts_by_sector = classify_points_by_polygons(sectors, dic_df, x_col="x", y_col="y")
 
-    sector_stats = compute_sector_stats(sectors, pts_by_sector, value_col="V")
-    sector_stats.to_csv(
-        output_dir / f"{base_name}_kinematic_sector_stats.csv", index=False
+    # Compute sector statistics
+    sectors["area_px2"] = sectors.geometry.area
+    sectors = compute_sector_stats(
+        sectors, pts_by_sector, value_col="V", group_col="sector"
     )
-    logger.info(f"Saved sector statistics: {len(sector_stats)} sectors")
-
-    # Merge stats into GDF for a rich export file
-    sectors = sectors.merge(sector_stats, on="sector", how="left")
     sectors.to_file(
         output_dir / f"{base_name}_kinematic_sectors_final.geojson", driver="GeoJSON"
     )
+    stats = sectors.drop(columns=[sectors.geometry.name], errors="ignore")
+    stats.to_csv(
+        output_dir / f"{base_name}_kinematic_sector_stats.csv",
+        index=False,
+        float_format="%.3f",
+    )
     logger.info(f"Saved final kinematic sectors GeoJSON with stats to {output_dir}")
 
-    # 4. Plot summary figure
     logger.info("Creating summary figure...")
     sector_colors = postproc_config.sector_assignment.sector_colors
     sector_figure_path = plot_sectors_summary(
-        velocity_df=pts_by_sector,
-        sector_gdf=sectors,
-        sector_stats=sector_stats,
+        sectors=sectors,
+        points_by_sector=pts_by_sector,
         img=img,
-        sector_colors=sector_colors,
+        colors=sector_colors,
         output_dir=output_dir,
         base_name=base_name,
-        figsize=(18, 7),
+        unit="px",
+        figsize=(20, 10),
         dpi=300,
         save_svg=True,
     )

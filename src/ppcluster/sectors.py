@@ -3,10 +3,12 @@ from pathlib import Path
 from typing import Literal
 
 import geopandas as gpd
+import matplotlib.gridspec as gridspec
 import matplotlib.patches as mpatches
 import numpy as np
 import pandas as pd
 import rasterio.features
+import seaborn as sns
 from affine import Affine
 from matplotlib import colors as mcolors
 from matplotlib import pyplot as plt
@@ -262,122 +264,172 @@ def assign_sector_labels(
     return gdf.drop(columns=["sort_key"])
 
 
-def compute_sector_stats(
-    sector_gdf: gpd.GeoDataFrame,
-    points_df: pd.DataFrame,  # This df has 'sector', 'V', etc.
+def compute_distribution_stats(
+    df: pd.DataFrame | gpd.GeoDataFrame,
     value_col: str = "V",
-) -> pd.DataFrame:
+    group_col: str | None = None,
+) -> pd.DataFrame | pd.Series:
     """
-    Compute comprehensive statistics per sector.
+    Compute robust distribution statistics for a value column, optionally grouped.
 
-    Calculates geometric properties (area, perimeter, compactness) and
-    distribution statistics of the values (e.g. velocity) for points falling
-    within each sector.
+    Args:
+        df: Input DataFrame or GeoDataFrame containing points.
+        value_col: Column name to aggregate (e.g. "V").
+        group_col: Column name to group by (e.g. "sector").
+
+    Returns:
+        DataFrame or Series with statistics (mean, std, median, nmad, etc.).
+        Columns/Index are prefixed with 'v_' based on value_col name logic.
     """
 
-    def _compute_distribution_stats(arr: np.ndarray) -> dict[str, float]:
-        """Helper to compute distribution statistics."""
-        if len(arr) == 0:
-            return {}
+    def _stats_func(x):
+        if len(x) == 0:
+            return pd.Series(
+                {
+                    "mean": np.nan,
+                    "std": np.nan,
+                    "median": np.nan,
+                    "mad": np.nan,
+                    "nmad": np.nan,
+                    "min": np.nan,
+                    "max": np.nan,
+                    "percentile_5": np.nan,
+                    "percentile_95": np.nan,
+                    "quartile_1": np.nan,
+                    "quartile_3": np.nan,
+                    "iqr": np.nan,
+                    "n_points": 0,
+                }
+            )
 
-        median_val = np.median(arr)
-        mad = np.median(np.abs(arr - median_val))
-        q1 = np.percentile(arr, 25)
-        q3 = np.percentile(arr, 75)
+        med = np.median(x)
+        abs_dev = np.abs(x - med)
+        mad = np.median(abs_dev)
+        q1 = np.percentile(x, 25)
+        q3 = np.percentile(x, 75)
 
-        return {
-            "mean": float(np.mean(arr)),
-            "std": float(np.std(arr)),
-            "median": float(median_val),
-            "mad": float(mad),
-            "nmad": float(mad * 1.4826),
-            "min": float(np.min(arr)),
-            "max": float(np.max(arr)),
-            "percentile_5": float(np.percentile(arr, 5)),
-            "percentile_95": float(np.percentile(arr, 95)),
-            "quartile_1": float(q1),
-            "quartile_3": float(q3),
-            "iqr": float(q3 - q1),
-        }
-
-    stats_list = []
-
-    for _, row in sector_gdf.iterrows():
-        sector_label = row["sector"]
-        geom = row["geometry"]
-
-        if geom is None or geom.is_empty:
-            continue
-
-        # Points in this sector
-        points_in = points_df[points_df["sector"] == sector_label]
-        n_points = len(points_in)
-
-        # Geometric properties
-        area = float(geom.area)
-        perimeter = float(geom.length)
-        centroid = geom.centroid
-        centroid_x, centroid_y = centroid.x, centroid.y
-
-        # Compactness (Isoperimetric quotient: 1 for circle, <1 for others)
-        compactness = (
-            (4.0 * np.pi * area) / (perimeter**2 + 1e-12) if perimeter > 0 else np.nan
-        )
-        density = n_points / area if area > 0 else 0.0
-
-        # Value statistics
-        v_stats = {}
-        vals = points_in[value_col].dropna().values
-
-        if len(vals) > 0:
-            raw_stats = _compute_distribution_stats(vals)
-            # Prefix keys with v_
-            v_stats = {f"v_{k}": v for k, v in raw_stats.items()}
-        else:
-            # Populate with NaNs if no points
-            empty_keys = [
-                "mean",
-                "std",
-                "median",
-                "mad",
-                "nmad",
-                "min",
-                "max",
-                "percentile_5",
-                "percentile_95",
-                "quartile_1",
-                "quartile_3",
-                "iqr",
-            ]
-            v_stats = {f"v_{k}": np.nan for k in empty_keys}
-
-        stats_list.append(
+        return pd.Series(
             {
-                "sector": sector_label,
-                "n_points": n_points,
-                "area_px2": area,
-                "point_density_pts_per_px2": density,
-                "perimeter_px": perimeter,
-                "compactness": compactness,
-                "centroid_x": float(centroid_x),
-                "centroid_y": float(centroid_y),
-                **v_stats,
+                "mean": np.mean(x),
+                "std": np.std(x),
+                "median": med,
+                "mad": mad,
+                "nmad": 1.4826 * mad,
+                "min": np.min(x),
+                "max": np.max(x),
+                "percentile_5": np.percentile(x, 5),
+                "percentile_95": np.percentile(x, 95),
+                "quartile_1": q1,
+                "quartile_3": q3,
+                "iqr": q3 - q1,
+                "n_points": int(len(x)),
             }
         )
 
-    if not stats_list:
-        return pd.DataFrame()
+    # Filter NaNs in value column
+    clean_df = df.dropna(subset=[value_col])
 
-    df = pd.DataFrame(stats_list)
+    if group_col:
+        # Grouped stats -> DataFrame (rows=groups, columns=stats)
+        out = clean_df.groupby(group_col)[value_col].apply(_stats_func)
+        if isinstance(out, pd.Series):
+            # If only one group or weird unstack behavior
+            out = out.unstack()
+        else:
+            out = out.unstack()
 
-    # Sort by sector
-    df = df.sort_values("sector").reset_index(drop=True)
+        # Rename columns: v_mean, v_std ... but keep n_points columns
+        out.columns = [f"v_{c}" if c != "n_points" else c for c in out.columns]
+        return out
+    else:
+        # Flat stats -> Series
+        if clean_df.empty:
+            out = _stats_func(np.array([]))
+        else:
+            out = _stats_func(clean_df[value_col].to_numpy())
+        out.index = [f"v_{c}" if c != "n_points" else c for c in out.index]
+        return out
 
-    logger.info(
-        f"Computed stats for {len(df)} sectors (total points: {df['n_points'].sum()})"
-    )
 
-    return df
+def compute_sector_stats(
+    sector_gdf: gpd.GeoDataFrame,
+    points_df: pd.DataFrame,
+    value_col: str = "V",
+    group_col: str = "sector",
+    inplace: bool = False,
+) -> gpd.GeoDataFrame | None:
+    """
+    Compute geometric properties and value distribution statistics per sector.
+    Appends statistics to the sector GeoDataFrame.
+
+    Args:
+        sector_gdf: GeoDataFrame containing sector polygons.
+        points_df: DataFrame containing point data with group_col.
+        value_col: Column in points_df for statistics (e.g. velocity).
+        group_col: Column to link sectors and points.
+        inplace: Whether to modify sector_gdf in place.
+
+    Returns:
+        GeoDataFrame with appended statistics if inplace=False, else None.
+    """
+    if not inplace:
+        sector_gdf = sector_gdf.copy()
+
+    # 1. Compute Point Statistics (grouped) using the simpler function
+    if group_col in points_df.columns:
+        stats_df = compute_distribution_stats(
+            points_df, value_col=value_col, group_col=group_col
+        )
+    else:
+        logger.warning(
+            f"Group column '{group_col}' missing in points DF. Skipping point stats."
+        )
+        stats_df = pd.DataFrame()
+
+    # 2. Compute Geometry Statistics
+    if not sector_gdf.empty:
+        # Initialize columns
+        sector_gdf["area_px2"] = sector_gdf.geometry.area
+        sector_gdf["perimeter_px"] = sector_gdf.geometry.length
+        sector_gdf["centroid_x"] = sector_gdf.geometry.centroid.x
+        sector_gdf["centroid_y"] = sector_gdf.geometry.centroid.y
+        # Compactness: (4 * pi * A) / P^2
+        sector_gdf["compactness"] = (4.0 * np.pi * sector_gdf["area_px2"]) / (
+            sector_gdf["perimeter_px"] ** 2 + 1e-12
+        )
+
+    # 3. Merge Point Stats
+    if not stats_df.empty:
+        if group_col not in sector_gdf.columns:
+            logger.warning(
+                f"Group column '{group_col}' missing in sector GDF. Cannot join stats."
+            )
+        else:
+            # Merge stats into sector_gdf
+            # stats_df index is the group label. We left join.
+            merged = sector_gdf.merge(
+                stats_df, left_on=group_col, right_index=True, how="left"
+            )
+
+            # Assign mixed columns back
+            for col in stats_df.columns:
+                sector_gdf[col] = merged[col]
+
+    # 4. Derived stats
+    if "n_points" in sector_gdf.columns:
+        sector_gdf["n_points"] = sector_gdf["n_points"].fillna(0)
+        sector_gdf["point_density_pts_per_px2"] = (
+            sector_gdf["n_points"] / sector_gdf["area_px2"].replace(0, np.nan)
+        ).fillna(0)
+    else:
+        sector_gdf["n_points"] = 0
+        sector_gdf["point_density_pts_per_px2"] = 0.0
+
+    logger.info(f"Computed stats for {len(sector_gdf)} sectors.")
+
+    if not inplace:
+        return sector_gdf
+    return None
 
 
 def plot_sectors(
@@ -583,44 +635,154 @@ def render_sector_stats_table(
 
 
 def plot_sectors_summary(
-    velocity_df: pd.DataFrame,
-    sector_gdf: gpd.GeoDataFrame,
-    sector_stats: pd.DataFrame,
+    sectors: gpd.GeoDataFrame,
+    points_by_sector: pd.DataFrame | gpd.GeoDataFrame,
     img: np.ndarray,
-    sector_colors: dict | None,
+    colors: dict[str, str],
     output_dir: Path,
     base_name: str,
-    figsize: tuple = (18, 7),
-    dpi: int = 200,
+    unit: str = "px",
+    figsize: tuple = (20, 10),
+    dpi: int = 300,
     save_svg: bool = False,
 ) -> Path:
     """
-    Plot morpho-kinematic sectors summary with velocity field and statistics table.
+    Plot kinematic sectors summary with velocity field and statistics table.
     coordinates the sub-plotting functions.
     """
-    fig, axes = plt.subplots(
-        1,
-        2,
-        figsize=figsize,
-        gridspec_kw={"width_ratios": [1.3, 1.0], "wspace": 0.25},
-    )
-    ax_sectors, ax_table = axes
 
-    # 1. Plot Map
+    # Ensure colors is a standard dictionary (Seaborn can fail with OmegaConf DictConfig)
+    if hasattr(colors, "to_container"):
+        colors = colors.to_container()
+    colors = dict(colors)
+
+    # Handle missing keys for sectors present in the data
+    unique_sectors = sorted(points_by_sector["sector"].unique())
+    cmap = plt.get_cmap("tab10")
+    for i, sec in enumerate(unique_sectors):
+        if sec not in colors:
+            colors[sec] = plt.colors.to_hex(cmap(i % 10))
+
+    # --- Figure Layout ---
+    fig = plt.figure(figsize=figsize)
+    gs = gridspec.GridSpec(
+        3,
+        2,
+        width_ratios=[1.3, 1],
+        height_ratios=[1, 1, 0.6],
+        figure=fig,
+        hspace=0.35,
+        wspace=0.15,
+    )
+
+    # 1. Left Panel: Map (spans all rows)
+    ax_map = fig.add_subplot(gs[:, 0])
     plot_sectors(
-        sectors=sector_gdf,
+        sectors=sectors,
         img=img,
-        velocity_df=velocity_df,
-        sector_colors=sector_colors,
+        velocity_df=points_by_sector,
+        sector_colors=colors,
         add_sector_labels=True,
         title="Kinematic Sectors",
-        ax=ax_sectors,
+        ax=ax_map,
     )
+    # If no image is passed, invert the y axis to keep the correct orientation of the sectors
+    if img is None:
+        ax_map.invert_yaxis()
 
-    # 2. Plot Table
-    render_sector_stats_table(ax=ax_table, sector_stats=sector_stats)
+    # 2. Right Panel Top: Boxplot of Velocities
+    ax_box = fig.add_subplot(gs[0, 1])
+    sns.boxplot(
+        data=points_by_sector,
+        x="sector",
+        y="V",
+        palette=colors,
+        ax=ax_box,
+        hue="sector",
+        showfliers=True,  # Show outliers
+        fliersize=2,  # Make outlier markers smaller
+    )
+    ax_box.set_title("Velocity Distribution per Sector", weight="bold")
+    ax_box.set_ylabel(f"Velocity [{unit}/day]")
+    ax_box.set_xlabel("")
+    ax_box.legend([], [], frameon=False)  # Hide legend if hue creates one
 
-    fig.suptitle(base_name, fontsize=13, weight="bold", y=0.985)
+    # 3. Right Panel Middle: Histogram of Velocities
+    ax_hist = fig.add_subplot(gs[1, 1])
+    sns.histplot(
+        data=points_by_sector,
+        x="V",
+        hue="sector",
+        palette=colors,
+        element="step",
+        stat="density",
+        common_norm=False,
+        ax=ax_hist,
+        alpha=0.3,
+    )
+    # Dynamically limit Y-axis to avoid squashing the boxes
+    # We show up to the 98th percentile + 20% padding
+    all_velocities = points_by_sector["V"].dropna()
+    if not all_velocities.empty:
+        y_limit = np.percentile(all_velocities, 98) * 1.2
+        ax_box.set_ylim(0, y_limit)
+
+    ax_hist.set_title("Velocity Histogram (Density)", weight="bold")
+    ax_hist.set_xlabel(f"Velocity [{unit}/day]")
+    if ax_box.get_legend() is not None:
+        ax_box.get_legend().remove()
+
+    # 4. Right Panel Bottom: Text Statistics Table
+    ax_stats = fig.add_subplot(gs[2, 1])
+    ax_stats.axis("off")
+    ax_stats.set_title("Statistics Summary", weight="bold", pad=10)
+
+    # Prepare table data
+    header = ["Sector", "Median V", "NMAD", f"Area [{unit}²]", "N points"]
+    relevant_sectors = sorted(points_by_sector["sector"].unique())
+    stats_data = []
+    for sec in relevant_sectors:
+        row = sectors[sectors["sector"] == sec]
+        if row.empty:
+            continue
+        row = row.iloc[0]
+        nmad = row.get("v_nmad", np.nan)
+        stats_data.append(
+            [
+                sec,
+                f"{row['v_median']:.2f}",
+                f"{nmad:.2f}",
+                f"{int(row['area_px2']):,}",
+                f"{int(row['n_points'])}",
+            ]
+        )
+
+    # Render table
+    if stats_data:
+        table = ax_stats.table(
+            cellText=stats_data,
+            colLabels=header,
+            loc="center",
+            cellLoc="center",
+            colWidths=[0.15, 0.2, 0.2, 0.25, 0.2],
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(11)
+        table.scale(1, 1.8)
+
+        # Style headers and cells
+        for (i, j), cell in table.get_celld().items():
+            if i == 0:
+                cell.set_facecolor("#e0e0e0")
+                cell.set_text_props(weight="bold")
+            else:
+                # Color the sector letter cell with the sector color
+                if j == 0:
+                    sec_label = stats_data[i - 1][0]
+                    c = colors.get(sec_label, "#ffffff")
+                    cell.set_facecolor(c)
+                    cell.set_text_props(weight="bold", color="black")
+                    cell.set_alpha(0.6)
 
     out_path = output_dir / f"{base_name}_kinematic_sectors_summary.png"
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
