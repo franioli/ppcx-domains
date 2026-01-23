@@ -5,6 +5,7 @@ set -u
 YEARS=(2015 2016 2018 2019 2020 2022 2023 2024)
 START_MM_DD="06-01"
 END_MM_DD="10-30"
+JOBS=3
 
 PYTHON=${PYTHON:-python}
 SCRIPT=${SCRIPT:-clusterize_batch.py}
@@ -26,7 +27,7 @@ for label in "${YEARS[@]}"; do
 
   echo "[$(date -Iseconds)] Starting ${label}: ${start} -> ${end} (log: ${logfile})"
 
-  if $PYTHON "$SCRIPT" --date-range --start "$start" --end "$end" >"$logfile" 2>&1; then
+  if $PYTHON "$SCRIPT" --date-range --start "$start" --end "$end" --jobs "$JOBS" >"$logfile" 2>&1; then
     echo "[$(date -Iseconds)] Completed ${label} OK"
   else
     rc=$?

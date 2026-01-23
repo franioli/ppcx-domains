@@ -51,6 +51,25 @@ if HEADLESS:
     plt.switch_backend("Agg")
 
 
+def parse_arguments():
+    p = argparse.ArgumentParser(
+        description="Run MCMC clustering with optional overrides."
+    )
+    p.add_argument(
+        "--date",
+        "-d",
+        help="Reference date (i.e., final date) to process. Override data.reference_date (YYYY-MM-DD). If not provided, uses config value.",
+        default=None,
+    )
+    p.add_argument(
+        "--output_dir",
+        "-o",
+        help="Output directory. Override config value. If not provided, uses config value.",
+        default=None,
+    )
+    return p.parse_args()
+
+
 def run_mcmc_clustering(
     df_input,
     prior_probs,
@@ -646,9 +665,7 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
     # 1. Vectorize & Smooth
     logger.info("Vectorizing grid clusters to polygons...")
     sectors = vectorize_gridded_sectors(kin_cluster_grid, X, Y)
-    sectors.to_file(
-        output_dir / f"{base_name}_kinematic_sectors_raw.geojson", driver="GeoJSON"
-    )
+    sectors.to_file(output_dir / f"{base_name}_sectors_raw.geojson", driver="GeoJSON")
     sectors = clean_vector_sectors(
         sectors,
         dic_df,
@@ -704,22 +721,24 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
 
     # 3. Classify the original points dataframe and compute statistics
     pts_by_sector = classify_points_by_polygons(sectors, dic_df, x_col="x", y_col="y")
+    pts_by_sector.to_file(
+        output_dir / f"{base_name}_dic_points_by_sector.geojson",
+        driver="GeoJSON",
+    )
 
     # Compute sector statistics
     sectors["area_px2"] = sectors.geometry.area
     sectors = compute_sector_stats(
         sectors, pts_by_sector, value_col="V", group_col="sector"
     )
-    sectors.to_file(
-        output_dir / f"{base_name}_kinematic_sectors_final.geojson", driver="GeoJSON"
-    )
+    sectors.to_file(output_dir / f"{base_name}_sectors_final.geojson", driver="GeoJSON")
     stats = sectors.drop(columns=[sectors.geometry.name], errors="ignore")
     stats.to_csv(
-        output_dir / f"{base_name}_kinematic_sector_stats.csv",
+        output_dir / f"{base_name}_sector_stats.csv",
         index=False,
         float_format="%.3f",
     )
-    logger.info(f"Saved final kinematic sectors GeoJSON with stats to {output_dir}")
+    logger.info(f"Saved final sectors GeoJSON with stats to {output_dir}")
 
     logger.info("Creating summary figure...")
     sector_colors = postproc_config.sector_assignment.sector_colors
@@ -745,45 +764,22 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
     logger.info("Saving final sector results...")
 
     # 1) Pythonized bundle with all dataframes and arrays
-    try:
-        bundle = {
-            "reference_date": reference_date,
-            "date_start": date_start,
-            "date_end": date_end,
-            "dic_dataframe": dic_df,
-            "posterior_probs": posterior_probs,
-            "cluster_pred": cluster_pred,
-            "uncertainty": entropy,
-            "sectors": sectors,
-            "sector_stats": sector_stats,
-            "pts_by_sector": pts_by_sector,
-        }
-        py_path = output_dir / f"{base_name}_results.joblib"
-        joblib.dump(bundle, py_path)
-    except Exception as exc:
-        logger.warning(f"Failed saving joblib bundle: {exc}")
+    bundle = {
+        "reference_date": reference_date,
+        "date_start": date_start,
+        "date_end": date_end,
+        "dic_dataframe": dic_df,
+        "posterior_probs": posterior_probs,
+        "cluster_pred": cluster_pred,
+        "uncertainty": entropy,
+        "sectors": sectors,
+        "pts_by_sector": pts_by_sector,
+    }
+    joblib.dump(bundle, output_dir / f"{base_name}_results.joblib")
 
     logger.info("Processing complete.")
 
 
 if __name__ == "__main__":
-    import argparse
-
-    p = argparse.ArgumentParser(
-        description="Run MCMC clustering with optional overrides."
-    )
-    p.add_argument(
-        "--date",
-        "-d",
-        help="Reference date (i.e., final date) to process. Override data.reference_date (YYYY-MM-DD). If not provided, uses config value.",
-        default=None,
-    )
-    p.add_argument(
-        "--output_dir",
-        "-o",
-        help="Output directory. Override config value. If not provided, uses config value.",
-        default=None,
-    )
-    args = p.parse_args()
-
+    args = parse_arguments()
     main(reference_date=args.date, output_dir=args.output_dir)

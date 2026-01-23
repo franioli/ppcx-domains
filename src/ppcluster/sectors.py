@@ -435,17 +435,49 @@ def compute_sector_stats(
 def plot_sectors(
     sectors: gpd.GeoDataFrame,
     img: np.ndarray | None = None,
-    velocity_df: pd.DataFrame | None = None,
+    velocity_df: pd.DataFrame | gpd.GeoDataFrame | None = None,
+    velocity_mode: Literal["quiver", "scatter"] = "quiver",
     sector_colors: dict | None = None,
-    min_cbar_percentile: float = 5.0,
-    max_cbar_percentile: float = 95.0,
+    velocity_cmap: str = "viridis",
+    min_cbar: float | None = None,
+    max_cbar: float | None = None,
+    min_cbar_percentile: float | None = None,
+    max_cbar_percentile: float | None = None,
     label_column: str = "sector",
     add_sector_labels: bool = False,
     title: str = "Kinematic Sectors",
     ax: Axes | None = None,
+    img_kwargs: dict | None = None,
+    quiver_kwargs: dict | None = None,
+    scatter_kwargs: dict | None = None,
+    sector_kwargs: dict | None = None,
+    sector_fill_kwargs: dict | None = None,
+    sector_edge_kwargs: dict | None = None,
+    label_kwargs: dict | None = None,
 ) -> Axes | None:
     """
     Plot velocity field and overlay sector geometries on a given axis.
+
+    Args:
+        sectors: GeoDataFrame with sector geometries and labels.
+        img: 2D array for background image.
+        velocity_df: DataFrame/Geodataframe with velocity vectors (columns: x, y, u, v, V).
+        velocity_mode: 'quiver' or 'scatter' for velocity plotting.
+        sector_colors: Dict mapping sector labels to colors.
+        velocity_cmap: Colormap for velocity field, ignored if velocity_df is None (default 'viridis').
+        min_cbar_percentile: Minimum percentile for velocity colorbar scaling.
+        max_cbar_percentile: Maximum percentile for velocity colorbar scaling.
+        label_column: Column in sectors GeoDataFrame for labeling.
+        add_sector_labels: Whether to add text labels at sector centroids.
+        title: Title of the plot.
+        ax: Matplotlib Axes to plot on. If None, a new figure and axes are created.
+        img_kwargs: Keyword arguments for ax.imshow()
+        quiver_kwargs: Keyword arguments for ax.quiver()
+        scatter_kwargs: Keyword arguments for ax.scatter()
+        sector_kwargs: General keyword arguments for sector plotting (applied to both fill and edge if specialized kwargs not provided)
+        sector_fill_kwargs: Specific keyword arguments for sector fill
+        sector_edge_kwargs: Specific keyword arguments for sector edges
+        label_kwargs: Keyword arguments for ax.text() labels
     """
 
     if ax is None:
@@ -462,37 +494,84 @@ def plot_sectors(
 
     # Plot background image if provided
     if img is not None:
-        ax.imshow(img, cmap="gray")
+        # Default defaults
+        img_defaults = {"cmap": "gray"}
+        if img_kwargs:
+            img_defaults.update(img_kwargs)
+        ax.imshow(img, **img_defaults)
 
     # Plot Velocity field if provided
     if velocity_df is not None and not velocity_df.empty:
+        X = velocity_df["x"].to_numpy()
+        Y = velocity_df["y"].to_numpy()
         mags = velocity_df["V"].to_numpy()
-        vmin = np.percentile(mags, min_cbar_percentile)
-        vmax = np.percentile(mags, max_cbar_percentile)
+
+        # Ensure vmin/vmax are always defined, then create Normalize once
+        if min_cbar is not None and max_cbar is not None:
+            vmin, vmax = float(min_cbar), float(max_cbar)
+        elif min_cbar_percentile is not None and max_cbar_percentile is not None:
+            vmin = float(np.percentile(mags, min_cbar_percentile))
+            vmax = float(np.percentile(mags, max_cbar_percentile))
+        else:
+            vmin = float(np.min(mags))
+            vmax = float(np.max(mags))
+            if vmin == vmax:
+                vmin = 0.0  # avoid zero-range
+
         norm = Normalize(vmin=vmin, vmax=vmax)
-        q = ax.quiver(
-            velocity_df["x"].to_numpy(),
-            velocity_df["y"].to_numpy(),
-            velocity_df["u"].to_numpy(),
-            velocity_df["v"].to_numpy(),
-            mags,
-            norm=norm,
-            scale=None,
-            scale_units="xy",
-            angles="xy",
-            cmap="viridis",
-            width=0.006,
-            headwidth=2.0,
-        )
+
+        if velocity_mode == "quiver":
+            # Override defaults args with user kwargs
+            q_defaults = {
+                "scale": None,
+                "scale_units": "xy",
+                "angles": "xy",
+                "width": 0.006,
+                "headwidth": 2.0,
+                "norm": norm,
+                "cmap": velocity_cmap,
+            }
+            if quiver_kwargs:
+                q_defaults.update(quiver_kwargs)
+
+            # Note: X, Y, U, V, C are positional for quiver usually, but we pass C (mags) as 5th arg.
+            q = ax.quiver(
+                X,
+                Y,
+                velocity_df["u"].to_numpy(),
+                velocity_df["v"].to_numpy(),
+                mags,
+                **q_defaults,
+            )
+
+        elif velocity_mode == "scatter":
+            # Override defaults args with user kwargs
+            s_defaults = {
+                "c": mags,
+                "cmap": velocity_cmap,
+                "norm": norm,
+                "s": 10,
+                "edgecolors": "none",
+            }
+            if scatter_kwargs:
+                s_defaults.update(scatter_kwargs)
+
+            q = ax.scatter(X, Y, **s_defaults)
+        else:
+            logger.warning(
+                f"Unknown velocity_mode '{velocity_mode}'. Skipping velocity plot."
+            )
+            q = None
         ax.set_aspect("equal")
         ax.set_xticks([])
         ax.set_yticks([])
 
         # Colorbar
-        cbar = plt.colorbar(q, ax=ax, fraction=0.046, pad=0.03)
-        cbar.set_label("Velocity [px/day]", rotation=270, labelpad=12, fontsize=8)
-        cbar.ax.tick_params(labelsize=7)
-        ax.set_title("Velocity Field", fontsize=11)
+        if q is not None:
+            cbar = plt.colorbar(q, ax=ax, fraction=0.046, pad=0.03)
+            cbar.set_label("Velocity [px/day]", rotation=270, labelpad=12, fontsize=8)
+            cbar.ax.tick_params(labelsize=7)
+            ax.set_title("Velocity Field", fontsize=11)
 
     # Plot Sectors Overlay
     if label_column not in plt_gdf.columns:
@@ -509,25 +588,38 @@ def plot_sectors(
             colors[label] = sector_colors[label]
         else:
             colors[label] = mcolors.to_hex(fallback_cmap(i % 10))
-
-    # Fill (transparent)
+    # Assign colors to sectors
     plt_gdf["color"] = plt_gdf[label_column].map(colors)
-    plt_gdf.plot(
-        ax=ax,
-        color=plt_gdf["color"],
-        alpha=0.1,
-        linewidth=0,
-        aspect=None,
-    )
-    # Edges (opaque)
-    plt_gdf.plot(
-        ax=ax,
-        facecolor="none",
-        edgecolor=plt_gdf["color"],
-        linewidth=2.5,
-        alpha=1.0,
-        aspect=None,
-    )
+
+    # --- Plot Fill (transparent) ---
+    # Merge default styles < sector_kwargs < sector_fill_kwargs
+    fill_styles = {
+        "color": plt_gdf["color"],
+        "alpha": 0.1,
+        "linewidth": 0,
+        "aspect": None,
+    }
+    if sector_kwargs:
+        fill_styles.update(sector_kwargs)
+    if sector_fill_kwargs:
+        fill_styles.update(sector_fill_kwargs)
+    plt_gdf.plot(ax=ax, **fill_styles)
+
+    # --- Plot Edges (opaque) ---
+    # Merge default styles < sector_kwargs < sector_edge_kwargs
+    edge_styles = {
+        "facecolor": "none",
+        "edgecolor": plt_gdf["color"],
+        "linewidth": 2.5,
+        "alpha": 1.0,
+        "aspect": None,
+    }
+    if sector_kwargs:
+        edge_styles.update(sector_kwargs)
+    if sector_edge_kwargs:
+        edge_styles.update(sector_edge_kwargs)
+
+    plt_gdf.plot(ax=ax, **edge_styles)
 
     # Manual Legend
     legend_patches = [
@@ -545,17 +637,23 @@ def plot_sectors(
 
     # Labels on centroids
     if add_sector_labels:
+        lbl_defaults = {
+            "fontsize": 12,
+            "weight": "bold",
+            "color": "white",
+            "ha": "center",
+            "va": "center",
+        }
+        if label_kwargs:
+            lbl_defaults.update(label_kwargs)
+
         for _, row in plt_gdf.iterrows():
             cent = row.geometry.centroid
             ax.text(
                 cent.x,
                 cent.y,
                 row[label_column],
-                fontsize=12,
-                weight="bold",
-                color="white",
-                ha="center",
-                va="center",
+                **lbl_defaults,
             )
 
     ax.set_xticks([])

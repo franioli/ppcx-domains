@@ -15,8 +15,8 @@ logger = setup_logger(
     level=logging.INFO,
     name="ppcx",
     force=True,
-    log_to_file=True,
-    log_folder="logs",
+    # log_to_file=True,
+    # log_folder="logs",
     redirect_to_stdout=True,
 )
 
@@ -64,10 +64,10 @@ def parse_args():
         help="Optional months to exclude from random sampling. Format: comma separated months/ranges, e.g. '1-5,11-12' to exclude Jan-May and Nov-Dec.",
     )
     parser.add_argument(
-        "--max-workers",
+        "--jobs",
         type=int,
         default=1,
-        help="Number of parallel processes to run simultaneously (default 1).",
+        help="Number of parallel processes to run simultaneously with joblib (default 1).",
     )
     parser.add_argument(
         "--python",
@@ -277,8 +277,8 @@ def main():
     # Run jobs (parallel or sequential) with joblib
     # use prefer='processes' (default) if you want stronger isolation
     # prefer='threads' is efficient if the tasks are I/O bound (waiting for subprocess).
-    logger.info(f"Running {len(dates)} jobs with max_workers={args.max_workers}...")
-    results = Parallel(n_jobs=args.max_workers, prefer="processes")(
+    logger.info(f"Running {len(dates)} jobs with {args.jobs} jobs...")
+    results = Parallel(n_jobs=args.jobs, prefer="processes")(
         delayed(run_one_date)(args.python, args.script_path, d, timeout=args.timeout)
         for d in tqdm(dates)
     )
