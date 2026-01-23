@@ -47,53 +47,48 @@ class Polygon:
 
 def read_polygons_from_cvat(
     xml_source: str | Path,
-    image_name: str | None = None,
+    image_ids: int | Sequence[int] | None = 0,
+    include_labels: Sequence[str] | None = None,
     exclude_labels: Sequence[str] | None = None,
 ) -> dict[str, Polygon]:
-    """
-    Parse polygons from a CVAT export and return a dict of Polygon objects.
+    """Parse polygons from a CVAT export using cvatkit.
 
-    - If image_name is provided, only polygons for that image are returned.
-    - exclude_labels: optional sequence of label names to ignore.
-    - polygons are sorted by z_order to preserve annotation stacking order.
+    Args:
+        xml_source: Path to the CVAT XML or ZIP annotation.
+        image_ids: ID(s) of the images to extract. 0 (default) for first image,
+            None for all images.
+        include_labels: Whitelist of labels.
+        exclude_labels: Blacklist of labels.
+
+    Returns:
+        dict[str, Polygon]: Map of label names to Polygon objects.
     """
-    exclude = set(exclude_labels or ())
     reader = CvatReader(xml_source)
-
-    # If no specific image requested, use first image
-    if image_name is None:
-        images = reader.get_images()
-        if not images:
-            return {}
-        image_name = images[0].name
-
-    # Get all polygons for the specified image
-    cvat_polygons = reader.get_polygons(image_name=image_name)
-
-    # Sort by z_order
-    cvat_polygons.sort(key=lambda p: p.z_order)
-
     polygons: dict[str, Polygon] = {}
-    for cvat_poly in cvat_polygons:
-        if cvat_poly.label in exclude:
-            logger.debug("Skipping excluded label: %s", cvat_poly.label)
-            continue
 
-        pts_arr = cvat_poly.points
-        if pts_arr is None or pts_arr.size == 0:
-            continue
+    # Normalize image_ids to a list or None
+    target_ids = [image_ids] if isinstance(image_ids, int) else image_ids
 
-        # Close the polygon
-        verts = np.vstack([pts_arr, pts_arr[0]])
-        codes = (
-            [MplPath.MOVETO]
-            + [MplPath.LINETO] * (len(pts_arr) - 1)
-            + [MplPath.CLOSEPOLY]
+    # If target_ids is None, CvatReader handles fetching from all images by not passing image_id
+    if target_ids is None:
+        cvat_polygons = reader.get_polygons(
+            labels=include_labels, exclude_labels=exclude_labels
         )
-        path = MplPath(verts, codes)
+    else:
+        cvat_polygons = []
+        for iid in target_ids:
+            cvat_polygons.extend(
+                reader.get_polygons(
+                    image_id=iid, labels=include_labels, exclude_labels=exclude_labels
+                )
+            )
 
+    # Convert CvatPolygon to Polygon (using MplPath)
+    for cvat_poly in cvat_polygons:
         label = cvat_poly.label or "unnamed"
-        polygons[label] = Polygon(name=label, path=path)
+        path = cvat_poly.to_mpl_path()
+        if path:
+            polygons[label] = Polygon(name=label, path=path)
 
     return polygons
 

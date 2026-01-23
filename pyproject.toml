@@ -13,6 +13,7 @@ dependencies = [
     "affine>=2.4.0",
     "arviz>=0.22.0",
     "cmcrameri>=1.9",
+    "cvatkit>=0.1.0",
     "dotenv>=0.9.9",
     "exifread>=3.3.1",
     "graphviz>=0.21",

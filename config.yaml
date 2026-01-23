@@ -1,16 +1,16 @@
 # Data selection parameters
 data:
-  year: "2017"
-  reference_date: ""
+  year: "2017" # Year of interest. Can be overwritten by the --date argument in the command line
+  reference_date: "" # e.g., "2017-06-15"; can be ovewritten by by the --date in the command-line
   camera_name: "PPCX_Tele"
   days_before_to_include: 0
   days_after_to_include: 0
   dt_min: 70  # Minimum time difference between images in hours
   dt_max: 100  # Maximum time difference between images in hours
-  roi_path: "data/roi.xml"
-  sector_prior_file: "data/prior_data/${data.year}_4domains*.zip"
+  sector_prior_file: "data/${data.year}*.zip" # Path to CVAT ZIP file containing sector prior polygons (and optionally ROI polygon)
+  roi_path: "data/roi.xml" # Path to CVAT XML file containing ROI polygon (optional, if not already included in sector_prior_file)
   variables_names: ["V"] # The feature vector used for clustering (Velocity)
-  output_dir: "output/${data.year}"
+  output_dir: "output/${data.year}" # Output directory for results
 
 # Data preprocessing parameters
 preprocessing:

@@ -384,13 +384,10 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
     master_image_id = dic_analyses["master_image_id"].iloc[0]
     img = get_image(image_id=master_image_id, config=config.api)
 
-    # Read roi for data filtering
-    roi = read_polygons_from_cvat(data_config.roi_path, image_name=None)
-
     # Read sectors for spatial priors
-    prior_file_pattern = data_config.sector_prior_file
+    prior_file_pattern = Path(data_config.sector_prior_file)
     sector_prior_files = list(
-        Path(prior_file_pattern).parent.glob(Path(prior_file_pattern).name)
+        prior_file_pattern.parent.glob(Path(prior_file_pattern).name)
     )
     if len(sector_prior_files) == 0:
         raise FileNotFoundError(
@@ -401,7 +398,39 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
             f"Multiple sector prior files matched. Using the first one found: {list(sector_prior_files)}"
         )
     sector_prior_file = sector_prior_files[0]
-    sectors = read_polygons_from_cvat(sector_prior_file, image_name=None)
+    try:
+        sector_names = list(config.priors.probability.keys())
+        sectors = read_polygons_from_cvat(
+            sector_prior_file,
+            image_ids=[0],
+            include_labels=sector_names,
+        )
+        if not sectors or any(name not in sectors for name in sector_names):
+            raise ValueError(
+                f"Sectors not found or missing in CVAT file: {sector_prior_file}. Check that all sector names {sector_names} are present in the first image of the CVAT task."
+            )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not read sectors from CVAT file: {sector_prior_file}"
+        ) from exc
+
+    # Try to read ROI from the same CVAT file (polygons named "ROI" or "roi")
+    roi = None
+    try:
+        roi_poly = read_polygons_from_cvat(
+            sector_prior_file, image_ids=[0], include_labels=["ROI", "roi"]
+        )
+        roi = roi_poly["ROI"] if "ROI" in roi_poly else roi_poly["roi"]
+    except Exception:
+        # If ROI not found yet in sector_prior_file, try to read from separate CVAT file if provided
+        if data_config.roi_path is not None:
+            roi_poly = read_polygons_from_cvat(
+                data_config.roi_path, image_ids=[0], include_labels=["ROI", "roi"]
+            )
+            roi = roi_poly["ROI"] if "ROI" in roi_poly else roi_poly["roi"]
+
+    if roi is None:
+        logger.warning("No ROI polygon provided. Skipping spatial filtering.")
 
     # Fetch DIC data
     out = get_multi_dic_data(dic_ids, stack_results=False, config=config.api)
@@ -413,7 +442,8 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
     for src_id, df_src in out.items():
         try:
             # Filter only points inside the spatial priors sectors
-            df_src = filter_dataframe_by_polygons(df_src, polygons=roi)
+            if roi is not None:
+                df_src = filter_dataframe_by_polygons(df_src, polygons=roi)
 
             # Apply other DIC filters if any
             df_src = apply_dic_filters(df_src, **preproc_config.filter_kwargs)

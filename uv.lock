@@ -356,6 +356,20 @@ wheels = [
 ]
 
 [[package]]
+name = "cvatkit"
+version = "0.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "matplotlib" },
+    { name = "numpy" },
+    { name = "shapely" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c5/1f/5c432e29143c7ebfa1eee1c381261d8b290497e9c9256fa982eda2a1c2dd/cvatkit-0.1.0.tar.gz", hash = "sha256:56a5bf7b2bcbb943c42560cf12f52a1a59cda3980f12809012d34496a65b67f1", size = 267522, upload-time = "2026-01-23T10:45:53.441Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7c/0f/77f12cff68dfc45dc06102f6dd96a3dee05510427185e8e9394a510a53b9/cvatkit-0.1.0-py3-none-any.whl", hash = "sha256:5fc32f4adb4741d3b239852484c5071b7b6cc2a933499ab621ef56c89718637f", size = 12790, upload-time = "2026-01-23T10:45:51.7Z" },
+]
+
+[[package]]
 name = "cycler"
 version = "0.12.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1254,6 +1268,7 @@ dependencies = [
     { name = "affine" },
     { name = "arviz" },
     { name = "cmcrameri" },
+    { name = "cvatkit" },
     { name = "dotenv" },
     { name = "exifread" },
     { name = "graphviz" },
@@ -1287,6 +1302,7 @@ requires-dist = [
     { name = "affine", specifier = ">=2.4.0" },
     { name = "arviz", specifier = ">=0.22.0" },
     { name = "cmcrameri", specifier = ">=1.9" },
+    { name = "cvatkit", specifier = ">=0.1.0" },
     { name = "dotenv", specifier = ">=0.9.9" },
     { name = "exifread", specifier = ">=3.3.1" },
     { name = "graphviz", specifier = ">=0.21" },
