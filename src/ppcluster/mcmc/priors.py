@@ -10,8 +10,6 @@ from PIL import Image
 from scipy.spatial.distance import cdist
 
 logger = logging.getLogger("ppcx")
-RANDOM_SEED = 8927
-rng = np.random.default_rng(RANDOM_SEED)
 
 COLORMAP = plt.get_cmap("tab10")
 

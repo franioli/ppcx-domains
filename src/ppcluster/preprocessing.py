@@ -9,8 +9,6 @@ from ppcluster.griddata import create_2d_grid_from_df
 from ppcluster.lamma_filter import vector_field_filter
 
 logger = logging.getLogger("ppcx")
-RANDOM_SEED = 8927
-
 
 # === GRID data filtering ===
 
@@ -370,7 +368,7 @@ def apply_2d_lamma_filter(
 
 
 # === SPATIAL SUBSAMPLING ===
-def spatial_subsample(df, n_subsample=5, method="regular", random_state=RANDOM_SEED):
+def spatial_subsample(df, n_subsample=5, method="regular"):
     """
     Subsample DIC data spatially to reduce computational load.
 
@@ -392,7 +390,7 @@ def spatial_subsample(df, n_subsample=5, method="regular", random_state=RANDOM_S
             if n_subsample < 1
             else int(len(df) / n_subsample)
         )
-        df_sub = df.sample(n=min(n_samples, len(df)), random_state=random_state).copy()
+        df_sub = df.sample(n=min(n_samples, len(df))).copy()
 
     else:
         raise ValueError(

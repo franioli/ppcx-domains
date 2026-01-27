@@ -19,8 +19,8 @@ from ppcluster.cvat import (
     filter_dataframe_by_polygons,
     read_polygons_from_cvat,
 )
-from ppcluster.griddata import create_2d_grid
-from ppcluster.postproc import aggregate_multiscale_clustering, plot_clustering_grid
+from ppcluster.griddata import create_2d_grid, plot_clustering_grid
+from ppcluster.mcmc.multiscale import aggregate_multiscale_clustering
 from ppcluster.preprocessing import (
     apply_2d_gaussian_filter,
     apply_dic_filters,
@@ -318,10 +318,35 @@ def run_mcmc_clustering(
     return result
 
 
+def load_priors_and_roi(sector_prior_file, sector_names):
+    sectors = {}
+    roi = None
+
+    if sector_prior_file.suffix.lower() == ".xml":
+        # CVAT XML
+        if logger:
+            logger.info(f"Loading priors from CVAT XML: {sector_prior_file}")
+        sectors = read_polygons_from_cvat(
+            sector_prior_file,
+            image_ids=[0],
+            include_labels=sector_names,
+        )
+        try:
+            roi_poly = read_polygons_from_cvat(
+                sector_prior_file, image_ids=[0], include_labels=["ROI", "roi"]
+            )
+            roi = roi_poly.get("ROI") or roi_poly.get("roi")
+        except Exception:
+            pass
+
+
 def run_pipeline(config: DictConfig | ListConfig):
     """
     Main execution pipeline taking a fully merged configuration object.
     """
+    if not isinstance(config, DictConfig | ListConfig):
+        raise ValueError("config must be an OmegaConf DictConfig or ListConfig object.")
+
     reference_date = config.data.reference_date
     if not reference_date:
         raise ValueError("reference_date must be provided via CLI or config.")
