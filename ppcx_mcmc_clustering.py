@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 
 import arviz as az
+import geopandas as gpd
 import joblib
 import numpy as np
 import pandas as pd
@@ -318,14 +319,19 @@ def run_mcmc_clustering(
     return result
 
 
-def load_priors_and_roi(sector_prior_file, sector_names):
+def load_sectors_and_roi(
+    sector_prior_file: Path, sector_names: list[str], roi_path: Path | None = None
+):
+    """
+    Load sector polygons and ROI polygon from a CVAT XML or geospatial file.
+    Returns: (sectors_dict, roi_polygon or None)
+    """
     sectors = {}
     roi = None
 
     if sector_prior_file.suffix.lower() == ".xml":
         # CVAT XML
-        if logger:
-            logger.info(f"Loading priors from CVAT XML: {sector_prior_file}")
+        logger.info(f"Loading priors from CVAT XML: {sector_prior_file}")
         sectors = read_polygons_from_cvat(
             sector_prior_file,
             image_ids=[0],
@@ -338,6 +344,52 @@ def load_priors_and_roi(sector_prior_file, sector_names):
             roi = roi_poly.get("ROI") or roi_poly.get("roi")
         except Exception:
             pass
+    else:
+        # GeoJSON, SHP, GPKG, etc.
+        logger.info(f"Loading priors from geospatial file: {sector_prior_file}")
+        gdf_priors = gpd.read_file(sector_prior_file)
+        label_col = None
+        for candidate in ["sector", "label", "name", "class", "id"]:
+            if candidate in gdf_priors.columns:
+                label_col = candidate
+                break
+        if not label_col:
+            raise ValueError(
+                f"Could not find a classification label column in {sector_prior_file}."
+            )
+        for _, row in gdf_priors.iterrows():
+            lbl = str(row[label_col])
+            geom = row.geometry
+            if lbl in sector_names:
+                if lbl in sectors:
+                    sectors[lbl] = sectors[lbl].union(geom)
+                else:
+                    sectors[lbl] = geom
+            if lbl.lower() == "roi":
+                roi = geom if roi is None else roi.union(geom)
+
+    # Try to read ROI from separate file if not found
+    if roi is None and roi_path is not None:
+        roi_path = Path(roi_path)
+        if roi_path.exists():
+            if roi_path.suffix.lower() == ".xml":
+                try:
+                    roi_poly = read_polygons_from_cvat(
+                        roi_path, image_ids=[0], include_labels=["ROI", "roi"]
+                    )
+                    roi = roi_poly.get("ROI") or roi_poly.get("roi")
+                except Exception as e:
+                    logger.warning(f"Failed to read ROI from XML {roi_path}: {e}")
+            else:
+                try:
+                    gdf_roi = gpd.read_file(roi_path)
+                    roi = gdf_roi.geometry.unary_union
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to read ROI from geospatial file {roi_path}: {e}"
+                    )
+
+    return sectors, roi
 
 
 def run_pipeline(config: DictConfig | ListConfig):
@@ -420,7 +472,7 @@ def run_pipeline(config: DictConfig | ListConfig):
     master_image_id = dic_analyses["master_image_id"].iloc[0]
     img = get_image(image_id=master_image_id, config=config.api)
 
-    # Read sectors for spatial priors
+    # Read sectors for spatial priors and ROI
     prior_file_pattern = Path(data_config.sector_prior_file)
     sector_prior_files = list(
         prior_file_pattern.parent.glob(Path(prior_file_pattern).name)
@@ -434,39 +486,50 @@ def run_pipeline(config: DictConfig | ListConfig):
             f"Multiple sector prior files matched. Using the first one found: {list(sector_prior_files)}"
         )
     sector_prior_file = sector_prior_files[0]
-    try:
-        sector_names = list(config.priors.probability.keys())
-        sectors = read_polygons_from_cvat(
-            sector_prior_file,
-            image_ids=[0],
-            include_labels=sector_names,
-        )
-        if not sectors or any(name not in sectors for name in sector_names):
-            raise ValueError(
-                f"Sectors not found or missing in CVAT file: {sector_prior_file}. Check that all sector names {sector_names} are present in the first image of the CVAT task."
-            )
-    except Exception as exc:
-        raise RuntimeError(
-            f"Could not read sectors from CVAT file: {sector_prior_file}"
-        ) from exc
+    sector_names = list(config.priors.probability.keys())
+    sectors, roi = load_sectors_and_roi(
+        sector_prior_file, sector_names, roi_path=data_config.roi_path
+    )
 
-    # Try to read ROI from the same CVAT file (polygons named "ROI" or "roi")
-    roi = None
-    try:
-        roi_poly = read_polygons_from_cvat(
-            sector_prior_file, image_ids=[0], include_labels=["ROI", "roi"]
+    if not sectors or any(name not in sectors for name in sector_names):
+        missing = [name for name in sector_names if name not in sectors]
+        raise ValueError(
+            f"Sectors missing in prior file {sector_prior_file}: {missing}. Expected: {sector_names}"
         )
-        roi = roi_poly["ROI"] if "ROI" in roi_poly else roi_poly["roi"]
-    except Exception:
-        # If ROI not found yet in sector_prior_file, try to read from separate CVAT file if provided
-        if data_config.roi_path is not None:
-            roi_poly = read_polygons_from_cvat(
-                data_config.roi_path, image_ids=[0], include_labels=["ROI", "roi"]
-            )
-            roi = roi_poly["ROI"] if "ROI" in roi_poly else roi_poly["roi"]
-
     if roi is None:
         logger.warning("No ROI polygon provided. Skipping spatial filtering.")
+
+    # try:
+    #     sectors = read_polygons_from_cvat(
+    #         sector_prior_file,
+    #         image_ids=[0],
+    #         include_labels=sector_names,
+    #     )
+    #     if not sectors or any(name not in sectors for name in sector_names):
+    #         raise ValueError(
+    #             f"Sectors not found or missing in CVAT file: {sector_prior_file}. Check that all sector names {sector_names} are present in the first image of the CVAT task."
+    #         )
+    # except Exception as exc:
+    #     raise RuntimeError(
+    #         f"Could not read sectors from CVAT file: {sector_prior_file}"
+    #     ) from exc
+
+    # # Try to read ROI from the same CVAT file (polygons named "ROI" or "roi")
+    # roi = None
+    # try:
+    #     roi_poly = read_polygons_from_cvat(
+    #         sector_prior_file, image_ids=[0], include_labels=["ROI", "roi"]
+    #     )
+    #     roi = roi_poly["ROI"] if "ROI" in roi_poly else roi_poly["roi"]
+    # except Exception:
+    #     # If ROI not found yet in sector_prior_file, try to read from separate CVAT file if provided
+    #     if data_config.roi_path is not None:
+    #         roi_poly = read_polygons_from_cvat(
+    #             data_config.roi_path, image_ids=[0], include_labels=["ROI", "roi"]
+    #         )
+    #         roi = roi_poly["ROI"] if "ROI" in roi_poly else roi_poly["roi"]
+    # if roi is None:
+    #     logger.warning("No ROI polygon provided. Skipping spatial filtering.")
 
     # Fetch DIC data
     out = get_multi_dic_data(dic_ids, stack_results=False, config=config.api)
