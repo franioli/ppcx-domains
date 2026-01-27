@@ -1,7 +1,7 @@
 import matplotlib
 
+from ppcluster._deprecated.roi import PolygonROISelector
 from ppcluster.utils.database import get_image
-from ppcluster.utils.roi import PolygonROISelector
 
 matplotlib.use("Qt5Agg")
 
