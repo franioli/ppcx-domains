@@ -108,7 +108,15 @@ multiscale:
 
 # Post-processing parameters
 postprocessing:
-  # TODO: ADD HERE THE NEW VECTORIZATION PARAMETERS (now hardcoded in ppcx_mcmc_clustering.py)
+  vectorization:
+    min_area_px2: 100000.0
+    isolation_buffer: 30.0
+    velocity_merge_threshold: 1
+    target_number_of_sectors: 4
+    fill_holes_area: 80000.0
+    smooth_geometries: true
+    smooth_method: "smoothify"
+    smooth_iterations: 1
   sector_assignment:
     method: "y_centroid"  # Sorts resulting clusters by elevation to ensure consistent labeling (A, B, C...)
     ascending: false      # False if sector A is at the bottom (lowest Y), True otherwise (the y axis is inverted in image coordinates (0 at top))

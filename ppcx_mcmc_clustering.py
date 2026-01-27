@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import pymc as pm
 from matplotlib import pyplot as plt
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, ListConfig, OmegaConf
 from sklearn.preprocessing import StandardScaler
 from sqlalchemy import create_engine
 
@@ -66,6 +66,21 @@ def parse_arguments():
         "-o",
         help="Output directory. Override config value. If not provided, uses config value.",
         default=None,
+    )
+    p.add_argument(
+        "--config",
+        "-c",
+        type=str,
+        default=None,
+        help="Path to an optional custom config.yaml file to load instead of the default.",
+    )
+
+    # Robust generic override mechanism using dotlist (e.g., data.dt_min=24)
+    # This captures any leftover arguments in the format key=value
+    p.add_argument(
+        "overrides",
+        nargs="*",
+        help="Configuration overrides in dotlist format (e.g., data.dt_min=24 mcmc.sample_options.draws=500).",
     )
     return p.parse_args()
 
@@ -303,37 +318,13 @@ def run_mcmc_clustering(
     return result
 
 
-def main(reference_date: str | None = None, output_dir: str | Path | None = None):
+def run_pipeline(config: DictConfig | ListConfig):
     """
-    Run the pipeline. When called interactively you can pass:
-      - reference_date: "YYYY-MM-DD" to override config.data.reference_date
-      - overrides: dict of dot.notation keys -> values to override config entries
+    Main execution pipeline taking a fully merged configuration object.
     """
-
-    # ===  DATA LOADING AND PREPROCESSING  === #
-    config = load_config()
-
-    # Retrieve parameters from CLI or config
-    if reference_date:
-        config.data.reference_date = reference_date
-
     reference_date = config.data.reference_date
     if not reference_date:
-        raise ValueError("reference_date must be specified either via CLI or config.")
-
-    # Automatically update 'year' in config so that interpolated paths (output_dir, priors) match the date
-    try:
-        current_year = str(datetime.strptime(reference_date, "%Y-%m-%d").year)
-        if config.data.year != current_year:
-            logger.info(
-                f"Updating config.data.year: {config.data.year} -> {current_year}"
-            )
-            config.data.year = current_year
-    except ValueError:
-        logger.warning(f"Could not parse year from reference_date: {reference_date}")
-
-    if output_dir:
-        config.data.output_dir = str(output_dir)
+        raise ValueError("reference_date must be provided via CLI or config.")
 
     # Retrieve other config parameters
     data_config = config.data
@@ -342,6 +333,7 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
     variables_names = data_config.variables_names
 
     # Output base directory (output will be saved in a subfolder with camera name and date)
+    # config.data.output_dir is already resolved in __main__
     output_base_dir = Path(data_config.output_dir)
     output_dir = output_base_dir / f"{camera_name}_{reference_date}"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -660,26 +652,24 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
     # )
 
     # ===  KINEMATIC SECTORS COMPUTATION ===
-    # TODO: move parameters to config file!!
-
     # 1. Vectorize & Smooth
     logger.info("Vectorizing grid clusters to polygons...")
     sectors = vectorize_gridded_sectors(kin_cluster_grid, X, Y)
     sectors.to_file(output_dir / f"{base_name}_sectors_raw.geojson", driver="GeoJSON")
+    vect_config = postproc_config.vectorization
     sectors = clean_vector_sectors(
         sectors,
         dic_df,
-        min_area_px2=100000.0,
-        isolation_buffer=30.0,
-        velocity_merge_threshold=1,
-        target_number_of_sectors=4,
-        fill_holes_area=80000.0,
-        smooth_geometries=True,
-        smooth_method="smoothify",
-        smooth_iterations=1,
+        min_area_px2=vect_config.min_area_px2,
+        isolation_buffer=vect_config.isolation_buffer,
+        velocity_merge_threshold=vect_config.velocity_merge_threshold,
+        target_number_of_sectors=vect_config.target_number_of_sectors,
+        fill_holes_area=vect_config.fill_holes_area,
+        smooth_geometries=vect_config.smooth_geometries,
+        smooth_method=vect_config.smooth_method,
+        smooth_iterations=vect_config.smooth_iterations,
         raster_res=2 * raster_res,
     )
-
     # Plot raw clusters vs vectorized sectors
     fig, (ax_raw, ax_vectorized) = plt.subplots(1, 2, figsize=(14, 7))
     plot_clustering_grid(
@@ -782,4 +772,42 @@ def main(reference_date: str | None = None, output_dir: str | Path | None = None
 
 if __name__ == "__main__":
     args = parse_arguments()
-    main(reference_date=args.date, output_dir=args.output_dir)
+
+    # 1. Load Base Config
+    config_path = args.config if args.config else None
+    config = load_config(config_path)
+
+    # 2. Apply Specific CLI Flags (Highest Priority for these shortcuts)
+    if args.date:
+        config.data.reference_date = args.date
+    if args.output_dir:
+        config.data.output_dir = args.output_dir
+
+    # 3. Apply Generic Dotlist Overrides
+    if args.overrides:
+        # OmegaConf can natively merge list of dot-string arguments
+        # e.g. ["data.dt_min=10", "mcmc.regularization=False"]
+        cli_conf = OmegaConf.from_dotlist(args.overrides)
+        config = OmegaConf.merge(config, cli_conf)
+
+    # 4. Dynamic Logic: Update 'year' based on 'reference_date'
+    # This must happen before resolution so that paths using ${data.year} are correct
+    if config.data.reference_date:
+        try:
+            ref_dt = datetime.strptime(config.data.reference_date, "%Y-%m-%d")
+            current_year = str(ref_dt.year)
+            if config.data.year != current_year:
+                logger.info(
+                    f"CLI: Updating 'data.year' from {config.data.year} to {current_year} based on reference date."
+                )
+                config.data.year = current_year
+        except ValueError:
+            logger.error(
+                f"Could not parse year from reference_date: {config.data.reference_date}"
+            )
+
+    # 5. Resolve Configuration
+    # This computes all interpolations (e.g. ${data.output_dir}) now.
+    OmegaConf.resolve(config)
+
+    run_pipeline(config)
