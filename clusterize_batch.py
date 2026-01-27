@@ -80,7 +80,54 @@ def parse_args():
         default=None,
         help="Timeout (seconds) for each run subprocess (default none).",
     )
-    return parser.parse_args()
+    return parser.parse_known_args()
+
+
+def run_one_date(
+    python: str,
+    script: str,
+    date: str,
+    timeout=None,
+    cleanup_on_failure=False,
+    extra_args=None,
+) -> bool:
+    # Build command str
+    cmd = [python, script, "--date", date]
+    if extra_args:
+        cmd.extend(extra_args)
+
+    # Run subprocess
+    logger.info(f"START {date}")
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+        if proc.returncode == 0:
+            logger.info(f"SUCCESS {date}")
+            return True
+
+        # Log minimal info on error, detailed info can be inspected if needed
+        logger.error(
+            f"FAILURE {date} (exit code {proc.returncode})\n"
+            f"STDERR snippet: {proc.stderr[-500:] if proc.stderr else 'Empty'}"
+        )
+        if cleanup_on_failure:
+            _cleanup_partial_results(date)
+        return False
+
+    except subprocess.TimeoutExpired:
+        logger.error(f"TIMEOUT {date} (> {timeout}s)")
+        if cleanup_on_failure:
+            _cleanup_partial_results(date)
+        return False
+
+    except Exception as e:
+        logger.error(f"EXCEPTION {date}: {e}")
+        if cleanup_on_failure:
+            _cleanup_partial_results(date)
+        return False
+
+
+# === Helper functions ===
 
 
 def _load_dates_from_file(path: Path):
@@ -190,47 +237,10 @@ def _cleanup_partial_results(date: str):
         logger.debug(f"[CLEANUP] No partial results found for {date}")
 
 
-def run_one_date(
-    python: str,
-    script: str,
-    date: str,
-    timeout=None,
-    cleanup_on_failure=False,
-) -> bool:
-    cmd = [python, script, "--date", date]
-    logger.info(f"START {date}")
+if __name__ == "__main__":
+    # parse arguments, including extra args for the clustering script
+    args, extra_args = parse_args()
 
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-
-        if proc.returncode == 0:
-            logger.info(f"SUCCESS {date}")
-            return True
-
-        # Log minimal info on error, detailed info can be inspected if needed
-        logger.error(
-            f"FAILURE {date} (exit code {proc.returncode})\n"
-            f"STDERR snippet: {proc.stderr[-500:] if proc.stderr else 'Empty'}"
-        )
-        if cleanup_on_failure:
-            _cleanup_partial_results(date)
-        return False
-
-    except subprocess.TimeoutExpired:
-        logger.error(f"TIMEOUT {date} (> {timeout}s)")
-        if cleanup_on_failure:
-            _cleanup_partial_results(date)
-        return False
-
-    except Exception as e:
-        logger.error(f"EXCEPTION {date}: {e}")
-        if cleanup_on_failure:
-            _cleanup_partial_results(date)
-        return False
-
-
-def main():
-    args = parse_args()
     # build dates list
     if args.dates:
         dates = [d.strip() for d in args.dates.split(",") if d.strip()]
@@ -274,25 +284,40 @@ def main():
         except Exception as exc:
             raise SystemExit(f"Could not sample dates: {exc}") from None
 
-    # Run jobs (parallel or sequential) with joblib
-    # use prefer='processes' (default) if you want stronger isolation
-    # prefer='threads' is efficient if the tasks are I/O bound (waiting for subprocess).
-    logger.info(f"Running {len(dates)} jobs with {args.jobs} jobs...")
-    results = Parallel(n_jobs=args.jobs, prefer="processes")(
-        delayed(run_one_date)(args.python, args.script_path, d, timeout=args.timeout)
-        for d in tqdm(dates)
-    )
+    if args.jobs > 1:
+        # use prefer='processes' (default) if you want stronger isolation
+        # prefer='threads' is efficient if the tasks are I/O bound (waiting for subprocess).
+        logger.info(f"Running {len(dates)} jobs with {args.jobs} jobs...")
+        results = Parallel(n_jobs=args.jobs, prefer="processes")(
+            delayed(run_one_date)(
+                args.python,
+                args.script_path,
+                d,
+                timeout=args.timeout,
+                extra_args=extra_args,
+            )
+            for d in tqdm(dates)
+        )
+
+    else:
+        logger.info("Running in sequential mode.")
+        results = []
+        for d in tqdm(dates):
+            ok = run_one_date(
+                args.python,
+                args.script_path,
+                d,
+                timeout=args.timeout,
+                extra_args=extra_args,
+            )
+            results.append(ok)
 
     # summary
-    success_count = sum(results)
-    total = len(results)
+    success_count = sum(1 for ok in results if bool(ok))
+    total = len(dates)
     logger.info("-" * 40)
     logger.info(f"SUMMARY: {success_count}/{total} succeeded.")
     if success_count < total:
         failed = [d for d, ok in zip(dates, results, strict=True) if not ok]
         logger.error(f"Failed dates ({len(failed)}): {', '.join(failed)}")
     logger.info("-" * 40)
-
-
-if __name__ == "__main__":
-    main()
