@@ -88,12 +88,25 @@ _DEFAULT_CONFIG = {
         },
     },
     "postprocessing": {
-        "split_disconnected_components": True,
-        "erosion_iterations": 0,
-        "dilation_iterations": 0,
-        "min_cluster_size": 50,
-        "connectivity": 8,
-        "keep_only_largest_n": -1,
+        # "split_disconnected_components": True,
+        # "erosion_iterations": 0,
+        # "dilation_iterations": 0,
+        # "min_cluster_size": 50,
+        # "connectivity": 8,
+        # "keep_only_largest_n": -1,
+        "vectorization": {
+            "method": "smoothify",
+            "buffer_distance": 2.0,
+            "simplify_tolerance": 0.0,
+            "min_area_px2": 100000.0,
+            "isolation_buffer": 30.0,
+            "velocity_merge_threshold": 1,
+            "target_number_of_sectors": 4,
+            "fill_holes_area": 80000.0,
+            "smooth_geometries": True,
+            "smooth_method": "smoothify",
+            "smooth_iterations": 1,
+        },
         "sector_assignment": {
             "method": "y_position",  # We use the centroid Y position to order sectors from bottom to top (A=lowest Y)
             "ascending": False,  # The y axis is inverted in image coordinates (0 at top), hence ascending=False
@@ -103,11 +116,6 @@ _DEFAULT_CONFIG = {
                 "C": "#f1ee30",
                 "D": "#5fb61c",
             },
-        },
-        "vectorization": {
-            "method": "smoothify",
-            "buffer_distance": 2.0,
-            "simplify_tolerance": 0.0,
         },
     },
     "random_seed": 8927,
