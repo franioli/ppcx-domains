@@ -8,6 +8,7 @@ from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from PIL import Image
 from scipy.spatial.distance import cdist
+from shapely.geometry import Point
 
 logger = logging.getLogger("ppcx")
 
@@ -39,35 +40,6 @@ def _validate_and_normalize_prior_vecs(
             )
         prior_vecs[name] = arr / arr.sum()
     return prior_vecs
-
-
-def _polygon_contains_mask(
-    poly: Any, pts: np.ndarray, x: np.ndarray, y: np.ndarray
-) -> np.ndarray:
-    """Return boolean mask of points inside polygon (try common APIs)."""
-    try:
-        # common matplotlib Path-like API: contains_points(pts)
-        return np.asarray(poly.contains_points(pts), dtype=bool)
-    except Exception:
-        try:
-            # some objects accept separate x,y arrays
-            return np.asarray(poly.contains_points(x, y), dtype=bool)
-        except Exception:
-            # fallback: can't test membership -> no points inside
-            return np.zeros(len(x), dtype=bool)
-
-
-def _compute_sector_centroids(polygons: dict[str, Any]) -> dict[str, np.ndarray]:
-    """Compute centroid for each polygon sector."""
-    centroids = {}
-    for name, poly in polygons.items():
-        if hasattr(poly, "path") and hasattr(poly.path, "vertices"):
-            vertices = np.asarray(poly.path.vertices)
-        else:
-            # Fallback for other polygon types
-            vertices = np.asarray(poly)
-        centroids[name] = vertices.mean(axis=0)
-    return centroids
 
 
 def _apply_distance_fade_per_cluster(
@@ -161,18 +133,19 @@ def assign_spatial_priors(
     prior_probs_arr = np.tile(uniform, (ndata, 1))
 
     if fade_method == "constant":
-        # Original binary assignment
-        for name, polygon in polygons.items():
-            mask = _polygon_contains_mask(polygon, pts, x, y)
+        # Assign priors based on shapely polygon containment
+        for idx, (name, polygon) in enumerate(polygons.items()):
+            mask = np.array([polygon.contains(Point(pt)) for pt in pts])
             prior_probs_arr[mask, :] = prior_vecs[name]
 
     else:
         # Distance-based fading methods
-        centroids = _compute_sector_centroids(polygons)
-
-        # Apply fading for each sector independently
+        centroids = {
+            name: np.array(polygon.centroid.coords[0])
+            for name, polygon in polygons.items()
+        }
         for name, polygon in polygons.items():
-            mask = _polygon_contains_mask(polygon, pts, x, y)
+            mask = np.array([polygon.contains(Point(pt)) for pt in pts])
             if np.any(mask):
                 centroid = centroids[name]
                 sector_prior_vec = prior_vecs[name]

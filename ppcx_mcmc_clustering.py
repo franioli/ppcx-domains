@@ -319,34 +319,21 @@ def run_mcmc_clustering(
     return result
 
 
-def load_sectors_and_roi(
-    sector_prior_path: Path, sector_names: list[str], roi_path: Path | None = None
-):
+def read_sectors_from_file(sector_prior_path: Path, sector_names: list[str]):
     """
-    Load sector polygons and ROI polygon from a CVAT XML or geospatial file.
-    Returns: (sectors_dict, roi_polygon or None)
+    Load sector polygons from a CVAT XML or geospatial file.
+    Returns: sectors_dict.
     """
     sectors = {}
-    roi = None
-
     if sector_prior_path.suffix.lower() in (".xml", ".zip"):
-        # CVAT XML
-        logger.info(f"Loading priors from CVAT XML: {sector_prior_path}")
+        logger.info(f"Loading sectors from CVAT XML: {sector_prior_path}")
         sectors = read_polygons_from_cvat(
             sector_prior_path,
             image_ids=[0],
             include_labels=sector_names,
         )
-        try:
-            roi_poly = read_polygons_from_cvat(
-                sector_prior_path, image_ids=[0], include_labels=["ROI", "roi"]
-            )
-            roi = roi_poly.get("ROI") or roi_poly.get("roi")
-        except Exception:
-            pass
     elif sector_prior_path.suffix.lower() in (".geojson", ".shp", ".gpkg"):
-        # GeoJSON, SHP, GPKG, etc.
-        logger.info(f"Loading priors from geospatial file: {sector_prior_path}")
+        logger.info(f"Loading sectors from geospatial file: {sector_prior_path}")
         gdf_priors = gpd.read_file(sector_prior_path)
         label_col = None
         for candidate in ["sector", "label", "name", "class", "id"]:
@@ -365,33 +352,86 @@ def load_sectors_and_roi(
                     sectors[lbl] = sectors[lbl].union(geom)
                 else:
                     sectors[lbl] = geom
-            if lbl.lower() == "roi":
-                roi = geom if roi is None else roi.union(geom)
     else:
         raise ValueError(
             f"Unsupported sector prior file format: {sector_prior_path.suffix}"
         )
+    return sectors
 
-    # Try to read ROI from separate file if not found
-    if roi is None and roi_path is not None:
-        roi_path = Path(roi_path)
-        if roi_path.exists():
-            if roi_path.suffix.lower() == ".xml":
-                try:
-                    roi_poly = read_polygons_from_cvat(
-                        roi_path, image_ids=[0], include_labels=["ROI", "roi"]
-                    )
-                    roi = roi_poly.get("ROI") or roi_poly.get("roi")
-                except Exception as e:
-                    logger.warning(f"Failed to read ROI from XML {roi_path}: {e}")
-            else:
-                try:
-                    gdf_roi = gpd.read_file(roi_path)
-                    roi = gdf_roi.geometry.union_all()
-                except Exception as e:
-                    logger.warning(
-                        f"Failed to read ROI from geospatial file {roi_path}: {e}"
-                    )
+
+def read_roi_from_file(path: Path):
+    """
+    Load ROI polygon from a CVAT XML or geospatial file.
+    Returns: roi_polygon or None.
+    """
+    roi = None
+    if not path or not Path(path).exists():
+        return None
+
+    path = Path(path)
+    if path.suffix.lower() in (".xml", ".zip"):
+        try:
+            logger.info(f"Loading ROI from CVAT XML: {path}")
+            roi_poly = read_polygons_from_cvat(
+                path, image_ids=[0], include_labels=["ROI", "roi"]
+            )
+            roi = roi_poly.get("ROI") or roi_poly.get("roi")
+        except Exception as e:
+            logger.warning(f"Failed to read ROI from XML {path}: {e}")
+    elif path.suffix.lower() in (".geojson", ".shp", ".gpkg"):
+        try:
+            logger.info(f"Loading ROI from geospatial file: {path}")
+            gdf_roi = gpd.read_file(path)
+            roi = gdf_roi.geometry.union_all()
+        except Exception as e:
+            logger.warning(f"Failed to read ROI from geospatial file {path}: {e}")
+    else:
+        logger.warning(
+            f"Unsupported ROI file format: {path.suffix}. Skipping ROI loading."
+        )
+    return roi
+
+
+def load_sectors_and_roi(
+    sector_prior_path: Path, sector_names: list[str], roi_path: Path | None = None
+):
+    """
+    Load sector polygons and ROI polygon from a CVAT XML or geospatial file.
+    Returns: (sectors_dict, roi_polygon or None).
+    """
+
+    # Find matching sector prior file (supports glob patterns)
+    prior_file_pattern = Path(sector_prior_path)
+    sector_prior_paths = list(
+        prior_file_pattern.parent.glob(Path(prior_file_pattern).name)
+    )
+    if len(sector_prior_paths) == 0:
+        raise FileNotFoundError(
+            f"No sector prior file found matching: {sector_prior_path}"
+        )
+    if len(sector_prior_paths) > 1:
+        logger.warning(
+            f"Multiple sector prior files matched. Using the first one found: {list(sector_prior_paths)}"
+        )
+    sector_prior_path = sector_prior_paths[0]
+
+    # Load sectors
+    sectors = read_sectors_from_file(sector_prior_path, sector_names)
+    # if not sectors or any(name not in sectors for name in sector_names):
+    #     missing = [name for name in sector_names if name not in sectors]
+    #     raise ValueError(
+    #         f"Sectors missing in prior file {sector_prior_path}: {missing}. Expected: {sector_names}"
+    #     )
+
+    # Try to read ROI from separate file if provided, else from sector_prior_path
+    roi = None
+    if roi_path is not None:
+        roi = read_roi_from_file(roi_path)
+    if roi is None:
+        roi = read_roi_from_file(sector_prior_path)
+
+    if roi is None:
+        logger.warning("No ROI polygon provided. Skipping spatial filtering.")
 
     return sectors, roi
 
@@ -426,6 +466,14 @@ def run_pipeline(config: DictConfig | ListConfig):
     # Save a copy of the used config in the output dir with omegaconfig dump
     config_path = output_dir / f"{base_name}_config.yaml"
     OmegaConf.save(config, config_path)
+
+    # Read sectors for spatial priors and ROI
+    sector_names = list(config.priors.probability.keys())
+    sectors, roi = load_sectors_and_roi(
+        sector_prior_path=Path(data_config.sector_prior_path),
+        sector_names=sector_names,
+        roi_path=Path(data_config.roi_path),
+    )
 
     # Date range for data selection
     days_before_to_include = data_config.days_before_to_include
@@ -476,65 +524,6 @@ def run_pipeline(config: DictConfig | ListConfig):
     master_image_id = dic_analyses["master_image_id"].iloc[0]
     img = get_image(image_id=master_image_id, config=config.api)
 
-    # Read sectors for spatial priors and ROI
-    prior_file_pattern = Path(data_config.sector_prior_path)
-    sector_prior_paths = list(
-        prior_file_pattern.parent.glob(Path(prior_file_pattern).name)
-    )
-    if len(sector_prior_paths) == 0:
-        raise FileNotFoundError(
-            f"No sector prior file found matching: {data_config.sector_prior_path}"
-        )
-    if len(sector_prior_paths) > 1:
-        logger.warning(
-            f"Multiple sector prior files matched. Using the first one found: {list(sector_prior_paths)}"
-        )
-    sector_prior_path = sector_prior_paths[0]
-    sector_names = list(config.priors.probability.keys())
-    sectors, roi = load_sectors_and_roi(
-        sector_prior_path, sector_names, roi_path=data_config.roi_path
-    )
-
-    if not sectors or any(name not in sectors for name in sector_names):
-        missing = [name for name in sector_names if name not in sectors]
-        raise ValueError(
-            f"Sectors missing in prior file {sector_prior_path}: {missing}. Expected: {sector_names}"
-        )
-    if roi is None:
-        logger.warning("No ROI polygon provided. Skipping spatial filtering.")
-
-    # try:
-    #     sectors = read_polygons_from_cvat(
-    #         sector_prior_path,
-    #         image_ids=[0],
-    #         include_labels=sector_names,
-    #     )
-    #     if not sectors or any(name not in sectors for name in sector_names):
-    #         raise ValueError(
-    #             f"Sectors not found or missing in CVAT file: {sector_prior_path}. Check that all sector names {sector_names} are present in the first image of the CVAT task."
-    #         )
-    # except Exception as exc:
-    #     raise RuntimeError(
-    #         f"Could not read sectors from CVAT file: {sector_prior_path}"
-    #     ) from exc
-
-    # # Try to read ROI from the same CVAT file (polygons named "ROI" or "roi")
-    # roi = None
-    # try:
-    #     roi_poly = read_polygons_from_cvat(
-    #         sector_prior_path, image_ids=[0], include_labels=["ROI", "roi"]
-    #     )
-    #     roi = roi_poly["ROI"] if "ROI" in roi_poly else roi_poly["roi"]
-    # except Exception:
-    #     # If ROI not found yet in sector_prior_path, try to read from separate CVAT file if provided
-    #     if data_config.roi_path is not None:
-    #         roi_poly = read_polygons_from_cvat(
-    #             data_config.roi_path, image_ids=[0], include_labels=["ROI", "roi"]
-    #         )
-    #         roi = roi_poly["ROI"] if "ROI" in roi_poly else roi_poly["roi"]
-    # if roi is None:
-    #     logger.warning("No ROI polygon provided. Skipping spatial filtering.")
-
     # Fetch DIC data
     out = get_multi_dic_data(dic_ids, stack_results=False, config=config.api)
     logger.info(f"Found stack of {len(out)} DIC dataframes.")
@@ -546,7 +535,7 @@ def run_pipeline(config: DictConfig | ListConfig):
         try:
             # Filter only points inside the spatial priors sectors
             if roi is not None:
-                df_src = filter_dataframe_by_polygons(df_src, polygons=roi)
+                df_src = filter_dataframe_by_polygons(df_src, polygon=roi)
 
             # Apply other DIC filters if any
             df_src = apply_dic_filters(df_src, **preproc_config.filter_kwargs)
@@ -611,23 +600,99 @@ def run_pipeline(config: DictConfig | ListConfig):
     # Post-processing parameters
     postproc_config = config.postprocessing
 
-    # --- Assign spatial priors ---
+    # --- Assign Priors (Spatial or Velocity-based) ---
     prior_config = config.priors
-    if not prior_config.probability:
-        # Default: uniform priors across sectors
-        n_sectors = len(sectors)
-        uniform_prob = 1.0 / n_sectors
-        prior_config.probability = {
-            name: [uniform_prob] * n_sectors for name in sectors
-        }
-    prior_probs_array = mcmc.assign_spatial_priors(
-        x=dic_df["x"].to_numpy(),
-        y=dic_df["y"].to_numpy(),
-        polygons=sectors,
-        prior_probs=prior_config.probability,
-        fade_method=prior_config.fade_method,
-        fade_options=prior_config.fade_options.get(prior_config.fade_method, {}),
-    )
+
+    # DETECT REFINEMENT OVERRIDE # TODO: find a better way to do this
+    # If "Base" or "Fast" (or any specific custom key) is present,
+    # we assume the user wants to exclusively use these and ignore A, B, C, D.
+    custom_keys = [k for k in prior_config.probability if k in ["Base", "Fast"]]
+    if custom_keys:
+        logger.info(
+            f"Custom sector keys detected {custom_keys}. Using these exclusively."
+        )
+        # Create a new clean dictionary with ONLY the custom keys
+        filtered_probs = {}
+        for k in custom_keys:
+            filtered_probs[k] = prior_config.probability[k]
+
+        # Overwrite the config object's dictionary with the filtered one
+        prior_config.probability = filtered_probs
+
+    # Check if we are in "Sector A Refinement" mode
+    # If the user asks for sectors that don't exist in the loaded polygon file,
+    # assume we want velocity-based unsupervised clustering.
+    # Example config for refinement:
+    # priors:
+    #   probability:
+    #     Base: [0.5, 0.5]
+    #     Fast: [0.5, 0.5]
+    use_spatial_priors = True
+    for name in prior_config.probability:
+        if name not in sectors:
+            use_spatial_priors = False
+            break
+    use_velocity_priors_for_refinement = True  # TODO: hardcoded for now
+
+    if use_spatial_priors:
+        try:
+            logger.info("Using SPATIAL priors from polygons.")
+            prior_probs_array = mcmc.assign_spatial_priors(
+                x=dic_df["x"].to_numpy(),
+                y=dic_df["y"].to_numpy(),
+                polygons=sectors,  # sectors is now dict[str, shapely.Polygon]
+                prior_probs=prior_config.probability,
+                fade_method=prior_config.fade_method,
+                fade_options=prior_config.fade_options.get(
+                    prior_config.fade_method, {}
+                ),
+            )
+        except Exception as exc:
+            logger.error(f"Failed to assign spatial priors: {exc}")
+            raise
+    else:
+        if use_velocity_priors_for_refinement:
+            logger.info(
+                "Target sectors not found in polygons. Switching to VELOCITY-BASED priors (Unsupervised)."
+            )
+            # Ensure we have exactly 2 components for this specific task
+            n_components = len(prior_config.probability)
+            if n_components != 2:
+                logger.warning(
+                    "Velocity refinement is optimized for 2 components. Results may vary."
+                )
+
+            # Extract V column
+            v_data = dic_df["V"].to_numpy()
+
+            # Custom logic: Split by percentile
+            # Cluster 0 = Slow/Base, Cluster 1 = Fast
+            percentile_threshold = 90  # Top 10% guess - TODO: hardcoded for now
+            threshold = np.percentile(v_data, percentile_threshold)
+            prior_probs_array = np.zeros((len(v_data), n_components))
+            for i, v_val in enumerate(v_data):
+                if v_val > threshold:
+                    prior_probs_array[i, :] = [0.2, 0.8]  # 80% chance of being Fast
+                else:
+                    prior_probs_array[i, :] = [0.8, 0.2]  # 80% chance of being Base
+
+            # Update sectors dictionary to match new fictitious names for the output handling
+            # We create a dummy geometry (envelope of all points) just to satisfy the pipeline
+            sectors = {
+                list(prior_config.probability.keys())[0]: roi,  # Base
+                list(prior_config.probability.keys())[1]: roi,  # Fast
+            }
+        else:
+            raise NotImplementedError(
+                "Velocity-based priors without spatial sectors is not implemented."
+            )
+            # Default: uniform priors across sectors (not used. fail if spatial priors requested)
+            # if not prior_config.probability:
+            #     n_sectors = len(sectors)
+            #     uniform_prob = 1.0 / n_sectors
+            #     prior_config.probability = {
+            #         name: [uniform_prob] * n_sectors for name in sectors
+            #     }
 
     fig, axes = mcmc.plot_spatial_priors(dic_df, prior_probs_array, img=img)
     fig.savefig(

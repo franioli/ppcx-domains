@@ -8,7 +8,7 @@ data:
   dt_min: 70  # Minimum time difference between images in hours
   dt_max: 100  # Maximum time difference between images in hours
   sector_prior_path: "data/${data.year}*.zip" # Path to CVAT ZIP file containing sector prior polygons (and optionally ROI polygon)
-  roi_path: "data/roi.xml" # Path to CVAT XML file containing ROI polygon (optional, if not already included in sector_prior_path)
+  # roi_path: "data/roi.xml" # Path to CVAT XML file containing ROI polygon (optional, if not already included in sector_prior_path)
   variables_names: ["V"] # The feature vector used for clustering (Velocity)
   output_dir: "output/${data.year}" # Output directory for results
 
