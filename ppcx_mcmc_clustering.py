@@ -320,7 +320,7 @@ def run_mcmc_clustering(
 
 
 def load_sectors_and_roi(
-    sector_prior_file: Path, sector_names: list[str], roi_path: Path | None = None
+    sector_prior_path: Path, sector_names: list[str], roi_path: Path | None = None
 ):
     """
     Load sector polygons and ROI polygon from a CVAT XML or geospatial file.
@@ -329,25 +329,25 @@ def load_sectors_and_roi(
     sectors = {}
     roi = None
 
-    if sector_prior_file.suffix.lower() == ".xml":
+    if sector_prior_path.suffix.lower() in (".xml", ".zip"):
         # CVAT XML
-        logger.info(f"Loading priors from CVAT XML: {sector_prior_file}")
+        logger.info(f"Loading priors from CVAT XML: {sector_prior_path}")
         sectors = read_polygons_from_cvat(
-            sector_prior_file,
+            sector_prior_path,
             image_ids=[0],
             include_labels=sector_names,
         )
         try:
             roi_poly = read_polygons_from_cvat(
-                sector_prior_file, image_ids=[0], include_labels=["ROI", "roi"]
+                sector_prior_path, image_ids=[0], include_labels=["ROI", "roi"]
             )
             roi = roi_poly.get("ROI") or roi_poly.get("roi")
         except Exception:
             pass
-    else:
+    elif sector_prior_path.suffix.lower() in (".geojson", ".shp", ".gpkg"):
         # GeoJSON, SHP, GPKG, etc.
-        logger.info(f"Loading priors from geospatial file: {sector_prior_file}")
-        gdf_priors = gpd.read_file(sector_prior_file)
+        logger.info(f"Loading priors from geospatial file: {sector_prior_path}")
+        gdf_priors = gpd.read_file(sector_prior_path)
         label_col = None
         for candidate in ["sector", "label", "name", "class", "id"]:
             if candidate in gdf_priors.columns:
@@ -355,7 +355,7 @@ def load_sectors_and_roi(
                 break
         if not label_col:
             raise ValueError(
-                f"Could not find a classification label column in {sector_prior_file}."
+                f"Could not find a classification label column in {sector_prior_path}."
             )
         for _, row in gdf_priors.iterrows():
             lbl = str(row[label_col])
@@ -367,6 +367,10 @@ def load_sectors_and_roi(
                     sectors[lbl] = geom
             if lbl.lower() == "roi":
                 roi = geom if roi is None else roi.union(geom)
+    else:
+        raise ValueError(
+            f"Unsupported sector prior file format: {sector_prior_path.suffix}"
+        )
 
     # Try to read ROI from separate file if not found
     if roi is None and roi_path is not None:
@@ -383,7 +387,7 @@ def load_sectors_and_roi(
             else:
                 try:
                     gdf_roi = gpd.read_file(roi_path)
-                    roi = gdf_roi.geometry.unary_union
+                    roi = gdf_roi.geometry.union_all()
                 except Exception as e:
                     logger.warning(
                         f"Failed to read ROI from geospatial file {roi_path}: {e}"
@@ -473,56 +477,56 @@ def run_pipeline(config: DictConfig | ListConfig):
     img = get_image(image_id=master_image_id, config=config.api)
 
     # Read sectors for spatial priors and ROI
-    prior_file_pattern = Path(data_config.sector_prior_file)
-    sector_prior_files = list(
+    prior_file_pattern = Path(data_config.sector_prior_path)
+    sector_prior_paths = list(
         prior_file_pattern.parent.glob(Path(prior_file_pattern).name)
     )
-    if len(sector_prior_files) == 0:
+    if len(sector_prior_paths) == 0:
         raise FileNotFoundError(
-            f"No sector prior file found matching: {data_config.sector_prior_file}"
+            f"No sector prior file found matching: {data_config.sector_prior_path}"
         )
-    if len(sector_prior_files) > 1:
+    if len(sector_prior_paths) > 1:
         logger.warning(
-            f"Multiple sector prior files matched. Using the first one found: {list(sector_prior_files)}"
+            f"Multiple sector prior files matched. Using the first one found: {list(sector_prior_paths)}"
         )
-    sector_prior_file = sector_prior_files[0]
+    sector_prior_path = sector_prior_paths[0]
     sector_names = list(config.priors.probability.keys())
     sectors, roi = load_sectors_and_roi(
-        sector_prior_file, sector_names, roi_path=data_config.roi_path
+        sector_prior_path, sector_names, roi_path=data_config.roi_path
     )
 
     if not sectors or any(name not in sectors for name in sector_names):
         missing = [name for name in sector_names if name not in sectors]
         raise ValueError(
-            f"Sectors missing in prior file {sector_prior_file}: {missing}. Expected: {sector_names}"
+            f"Sectors missing in prior file {sector_prior_path}: {missing}. Expected: {sector_names}"
         )
     if roi is None:
         logger.warning("No ROI polygon provided. Skipping spatial filtering.")
 
     # try:
     #     sectors = read_polygons_from_cvat(
-    #         sector_prior_file,
+    #         sector_prior_path,
     #         image_ids=[0],
     #         include_labels=sector_names,
     #     )
     #     if not sectors or any(name not in sectors for name in sector_names):
     #         raise ValueError(
-    #             f"Sectors not found or missing in CVAT file: {sector_prior_file}. Check that all sector names {sector_names} are present in the first image of the CVAT task."
+    #             f"Sectors not found or missing in CVAT file: {sector_prior_path}. Check that all sector names {sector_names} are present in the first image of the CVAT task."
     #         )
     # except Exception as exc:
     #     raise RuntimeError(
-    #         f"Could not read sectors from CVAT file: {sector_prior_file}"
+    #         f"Could not read sectors from CVAT file: {sector_prior_path}"
     #     ) from exc
 
     # # Try to read ROI from the same CVAT file (polygons named "ROI" or "roi")
     # roi = None
     # try:
     #     roi_poly = read_polygons_from_cvat(
-    #         sector_prior_file, image_ids=[0], include_labels=["ROI", "roi"]
+    #         sector_prior_path, image_ids=[0], include_labels=["ROI", "roi"]
     #     )
     #     roi = roi_poly["ROI"] if "ROI" in roi_poly else roi_poly["roi"]
     # except Exception:
-    #     # If ROI not found yet in sector_prior_file, try to read from separate CVAT file if provided
+    #     # If ROI not found yet in sector_prior_path, try to read from separate CVAT file if provided
     #     if data_config.roi_path is not None:
     #         roi_poly = read_polygons_from_cvat(
     #             data_config.roi_path, image_ids=[0], include_labels=["ROI", "roi"]
@@ -878,21 +882,21 @@ if __name__ == "__main__":
         cli_conf = OmegaConf.from_dotlist(args.overrides)
         config = OmegaConf.merge(config, cli_conf)
 
-    # 4. Dynamic Logic: Update 'year' based on 'reference_date'
+    # 4. Dynamic update 'year' based on 'reference_date'
     # This must happen before resolution so that paths using ${data.year} are correct
-    if config.data.reference_date:
-        try:
-            ref_dt = datetime.strptime(config.data.reference_date, "%Y-%m-%d")
-            current_year = str(ref_dt.year)
-            if config.data.year != current_year:
-                logger.info(
-                    f"CLI: Updating 'data.year' from {config.data.year} to {current_year} based on reference date."
-                )
-                config.data.year = current_year
-        except ValueError:
-            logger.error(
-                f"Could not parse year from reference_date: {config.data.reference_date}"
-            )
+    if not config.data.reference_date:
+        raise ValueError("reference_date must be provided via CLI or config.")
+    try:
+        ref_dt = datetime.strptime(config.data.reference_date, "%Y-%m-%d")
+        config.data.year = str(ref_dt.year)
+        logger.debug(
+            f"CLI: Updating 'data.year' to {config.data.year} based on reference date."
+        )
+    except ValueError:
+        logger.error(
+            f"Could not parse year from reference_date: {config.data.reference_date}"
+        )
+        config.data.year = "unknown"
 
     # 5. Resolve Configuration
     # This computes all interpolations (e.g. ${data.output_dir}) now.
