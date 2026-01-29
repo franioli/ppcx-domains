@@ -3,6 +3,7 @@ import logging
 import shutil
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import arviz as az
 import geopandas as gpd
@@ -87,36 +88,58 @@ def parse_arguments():
 
 
 def run_mcmc_clustering(
-    df_input,
-    prior_probs,
-    sectors,
-    output_dir,
-    base_name,
-    img=None,
-    variables_names=None,
-    transform_velocity="none",
-    transform_params=None,
-    mu_params=None,
-    sigma_params=None,
-    feature_weights=None,
-    sample_args=None,
+    df_input: pd.DataFrame,
+    prior_probs: np.ndarray,
+    sectors: dict,
+    output_dir: Path,
+    base_name: str,
+    img: np.ndarray | None = None,
+    variables_names: list[str] | None = None,
+    transform_velocity: str = "none",
+    transform_params: dict | None = None,
+    mu_params: dict | None = None,
+    sigma_params: dict | None = None,
+    feature_weights: np.ndarray | None = None,
+    sample_args: dict | None = None,
     mrf_regularization: bool = False,
-    mrf_kwargs: dict | None = None,
-    second_pass: str = "full",  # "skip" | "short" | "full"
+    mrf_kwargs: dict[str, Any] | None = None,
+    second_pass: str = "full",
     second_pass_sample_args: dict | None = None,
-    random_seed=8927,
-):
+    make_plots: bool = True,
+    random_seed: int = 8927,
+) -> dict:
     """
     Run MCMC-based clustering on velocity data with flexible velocity transformations.
 
-    Parameters:
-    -----------
-    df_input : pandas.DataFrame
-        Input dataframe with 'x', 'y', 'V' columns
-    transform_velocity : str, default="none"
-        Type of velocity transformation: "power", "exponential", "threshold", "sigmoid", or "none"
-    transform_params : dict, optional
-        Parameters for velocity transformation (see preprocess_velocity_features for details)
+    Args:
+        df_input (pd.DataFrame): Input dataframe with columns 'x', 'y', 'V' (and optionally more features).
+        prior_probs (np.ndarray): Prior probabilities array (n_samples, n_clusters).
+        sectors (dict): Dictionary of sector names to shapely Polygons.
+        output_dir (Path): Directory to save outputs.
+        base_name (str): Base name for output files.
+        img (np.ndarray, optional): Image array for plotting overlays. Default is None.
+        variables_names (list[str], optional): List of feature names to use. Default is ["V"].
+        transform_velocity (str, optional): Type of velocity transformation ("power", "exponential", "threshold", "sigmoid", or "none"). Default is "none".
+        transform_params (dict, optional): Parameters for velocity transformation. Default is None.
+        mu_params (dict, optional): Parameters for the mean of the mixture components. Default is None.
+        sigma_params (dict, optional): Parameters for the standard deviation of the mixture components. Default is None.
+        feature_weights (np.ndarray, optional): Optional feature weights for the model. Default is None.
+        sample_args (dict, optional): Arguments for PyMC sampling. Default is None.
+        mrf_regularization (bool, optional): Whether to apply MRF regularization to spatial priors. Default is False.
+        mrf_kwargs (dict, optional): Arguments for MRF regularization. Default is None.
+        second_pass (str, optional): Strategy for second sampling pass ("skip", "short", "full"). Default is "full".
+        second_pass_sample_args (dict, optional): Arguments for second pass sampling. Default is None.
+        make_plots (bool, optional): Whether to generate and save plots. Default is True.
+        random_seed (int, optional): Random seed for reproducibility. Default is 8927.
+
+    Returns:
+        dict: Dictionary containing results:
+            - "idata": ArviZ InferenceData object
+            - "scaler": StandardScaler object
+            - "convergence_flag": bool
+            - "posterior_probs": np.ndarray
+            - "cluster_pred": np.ndarray
+            - "uncertainty": np.ndarray
     """
 
     # --- helper: build initvals from idata posterior means (warm-start) ---
@@ -126,6 +149,16 @@ def run_mcmc_clustering(
         # Ensure shapes match the model dims; return a list of per-chain dicts
         init = {"mu": mu_mean, "sigma": sigma_mean}
         return [init for _ in range(n_chains)]
+
+    def save_sampling_summary(convergence_flag, idata, output_dir, base_name):
+        import json
+
+        sampling_info = {
+            "convergence": convergence_flag,
+            "summary_stats": az.summary(idata, var_names=["mu", "sigma"]).to_dict(),
+        }
+        with open(output_dir / f"{base_name}_sampling_summary.json", "w") as f:
+            json.dump(sampling_info, f, indent=4)
 
     logger.info(f"Running MCMC clustering for {base_name}...")
 
@@ -148,6 +181,10 @@ def run_mcmc_clustering(
 
     if "V" not in df_input.columns:
         raise ValueError("Input dataframe must contain 'V' column for velocities.")
+
+    posterior_probs = None
+    cluster_pred = None
+    uncertainty = None
 
     # Preprocess velocity features to enhance high velocities
     velocities, transform_info = preprocess_velocity_features(
@@ -193,9 +230,23 @@ def run_mcmc_clustering(
         idata_summary = az.summary(idata, var_names=["mu", "sigma"])
         logger.info(f"MCMC did not converge. Summary:\n{idata_summary}")
 
+    # Save sampling summary
+    save_sampling_summary(convergence_flag, idata, output_dir, f"{base_name}_pass1")
+
+    logger.info("First pass MCMC clustering completed.")
+
     # --- MRF regularization of priors and optional re-sample ---
-    prior_used = prior_probs
     if mrf_regularization:
+        if mrf_kwargs is None:
+            mrf_kwargs = {
+                "n_neighbors": 8,
+                "length_scale": 50,
+                "beta": 2,
+                "n_iter": 5,
+            }
+
+        prior_used = prior_probs.copy()
+        logger.info("Applying MRF regularization to spatial priors...")
         x_pos = df_input["x"].to_numpy()
         y_pos = df_input["y"].to_numpy()
         # mrf_kwargs = {"n_neighbors": 24, "length_scale": 200, "beta": 5, "n_iter": 5} # hard-coded values for debug
@@ -203,47 +254,52 @@ def run_mcmc_clustering(
             data_array_scaled, idata, prior_probs, x_pos, y_pos, **mrf_kwargs
         )
         prior_used = prior_mrf
-        try:
-            fig, _ = mcmc.plot_spatial_priors(df_input, prior_mrf, img=img)
-            fig.savefig(
-                output_dir
-                / f"{base_name}_mrf_priors_neig{mrf_kwargs['n_neighbors']}_ls{mrf_kwargs['length_scale']}_beta{mrf_kwargs['beta']}.jpg",
-                dpi=150,
-                bbox_inches="tight",
-            )
-            plt.close(fig)
-        except Exception as exc:
-            logger.warning(f"Could not plot MRF priors: {exc}")
 
-    # Decide second pass strategy
-    if mrf_regularization and second_pass.lower() == "skip":
-        # Fastest: don't re-sample. Use q_mrf as final posterior_probs and argmax as labels.
-        posterior_probs = q_mrf
-        cluster_pred = np.argmax(posterior_probs, axis=1)
-        uncertainty = 1.0 - posterior_probs.max(axis=1)
-        # keep idata from 1st pass for plots/params
-    else:
-        # Re-sample with refined priors (short or full)
-        if mrf_regularization:
-            with model:
-                pm.set_data({"prior_w": prior_used})
-
-        # Allow short second pass and warm start
-        sp2_args = dict(**sample_args)
-        if second_pass.lower() == "short":
-            # much fewer draws/tune; fewer chains can also help
-            sp2_args.update(dict(draws=600, tune=400, chains=2, cores=2))
-            if second_pass_sample_args:
-                sp2_args.update(second_pass_sample_args)
-        elif second_pass_sample_args:
-            sp2_args.update(second_pass_sample_args)
-
-        # Warm-start from previous posterior means
-        initvals = _initvals_from_idata(idata, sp2_args.get("chains", 2))
-
-        with model:
-            # pass initvals through sample_model if it supports, else call pm.sample directly
+        if make_plots:
             try:
+                fig, _ = mcmc.plot_spatial_priors(df_input, prior_mrf, img=img)
+                fig.savefig(
+                    output_dir
+                    / f"{base_name}_mrf_priors_neig{mrf_kwargs['n_neighbors']}_ls{mrf_kwargs['length_scale']}_beta{mrf_kwargs['beta']}.jpg",
+                    dpi=150,
+                    bbox_inches="tight",
+                )
+                plt.close(fig)
+            except Exception as exc:
+                logger.warning(f"Could not plot MRF priors: {exc}")
+
+        # Decide second pass strategy
+        if second_pass.lower() == "skip":
+            # Fastest: don't re-sample. Use q_mrf as final posterior_probs and argmax as labels.
+            logger.info(
+                "Skipping re-sampling after MRF regularization. Using pre-sampled MCMC posteriors."
+            )
+            posterior_probs = q_mrf
+            cluster_pred = np.argmax(posterior_probs, axis=1)
+            uncertainty = 1.0 - posterior_probs.max(axis=1)
+            # keep idata from 1st pass for plots/params
+        else:
+            # Re-sample with refined priors (short or full)
+            if mrf_regularization:
+                logger.info("Re-sampling with MRF-regularized priors...")
+                with model:
+                    pm.set_data({"prior_w": prior_used})
+
+            # Allow short second pass and warm start
+            sp2_args = dict(**sample_args)
+            if second_pass.lower() == "short":
+                # much fewer draws/tune; fewer chains can also help
+                sp2_args.update(dict(draws=600, tune=400, chains=2, cores=2))
+                if second_pass_sample_args:
+                    sp2_args.update(second_pass_sample_args)
+            elif second_pass_sample_args:
+                sp2_args.update(second_pass_sample_args)
+
+            # Warm-start from previous posterior means
+            initvals = _initvals_from_idata(idata, sp2_args.get("chains", 2))
+
+            with model:
+                # pass initvals through sample_model if it supports, else call pm.sample directly
                 idata, convergence_flag = mcmc.sample_model(
                     model,
                     output_dir,
@@ -251,62 +307,73 @@ def run_mcmc_clustering(
                     initvals=initvals,
                     **sp2_args,
                 )
-            except TypeError:
-                # fallback if your wrapper doesn't accept initvals
-                idata = pm.sample(**sp2_args)
-                convergence_flag = True
+            logger.info("Second pass MCMC clustering completed.")
 
-        # Compute posterior-based assignments
-        posterior_probs, cluster_pred, uncertainty = mcmc.compute_posterior_assignments(
-            idata, n_posterior_samples=200
-        )
+    # Compute posterior-based assignments
+    posterior_probs, cluster_pred, uncertainty = mcmc.compute_posterior_assignments(
+        idata, n_posterior_samples=200
+    )
 
     # Generate plots
-    fig = mcmc.plot_velocity_clustering(
-        df_features=df_input,
-        img=img,
-        idata=idata,
-        cluster_pred=cluster_pred,
-        posterior_probs=posterior_probs,
-        scaler=scaler,
-    )
-    fig.savefig(
-        output_dir / f"{base_name}_results.jpg",
-        dpi=300,
-        bbox_inches="tight",
-    )
-    plt.close(fig)
+    if make_plots:
+        fig = mcmc.plot_velocity_clustering(
+            df_features=df_input,
+            img=img,
+            idata=idata,
+            cluster_pred=cluster_pred,
+            posterior_probs=posterior_probs,
+            scaler=scaler,
+        )
+        fig.savefig(
+            output_dir / f"{base_name}_results.jpg",
+            dpi=300,
+            bbox_inches="tight",
+        )
+        plt.close(fig)
 
-    # Trace plots
-    fig, axes = plt.subplots(2, 2, figsize=(10, 6))
-    az.plot_trace(
-        idata, var_names=["mu", "sigma"], axes=axes, compact=True, legend=True
-    )
-    fig.savefig(output_dir / f"{base_name}_trace_plots.jpg", dpi=150)
-    plt.close(fig)
+        # Trace plots
+        fig, axes = plt.subplots(2, 2, figsize=(10, 6))
+        az.plot_trace(
+            idata, var_names=["mu", "sigma"], axes=axes, compact=True, legend=True
+        )
+        fig.savefig(output_dir / f"{base_name}_trace_plots.jpg", dpi=150)
+        plt.close(fig)
 
-    # Forest plots
-    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-    az.plot_forest(idata, var_names=["mu", "sigma"], combined=True, ess=True, ax=axes)
-    fig.savefig(output_dir / f"{base_name}_forest_plot.jpg", dpi=150)
-    plt.close(fig)
+        # Forest plots
+        fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+        az.plot_forest(
+            idata, var_names=["mu", "sigma"], combined=True, ess=True, ax=axes
+        )
+        fig.savefig(output_dir / f"{base_name}_forest_plot.jpg", dpi=150)
+        plt.close(fig)
 
     # Collect and save metadata
-    metadata = mcmc.collect_run_metadata(
-        idata=idata,
-        convergence_flag=convergence_flag,
-        data_array_scaled=data_array_scaled,
-        variables_names=variables_names,
-        sectors=sectors,
-        prior_probs=prior_probs,
-        sample_args=sample_args,
-        frame=locals(),
+    # metadata = mcmc.collect_run_metadata(
+    #     idata=idata,
+    #     convergence_flag=convergence_flag,
+    #     data_array_scaled=data_array_scaled,
+    #     variables_names=variables_names,
+    #     sectors=sectors,
+    #     prior_probs=prior_probs,
+    #     sample_args=sample_args,
+    #     frame=locals(),
+    # )
+    # mcmc.save_run_metadata(output_dir, base_name, metadata)
+
+    # Save main output results as a CSV file
+    results_df = df_input.copy()
+    results_df["cluster_pred"] = cluster_pred
+    results_df["uncertainty"] = uncertainty
+    for i in range(posterior_probs.shape[1]):
+        results_df[f"posterior_prob_{i}"] = posterior_probs[:, i]
+    results_df.to_csv(output_dir / f"{base_name}_mcmc_results.csv", index=False)
+    save_sampling_summary(convergence_flag, idata, output_dir, f"{base_name}_pass1")
+    logger.info(
+        f"Saved MCMC clustering results to {output_dir / f'{base_name}_mcmc_results.csv'}"
     )
-    mcmc.save_run_metadata(output_dir, base_name, metadata)
 
     # Return results dictionary
     result = {
-        "metadata": metadata,
         "idata": idata,
         "scaler": scaler,
         "convergence_flag": convergence_flag,
@@ -393,7 +460,9 @@ def read_roi_from_file(path: Path):
 
 
 def load_sectors_and_roi(
-    sector_prior_path: Path, sector_names: list[str], roi_path: Path | None = None
+    sector_prior_path: Path | str,
+    sector_names: list[str],
+    roi_path: Path | str | None = None,
 ):
     """
     Load sector polygons and ROI polygon from a CVAT XML or geospatial file.
@@ -426,6 +495,7 @@ def load_sectors_and_roi(
     # Try to read ROI from separate file if provided, else from sector_prior_path
     roi = None
     if roi_path is not None:
+        roi_path = Path(roi_path)
         roi = read_roi_from_file(roi_path)
     if roi is None:
         roi = read_roi_from_file(sector_prior_path)
@@ -446,6 +516,7 @@ def run_pipeline(config: DictConfig | ListConfig):
     reference_date = config.data.reference_date
     if not reference_date:
         raise ValueError("reference_date must be provided via CLI or config.")
+    reference_date_dt = datetime.strptime(reference_date, "%Y-%m-%d")
 
     # Retrieve other config parameters
     data_config = config.data
@@ -470,9 +541,9 @@ def run_pipeline(config: DictConfig | ListConfig):
     # Read sectors for spatial priors and ROI
     sector_names = list(config.priors.probability.keys())
     sectors, roi = load_sectors_and_roi(
-        sector_prior_path=Path(data_config.sector_prior_path),
+        sector_prior_path=data_config.sector_prior_path,
         sector_names=sector_names,
-        roi_path=Path(data_config.roi_path),
+        roi_path=data_config.roi_path,
     )
 
     # Date range for data selection
@@ -480,16 +551,16 @@ def run_pipeline(config: DictConfig | ListConfig):
     days_after_to_include = data_config.days_after_to_include
     dt_min = data_config.dt_min
     dt_max = data_config.dt_max
-    if days_before_to_include > 0 or days_after_to_include > 0:
-        reference_start_date = datetime.strptime(
-            reference_date, "%Y-%m-%d"
-        ) - pd.Timedelta(days=days_before_to_include)
-        reference_end_date = datetime.strptime(
-            reference_date, "%Y-%m-%d"
-        ) + pd.Timedelta(days=days_after_to_include)
-    else:
-        reference_start_date = None
-        reference_end_date = None
+    reference_start_date = None
+    reference_end_date = None
+    if days_before_to_include > 0:
+        reference_start_date = reference_date_dt - pd.Timedelta(
+            days=days_before_to_include
+        )
+    if days_after_to_include > 0:
+        reference_end_date = reference_date_dt + pd.Timedelta(
+            days=days_after_to_include
+        )
 
     # Fetch DIC ids
     db_engine = create_engine(config.db_url)
