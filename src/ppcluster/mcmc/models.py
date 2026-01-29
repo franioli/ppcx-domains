@@ -1,8 +1,6 @@
 import logging
-from pathlib import Path
 from typing import Any
 
-import arviz as az
 import numpy as np
 import pymc as pm
 from pymc import math as pm_math
@@ -16,42 +14,6 @@ EPS = 1e-12
 rng = np.random.default_rng(RANDOM_SEED)
 
 
-def sample_model(
-    model: pm.Model,
-    output_dir: Path | None = None,
-    base_name: str | None = None,
-    sigma: float | int | None = None,
-    **kwargs,
-) -> tuple[az.InferenceData, bool]:
-    """
-    Simple wrapper to sample a PyMC model with given kwargs and check convergence.
-    Returns an ArviZ InferenceData object and a convergence flag.
-    """
-
-    with model:
-        logger.info("Starting MCMC sampling...")
-        idata = pm.sample(**kwargs)
-        logger.info("Sampling completed.")
-
-    idata_summary = az.summary(idata, var_names=["mu", "sigma"])
-
-    if np.any(idata_summary["r_hat"] > 1.1) or np.any(idata_summary["ess_bulk"] < 200):
-        convergence_flag = False
-        logger.warning("MCMC chains did not fully converge by r_hat/ess criteria.")
-    else:
-        convergence_flag = True
-
-    if output_dir is not None and base_name is not None:
-        scale_str = f"_scale{sigma}" if sigma is not None else ""
-        output_dir.mkdir(parents=True, exist_ok=True)
-        az.to_netcdf(idata, output_dir / f"{base_name}_posterior{scale_str}.idata.nc")
-        idata_summary.to_csv(
-            output_dir / f"{base_name}_posterior{scale_str}_summary.csv"
-        )
-
-    return idata, convergence_flag
-
-
 """ Mixture models with spatial priors"""
 
 
@@ -61,7 +23,6 @@ def build_marginalized_mixture_model(
     sectors: dict[str, Any],
     mu_params: dict[str, Any] | None = None,
     sigma_params: dict[str, Any] | None = None,
-    feature_weights: np.ndarray | list[float] | None = None,
 ):
     """
     Build a marginalized mixture PyMC model (no discrete z).
@@ -80,15 +41,6 @@ def build_marginalized_mixture_model(
         mu_params = {"mu": 0, "sigma": 1}
     if sigma_params is None:
         sigma_params = {"sigma": 1}
-
-    # If feature weights provided, scale data accordingly
-    if feature_weights is not None:
-        if len(feature_weights) != n_features:
-            raise ValueError(
-                f"Feature weights length {len(feature_weights)} does not match number of features {n_features}."
-            )
-        feature_weights = np.array(feature_weights)
-        data = data * feature_weights[np.newaxis, :]
 
     with model:
         obs_data = pm.Data("obs_data", data, dims=("obs", "feature"))
@@ -125,7 +77,7 @@ def build_marginalized_mixture_model(
     return model
 
 
-def marginalized_mixture_discrete(
+def build_discrete_marginalized_mixture_model(
     data: np.ndarray,
     prior_probs: np.ndarray,
     sectors: dict[str, Any],
@@ -182,6 +134,43 @@ def marginalized_mixture_discrete(
 """Markov-Random Fields for spatial smoothing of priors"""
 
 
+def mrf_regularization(
+    data_scaled,
+    idata,
+    prior_init,
+    x,
+    y,
+    *,
+    n_neighbors=8,
+    length_scale=None,
+    beta=2.0,
+    n_iter=5,
+):
+    """
+    Mean-field Potts smoothing of priors:
+      log π_i <- log π_i + β ∑_{j∈N(i)} w_ij q_j
+      q_i ∝ exp(loglik_i + log π_i)
+    Uses posterior means of μ/σ from idata (scaled space).
+    Returns prior_final, q_final.
+    """
+    # posterior means (chains,draws,k,d) -> (k,d)
+    mu = idata.posterior["mu"].mean(dim=["chain", "draw"]).values
+    sigma = idata.posterior["sigma"].mean(dim=["chain", "draw"]).values
+    if mu.ndim == 1:  # (K,) -> (K,1)
+        mu = mu[:, None]
+        sigma = sigma[:, None]
+
+    W = build_knn_graph(x, y, n_neighbors=n_neighbors, length_scale=length_scale)
+    pi = prior_init.copy()
+    q = _responsibilities(data_scaled, mu, sigma, pi)
+
+    for _ in range(n_iter):
+        pi = _mrf_update(pi, q, W, beta)
+        q = _responsibilities(data_scaled, mu, sigma, pi)
+
+    return pi, q
+
+
 def build_knn_graph(x, y, n_neighbors=8, length_scale=None):
     """
     Build symmetric kNN affinity W (csr). If length_scale is given (pixels),
@@ -233,40 +222,3 @@ def _mrf_update(prior_probs, q, W, beta):
     pi = np.exp(logits - a)
     pi /= pi.sum(axis=1, keepdims=True)
     return pi
-
-
-def mrf_regularization(
-    data_scaled,
-    idata,
-    prior_init,
-    x,
-    y,
-    *,
-    n_neighbors=8,
-    length_scale=None,
-    beta=2.0,
-    n_iter=5,
-):
-    """
-    Mean-field Potts smoothing of priors:
-      log π_i <- log π_i + β ∑_{j∈N(i)} w_ij q_j
-      q_i ∝ exp(loglik_i + log π_i)
-    Uses posterior means of μ/σ from idata (scaled space).
-    Returns prior_final, q_final.
-    """
-    # posterior means (chains,draws,k,d) -> (k,d)
-    mu = idata.posterior["mu"].mean(dim=["chain", "draw"]).values
-    sigma = idata.posterior["sigma"].mean(dim=["chain", "draw"]).values
-    if mu.ndim == 1:  # (K,) -> (K,1)
-        mu = mu[:, None]
-        sigma = sigma[:, None]
-
-    W = build_knn_graph(x, y, n_neighbors=n_neighbors, length_scale=length_scale)
-    pi = prior_init.copy()
-    q = _responsibilities(data_scaled, mu, sigma, pi)
-
-    for _ in range(n_iter):
-        pi = _mrf_update(pi, q, W, beta)
-        q = _responsibilities(data_scaled, mu, sigma, pi)
-
-    return pi, q

@@ -3,17 +3,13 @@ import logging
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 
-import arviz as az
 import geopandas as gpd
 import joblib
 import numpy as np
 import pandas as pd
-import pymc as pm
 from matplotlib import pyplot as plt
 from omegaconf import DictConfig, ListConfig, OmegaConf
-from sklearn.preprocessing import StandardScaler
 from sqlalchemy import create_engine
 
 from ppcluster import load_config, mcmc, setup_logger
@@ -22,11 +18,15 @@ from ppcluster.cvat import (
     read_polygons_from_cvat,
 )
 from ppcluster.griddata import create_2d_grid, plot_clustering_grid
-from ppcluster.mcmc.multiscale import aggregate_multiscale_clustering
+from ppcluster.mcmc.clustering import (
+    aggregate_multiscale_clustering,
+    clusterize_gaussian_mixture,
+    save_sampling_summary,
+)
 from ppcluster.preprocessing import (
     apply_2d_gaussian_filter,
     apply_dic_filters,
-    preprocess_velocity_features,
+    preprocess_features,
     spatial_subsample,
 )
 from ppcluster.sectors import (
@@ -34,6 +34,7 @@ from ppcluster.sectors import (
     classify_points_by_polygons,
     clean_vector_sectors,
     compute_sector_stats,
+    get_sector_colors,
     plot_sectors,
     plot_sectors_summary,
     vectorize_gridded_sectors,
@@ -85,305 +86,6 @@ def parse_arguments():
         help="Configuration overrides in dotlist format (e.g., data.dt_min=24 mcmc.sample_options.draws=500).",
     )
     return p.parse_args()
-
-
-def run_mcmc_clustering(
-    df_input: pd.DataFrame,
-    prior_probs: np.ndarray,
-    sectors: dict,
-    output_dir: Path,
-    base_name: str,
-    img: np.ndarray | None = None,
-    variables_names: list[str] | None = None,
-    transform_velocity: str = "none",
-    transform_params: dict | None = None,
-    mu_params: dict | None = None,
-    sigma_params: dict | None = None,
-    feature_weights: np.ndarray | None = None,
-    sample_args: dict | None = None,
-    mrf_regularization: bool = False,
-    mrf_kwargs: dict[str, Any] | None = None,
-    second_pass: str = "full",
-    second_pass_sample_args: dict | None = None,
-    make_plots: bool = True,
-    random_seed: int = 8927,
-) -> dict:
-    """
-    Run MCMC-based clustering on velocity data with flexible velocity transformations.
-
-    Args:
-        df_input (pd.DataFrame): Input dataframe with columns 'x', 'y', 'V' (and optionally more features).
-        prior_probs (np.ndarray): Prior probabilities array (n_samples, n_clusters).
-        sectors (dict): Dictionary of sector names to shapely Polygons.
-        output_dir (Path): Directory to save outputs.
-        base_name (str): Base name for output files.
-        img (np.ndarray, optional): Image array for plotting overlays. Default is None.
-        variables_names (list[str], optional): List of feature names to use. Default is ["V"].
-        transform_velocity (str, optional): Type of velocity transformation ("power", "exponential", "threshold", "sigmoid", or "none"). Default is "none".
-        transform_params (dict, optional): Parameters for velocity transformation. Default is None.
-        mu_params (dict, optional): Parameters for the mean of the mixture components. Default is None.
-        sigma_params (dict, optional): Parameters for the standard deviation of the mixture components. Default is None.
-        feature_weights (np.ndarray, optional): Optional feature weights for the model. Default is None.
-        sample_args (dict, optional): Arguments for PyMC sampling. Default is None.
-        mrf_regularization (bool, optional): Whether to apply MRF regularization to spatial priors. Default is False.
-        mrf_kwargs (dict, optional): Arguments for MRF regularization. Default is None.
-        second_pass (str, optional): Strategy for second sampling pass ("skip", "short", "full"). Default is "full".
-        second_pass_sample_args (dict, optional): Arguments for second pass sampling. Default is None.
-        make_plots (bool, optional): Whether to generate and save plots. Default is True.
-        random_seed (int, optional): Random seed for reproducibility. Default is 8927.
-
-    Returns:
-        dict: Dictionary containing results:
-            - "idata": ArviZ InferenceData object
-            - "scaler": StandardScaler object
-            - "convergence_flag": bool
-            - "posterior_probs": np.ndarray
-            - "cluster_pred": np.ndarray
-            - "uncertainty": np.ndarray
-    """
-
-    # --- helper: build initvals from idata posterior means (warm-start) ---
-    def _initvals_from_idata(idata_in, n_chains):
-        mu_mean = idata_in.posterior["mu"].mean(dim=["chain", "draw"]).values
-        sigma_mean = idata_in.posterior["sigma"].mean(dim=["chain", "draw"]).values
-        # Ensure shapes match the model dims; return a list of per-chain dicts
-        init = {"mu": mu_mean, "sigma": sigma_mean}
-        return [init for _ in range(n_chains)]
-
-    def save_sampling_summary(convergence_flag, idata, output_dir, base_name):
-        import json
-
-        sampling_info = {
-            "convergence": convergence_flag,
-            "summary_stats": az.summary(idata, var_names=["mu", "sigma"]).to_dict(),
-        }
-        with open(output_dir / f"{base_name}_sampling_summary.json", "w") as f:
-            json.dump(sampling_info, f, indent=4)
-
-    logger.info(f"Running MCMC clustering for {base_name}...")
-
-    # Default parameters if not provided
-    if mu_params is None:
-        mu_params = {"mu": 0, "sigma": 1}
-    if sigma_params is None:
-        sigma_params = {"sigma": 1}
-    if sample_args is None:
-        sample_args = dict(
-            target_accept=0.95,
-            draws=2000,
-            tune=1000,
-            chains=4,
-            cores=4,
-            random_seed=random_seed,
-        )
-    if variables_names is None:
-        variables_names = ["V"]
-
-    if "V" not in df_input.columns:
-        raise ValueError("Input dataframe must contain 'V' column for velocities.")
-
-    posterior_probs = None
-    cluster_pred = None
-    uncertainty = None
-
-    # Preprocess velocity features to enhance high velocities
-    velocities, transform_info = preprocess_velocity_features(
-        velocities=df_input["V"].to_numpy(),
-        velocity_transform=transform_velocity,
-        velocity_params=transform_params,
-    )
-
-    # Extract data array for clustering
-    if len(variables_names) > 1:
-        # Concatenate other features to velocities
-        additional_vars = variables_names.copy()
-        if "V" in additional_vars:
-            additional_vars.remove("V")
-        additional_data = df_input[additional_vars].to_numpy()
-        data_array = np.column_stack((velocities, additional_data))
-    else:
-        # Use only velocities
-        data_array = velocities.reshape(-1, 1)
-
-    # Scale data for model input
-    scaler = StandardScaler()
-    scaler.fit(data_array)
-    joblib.dump(scaler, output_dir / f"{base_name}_scaler.joblib")
-    data_array_scaled = scaler.transform(data_array)
-
-    # Build model
-    logger.info(f"Running MCMC clustering for {base_name}...")
-    model = mcmc.build_marginalized_mixture_model(
-        data_array_scaled,
-        prior_probs,
-        sectors,
-        mu_params=mu_params,
-        sigma_params=sigma_params,
-        feature_weights=feature_weights,
-    )
-
-    # Sample model (1st pass)
-    idata, convergence_flag = mcmc.sample_model(
-        model, output_dir, base_name, **sample_args
-    )
-    if not convergence_flag:
-        idata_summary = az.summary(idata, var_names=["mu", "sigma"])
-        logger.info(f"MCMC did not converge. Summary:\n{idata_summary}")
-
-    # Save sampling summary
-    save_sampling_summary(convergence_flag, idata, output_dir, f"{base_name}_pass1")
-
-    logger.info("First pass MCMC clustering completed.")
-
-    # --- MRF regularization of priors and optional re-sample ---
-    if mrf_regularization:
-        if mrf_kwargs is None:
-            mrf_kwargs = {
-                "n_neighbors": 8,
-                "length_scale": 50,
-                "beta": 2,
-                "n_iter": 5,
-            }
-
-        prior_used = prior_probs.copy()
-        logger.info("Applying MRF regularization to spatial priors...")
-        x_pos = df_input["x"].to_numpy()
-        y_pos = df_input["y"].to_numpy()
-        # mrf_kwargs = {"n_neighbors": 24, "length_scale": 200, "beta": 5, "n_iter": 5} # hard-coded values for debug
-        prior_mrf, q_mrf = mcmc.mrf_regularization(
-            data_array_scaled, idata, prior_probs, x_pos, y_pos, **mrf_kwargs
-        )
-        prior_used = prior_mrf
-
-        if make_plots:
-            try:
-                fig, _ = mcmc.plot_spatial_priors(df_input, prior_mrf, img=img)
-                fig.savefig(
-                    output_dir
-                    / f"{base_name}_mrf_priors_neig{mrf_kwargs['n_neighbors']}_ls{mrf_kwargs['length_scale']}_beta{mrf_kwargs['beta']}.jpg",
-                    dpi=150,
-                    bbox_inches="tight",
-                )
-                plt.close(fig)
-            except Exception as exc:
-                logger.warning(f"Could not plot MRF priors: {exc}")
-
-        # Decide second pass strategy
-        if second_pass.lower() == "skip":
-            # Fastest: don't re-sample. Use q_mrf as final posterior_probs and argmax as labels.
-            logger.info(
-                "Skipping re-sampling after MRF regularization. Using pre-sampled MCMC posteriors."
-            )
-            posterior_probs = q_mrf
-            cluster_pred = np.argmax(posterior_probs, axis=1)
-            uncertainty = 1.0 - posterior_probs.max(axis=1)
-            # keep idata from 1st pass for plots/params
-        else:
-            # Re-sample with refined priors (short or full)
-            if mrf_regularization:
-                logger.info("Re-sampling with MRF-regularized priors...")
-                with model:
-                    pm.set_data({"prior_w": prior_used})
-
-            # Allow short second pass and warm start
-            sp2_args = dict(**sample_args)
-            if second_pass.lower() == "short":
-                # much fewer draws/tune; fewer chains can also help
-                sp2_args.update(dict(draws=600, tune=400, chains=2, cores=2))
-                if second_pass_sample_args:
-                    sp2_args.update(second_pass_sample_args)
-            elif second_pass_sample_args:
-                sp2_args.update(second_pass_sample_args)
-
-            # Warm-start from previous posterior means
-            initvals = _initvals_from_idata(idata, sp2_args.get("chains", 2))
-
-            with model:
-                # pass initvals through sample_model if it supports, else call pm.sample directly
-                idata, convergence_flag = mcmc.sample_model(
-                    model,
-                    output_dir,
-                    base_name + ("_mrf" if mrf_regularization else ""),
-                    initvals=initvals,
-                    **sp2_args,
-                )
-            logger.info("Second pass MCMC clustering completed.")
-
-    # Compute posterior-based assignments
-    posterior_probs, cluster_pred, uncertainty = mcmc.compute_posterior_assignments(
-        idata, n_posterior_samples=200
-    )
-
-    # Generate plots
-    if make_plots:
-        fig = mcmc.plot_velocity_clustering(
-            df_features=df_input,
-            img=img,
-            idata=idata,
-            cluster_pred=cluster_pred,
-            posterior_probs=posterior_probs,
-            scaler=scaler,
-        )
-        fig.savefig(
-            output_dir / f"{base_name}_results.jpg",
-            dpi=300,
-            bbox_inches="tight",
-        )
-        plt.close(fig)
-
-        # Trace plots
-        fig, axes = plt.subplots(2, 2, figsize=(10, 6))
-        az.plot_trace(
-            idata, var_names=["mu", "sigma"], axes=axes, compact=True, legend=True
-        )
-        fig.savefig(output_dir / f"{base_name}_trace_plots.jpg", dpi=150)
-        plt.close(fig)
-
-        # Forest plots
-        fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-        az.plot_forest(
-            idata, var_names=["mu", "sigma"], combined=True, ess=True, ax=axes
-        )
-        fig.savefig(output_dir / f"{base_name}_forest_plot.jpg", dpi=150)
-        plt.close(fig)
-
-    # Collect and save metadata
-    # metadata = mcmc.collect_run_metadata(
-    #     idata=idata,
-    #     convergence_flag=convergence_flag,
-    #     data_array_scaled=data_array_scaled,
-    #     variables_names=variables_names,
-    #     sectors=sectors,
-    #     prior_probs=prior_probs,
-    #     sample_args=sample_args,
-    #     frame=locals(),
-    # )
-    # mcmc.save_run_metadata(output_dir, base_name, metadata)
-
-    # Save main output results as a CSV file
-    results_df = df_input.copy()
-    results_df["cluster_pred"] = cluster_pred
-    results_df["uncertainty"] = uncertainty
-    for i in range(posterior_probs.shape[1]):
-        results_df[f"posterior_prob_{i}"] = posterior_probs[:, i]
-    results_df.to_csv(output_dir / f"{base_name}_mcmc_results.csv", index=False)
-    save_sampling_summary(convergence_flag, idata, output_dir, f"{base_name}_pass1")
-    logger.info(
-        f"Saved MCMC clustering results to {output_dir / f'{base_name}_mcmc_results.csv'}"
-    )
-
-    # Return results dictionary
-    result = {
-        "idata": idata,
-        "scaler": scaler,
-        "convergence_flag": convergence_flag,
-        "posterior_probs": posterior_probs,
-        "cluster_pred": cluster_pred,
-        "uncertainty": uncertainty,
-    }
-
-    plt.close("all")
-    return result
 
 
 def read_sectors_from_file(sector_prior_path: Path, sector_names: list[str]):
@@ -518,16 +220,10 @@ def run_pipeline(config: DictConfig | ListConfig):
         raise ValueError("reference_date must be provided via CLI or config.")
     reference_date_dt = datetime.strptime(reference_date, "%Y-%m-%d")
 
-    # Retrieve other config parameters
-    data_config = config.data
-    random_seed = config.random_seed
-    camera_name = data_config.camera_name
-    variables_names = data_config.variables_names
-
     # Output base directory (output will be saved in a subfolder with camera name and date)
     # config.data.output_dir is already resolved in __main__
-    output_base_dir = Path(data_config.output_dir)
-    output_dir = output_base_dir / f"{camera_name}_{reference_date}"
+    output_base_dir = Path(config.data.output_dir)
+    output_dir = output_base_dir / f"{config.data.camera_name}_{reference_date}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Define base names for outputs
@@ -539,39 +235,39 @@ def run_pipeline(config: DictConfig | ListConfig):
     OmegaConf.save(config, config_path)
 
     # Read sectors for spatial priors and ROI
-    sector_names = list(config.priors.probability.keys())
+    # sectors is now dict[str, shapely.Polygon]
+    sector_names = list(config.mcmc.priors.probability.keys())
     sectors, roi = load_sectors_and_roi(
-        sector_prior_path=data_config.sector_prior_path,
+        sector_prior_path=config.data.sector_prior_path,
         sector_names=sector_names,
-        roi_path=data_config.roi_path,
+        roi_path=config.data.roi_path,
+    )
+    sector_colors = get_sector_colors(
+        config.postprocessing.sector_assignment.sector_colors, sector_names
     )
 
     # Date range for data selection
-    days_before_to_include = data_config.days_before_to_include
-    days_after_to_include = data_config.days_after_to_include
-    dt_min = data_config.dt_min
-    dt_max = data_config.dt_max
     reference_start_date = None
     reference_end_date = None
-    if days_before_to_include > 0:
+    if config.data.days_before_to_include > 0:
         reference_start_date = reference_date_dt - pd.Timedelta(
-            days=days_before_to_include
+            days=config.data.days_before_to_include
         )
-    if days_after_to_include > 0:
+    if config.data.days_after_to_include > 0:
         reference_end_date = reference_date_dt + pd.Timedelta(
-            days=days_after_to_include
+            days=config.data.days_after_to_include
         )
 
     # Fetch DIC ids
     db_engine = create_engine(config.db_url)
     dic_ids = fetch_dic_analysis_ids(
         db_engine,
-        camera_name=camera_name,
+        camera_name=config.data.camera_name,
         reference_date=reference_date,
         reference_date_start=reference_start_date,
         reference_date_end=reference_end_date,
-        dt_hours_min=dt_min,
-        dt_hours_max=dt_max,
+        dt_hours_min=config.data.dt_min,
+        dt_hours_max=config.data.dt_max,
     )
     if len(dic_ids) < 1:
         raise ValueError("No DIC analyses found for the given criteria")
@@ -637,47 +333,11 @@ def run_pipeline(config: DictConfig | ListConfig):
     logger.info(dic_df.head())
 
     # ===  MCMC CLUSTERING   === #
-
-    # --- Gather parameters ---
-
-    # MCMC parameters
-    sample_args = {
-        "draws": config.mcmc.sample_options.draws,
-        "tune": config.mcmc.sample_options.tune,
-        "chains": config.mcmc.sample_options.chains,
-        "cores": config.mcmc.sample_options.cores,
-        "target_accept": config.mcmc.sample_options.target_accept,
-        "random_seed": random_seed,
-    }
-    model_options = config.mcmc.model_options
-    mu_params = model_options.mu_params
-    sigma_params = model_options.sigma_params
-
-    # Velocity transformation parameters
-    velocity_transform = config.mcmc.velocity_transform
-    transform_params = config.mcmc.transform_params
-
-    # MRF regularization parameters
-    mrf_regularization = config.mcmc.mrf_regularization
-    mrf_kwargs = config.mcmc.mrf_kwargs
-    second_pass = config.mcmc.second_pass
-    second_pass_sample_args = config.mcmc.second_pass_sample_args
-
-    # Multiscale parameters
-    multiscale_config = config.multiscale
-    sigma_values = multiscale_config.sigma_values
-    aggregation_config = multiscale_config.aggregation
-
-    # Post-processing parameters
-    postproc_config = config.postprocessing
-
     # --- Assign Priors (Spatial or Velocity-based) ---
-    prior_config = config.priors
-
     # DETECT REFINEMENT OVERRIDE # TODO: find a better way to do this
     # If "Base" or "Fast" (or any specific custom key) is present,
     # we assume the user wants to exclusively use these and ignore A, B, C, D.
-    custom_keys = [k for k in prior_config.probability if k in ["Base", "Fast"]]
+    custom_keys = [k for k in config.mcmc.priors.probability if k in ["Base", "Fast"]]
     if custom_keys:
         logger.info(
             f"Custom sector keys detected {custom_keys}. Using these exclusively."
@@ -685,10 +345,10 @@ def run_pipeline(config: DictConfig | ListConfig):
         # Create a new clean dictionary with ONLY the custom keys
         filtered_probs = {}
         for k in custom_keys:
-            filtered_probs[k] = prior_config.probability[k]
+            filtered_probs[k] = config.mcmc.priors.probability[k]
 
         # Overwrite the config object's dictionary with the filtered one
-        prior_config.probability = filtered_probs
+        config.mcmc.priors.probability = filtered_probs
 
     # Check if we are in "Sector A Refinement" mode
     # If the user asks for sectors that don't exist in the loaded polygon file,
@@ -699,7 +359,7 @@ def run_pipeline(config: DictConfig | ListConfig):
     #     Base: [0.5, 0.5]
     #     Fast: [0.5, 0.5]
     use_spatial_priors = True
-    for name in prior_config.probability:
+    for name in config.mcmc.priors.probability:
         if name not in sectors:
             use_spatial_priors = False
             break
@@ -711,12 +371,10 @@ def run_pipeline(config: DictConfig | ListConfig):
             prior_probs_array = mcmc.assign_spatial_priors(
                 x=dic_df["x"].to_numpy(),
                 y=dic_df["y"].to_numpy(),
-                polygons=sectors,  # sectors is now dict[str, shapely.Polygon]
-                prior_probs=prior_config.probability,
-                fade_method=prior_config.fade_method,
-                fade_options=prior_config.fade_options.get(
-                    prior_config.fade_method, {}
-                ),
+                polygons=sectors,
+                prior_probs=config.mcmc.priors.probability,
+                fade_method=config.mcmc.priors.fade_method,
+                fade_options=config.mcmc.priors.fade_options,
             )
         except Exception as exc:
             logger.error(f"Failed to assign spatial priors: {exc}")
@@ -727,7 +385,7 @@ def run_pipeline(config: DictConfig | ListConfig):
                 "Target sectors not found in polygons. Switching to VELOCITY-BASED priors (Unsupervised)."
             )
             # Ensure we have exactly 2 components for this specific task
-            n_components = len(prior_config.probability)
+            n_components = len(config.mcmc.priors.probability)
             if n_components != 2:
                 logger.warning(
                     "Velocity refinement is optimized for 2 components. Results may vary."
@@ -743,25 +401,25 @@ def run_pipeline(config: DictConfig | ListConfig):
             prior_probs_array = np.zeros((len(v_data), n_components))
             for i, v_val in enumerate(v_data):
                 if v_val > threshold:
-                    prior_probs_array[i, :] = [0.2, 0.8]  # 80% chance of being Fast
+                    prior_probs_array[i, :] = [0.2, 0.8]  # 80% provof being Fast
                 else:
                     prior_probs_array[i, :] = [0.8, 0.2]  # 80% chance of being Base
 
             # Update sectors dictionary to match new fictitious names for the output handling
             # We create a dummy geometry (envelope of all points) just to satisfy the pipeline
             sectors = {
-                list(prior_config.probability.keys())[0]: roi,  # Base
-                list(prior_config.probability.keys())[1]: roi,  # Fast
+                list(config.mcmc.priors.probability.keys())[0]: roi,  # Base
+                list(config.mcmc.priors.probability.keys())[1]: roi,  # Fast
             }
         else:
             raise NotImplementedError(
                 "Velocity-based priors without spatial sectors is not implemented."
             )
             # Default: uniform priors across sectors (not used. fail if spatial priors requested)
-            # if not prior_config.probability:
+            # if not config.mcmc.priors.probability:
             #     n_sectors = len(sectors)
             #     uniform_prob = 1.0 / n_sectors
-            #     prior_config.probability = {
+            #     config.mcmc.priors.probability = {
             #         name: [uniform_prob] * n_sectors for name in sectors
             #     }
 
@@ -773,57 +431,121 @@ def run_pipeline(config: DictConfig | ListConfig):
     )
     plt.close(fig)
 
-    # --- Loop through smoothing scales ---
-    results = []
-    for sigma in sigma_values:
-        logger.info(f"Processing with Gaussian smoothing sigma={sigma}...")
+    # Perform MCMC clustering without any multiscale smoothing
+    if (
+        config.multiscale.sigma_values is None
+        or len(config.multiscale.sigma_values) == 1
+    ):
+        df_run = dic_df.copy()
 
-        # Create scale-specific base name
-        scale_base_name = f"{mcmc_base_name}_sigma{sigma}"
-
-        # Apply Gaussian smoothing if needed (skipped for sigma=0)
-        df_run = apply_2d_gaussian_filter(dic_df, sigma=sigma)
-
-        # For larger sigma, tighten priors
-        if sigma > 2:
-            mu_params = {"mu": 0, "sigma": 0.5}
-            sigma_params = {"sigma": 0.5}
-
-        # Run MCMC clustering with the smoothed data
-        result = run_mcmc_clustering(
+        # Preprocess features for clustering
+        data_array_scaled, scaler, velocities, transform_info = preprocess_features(
             df_input=df_run,
+            variables_names=config.preprocessing.variables_names,
+            transform_velocity=config.preprocessing.velocity_transform,
+            transform_params=config.preprocessing.transform_params,
+            feature_weights=config.preprocessing.feature_weights,
+        )
+        joblib.dump(scaler, output_dir / f"{base_name}_feature_scaler.joblib")
+
+        # Run MCMC clustering with the a gaussian mixture model
+        result = clusterize_gaussian_mixture(
+            data_array_scaled=data_array_scaled,
             prior_probs=prior_probs_array,
             sectors=sectors,
-            output_dir=output_dir,
-            base_name=scale_base_name,
-            img=img,
-            variables_names=variables_names,
-            sample_args=sample_args,
-            transform_velocity=velocity_transform,
-            transform_params=transform_params,
-            mu_params=mu_params,
-            sigma_params=sigma_params,
-            random_seed=random_seed,
-            mrf_regularization=mrf_regularization,
-            mrf_kwargs=mrf_kwargs,
-            second_pass=second_pass,
-            second_pass_sample_args=second_pass_sample_args,
+            sample_args=config.mcmc.sample_options,
+            mu_params=config.mcmc.model_options.mu_params,
+            sigma_params=config.mcmc.model_options.sigma_params,
+            apply_mrf_regularization=config.mcmc.mrf_regularization,
+            x_pos=df_run["x"].to_numpy(),
+            y_pos=df_run["y"].to_numpy(),
+            mrf_kwargs=config.mcmc.mrf_kwargs,
+            second_pass=config.mcmc.second_pass,
+            second_pass_sample_args=config.mcmc.second_pass_sample_args,
+            random_seed=config.random_seed,
         )
 
-        # Add scale information to result
-        result["sigma"] = sigma
+        # Save sampling summary
+        save_sampling_summary(
+            convergence_flag=result.convergence_flag,
+            idata=result.idata,
+            output_dir=output_dir,
+            base_name=base_name,
+        )
 
-        # Append to results list
-        results.append(result)
+        # Otherwise extract the single result
+        cluster_pred = result.cluster_pred
+        posterior_probs = result.posterior_probs
+        entropy = -np.sum(posterior_probs * np.log(posterior_probs + 1e-10), axis=1)
+        similarity_matrix = None
+        stability_score = None
+        valid_scales = None
+    else:
+        raise NotImplementedError(
+            "Multiscale aggregation is broken, as the old result dict was replaced with a ClusteringResult object that does not contain 'sigma' key anymore."
+        )
 
-    # --- Aggregate multi-scale results (if multiscale approach) ---
+        # Loop through smoothing scales
+        results = []
+        for sigma in config.multiscale.sigma_values:
+            logger.info(f"Processing with Gaussian smoothing sigma={sigma}...")
 
-    # Multiscale parameters (grouped)
-    if len(sigma_values) > 1:
+            # Create scale-specific base name
+            scale_base_name = f"{mcmc_base_name}_sigma{sigma}"
+
+            # Apply Gaussian smoothing if needed (skipped for sigma=0)
+            df_run = apply_2d_gaussian_filter(dic_df, sigma=sigma)
+
+            # Preprocess features for clustering
+            data_array_scaled, scaler, velocities, transform_info = preprocess_features(
+                df_input=df_run,
+                variables_names=config.data.variables_names,
+                transform_velocity=config.mcmc.velocity_transform,
+                transform_params=config.mcmc.transform_params,
+            )
+            joblib.dump(scaler, output_dir / f"{scale_base_name}_scaler.joblib")
+
+            # Run MCMC clustering with the a gaussian mixture model
+            if sigma > 2:  # For larger sigma, tighten priors
+                mu_params = {"mu": 0, "sigma": 0.5}
+                sigma_params = {"sigma": 0.5}
+            else:
+                mu_params = config.mcmc.model_options.mu_params
+                sigma_params = config.mcmc.model_options.sigma_params
+            result = clusterize_gaussian_mixture(
+                data_array_scaled=data_array_scaled,
+                prior_probs=prior_probs_array,
+                sectors=sectors,
+                sample_args=config.mcmc.sample_options,
+                mu_params=mu_params,
+                sigma_params=sigma_params,
+                feature_weights=config.mcmc.feature_weights,
+                apply_mrf_regularization=config.mcmc.mrf_regularization,
+                mrf_kwargs=config.mcmc.mrf_kwargs,
+                second_pass=config.mcmc.second_pass,
+                second_pass_sample_args=config.mcmc.second_pass_sample_args,
+                random_seed=config.random_seed,
+            )
+
+            # --- Save sampling summary ---
+            save_sampling_summary(
+                convergence_flag=result["convergence_flag"],
+                idata=result["idata"],
+                output_dir=output_dir,
+                base_name=scale_base_name,
+            )
+
+            # Add scale information to result
+            # result["sigma"] = sigma
+
+            # Append to results list
+            results.append(result)
+
+        # aggregate multi-scale results
         aggregated_results = aggregate_multiscale_clustering(
             results,
-            similarity_threshold=aggregation_config.similarity_threshold,
-            overall_threshold=aggregation_config.overall_threshold,
+            similarity_threshold=config.multiscale.aggregation.similarity_threshold,
+            overall_threshold=config.multiscale.aggregation.overall_threshold,
             fig_path=output_dir / f"{mcmc_base_name}_similarity_heatmap.jpg",
         )
         cluster_pred = aggregated_results["combined_cluster_pred"]
@@ -832,15 +554,6 @@ def run_pipeline(config: DictConfig | ListConfig):
         similarity_matrix = aggregated_results["similarity_matrix"]
         stability_score = aggregated_results["stability_score"]
         valid_scales = aggregated_results["valid_scales"]
-
-    else:
-        # Otherwise extract the single result
-        cluster_pred = results[0]["cluster_pred"]
-        posterior_probs = results[0]["posterior_probs"]
-        entropy = -np.sum(posterior_probs * np.log(posterior_probs + 1e-10), axis=1)
-        similarity_matrix = None
-        stability_score = None
-        valid_scales = None
 
     # --- Save final clustering results ---
     cluster_aggregation_outs = {
@@ -884,7 +597,7 @@ def run_pipeline(config: DictConfig | ListConfig):
     logger.info("Vectorizing grid clusters to polygons...")
     sectors = vectorize_gridded_sectors(kin_cluster_grid, X, Y)
     sectors.to_file(output_dir / f"{base_name}_sectors_raw.geojson", driver="GeoJSON")
-    vect_config = postproc_config.vectorization
+    vect_config = config.postprocessing.vectorization
     sectors = clean_vector_sectors(
         sectors,
         dic_df,
@@ -916,7 +629,7 @@ def run_pipeline(config: DictConfig | ListConfig):
         sectors=sectors,
         img=img,
         velocity_df=None,
-        sector_colors=postproc_config.sector_assignment.sector_colors,
+        sector_colors=sector_colors,
         label_column="cluster_id",
         add_sector_labels=False,
         title=f"Cleaned vectorized sectors (n={len(sectors)})",
@@ -930,8 +643,8 @@ def run_pipeline(config: DictConfig | ListConfig):
     # The y axis is inverted in image coordinates (0 at top), hence ascending=False
     sectors = assign_sector_labels(
         sectors,
-        order_by=postproc_config.sector_assignment.method,
-        ascending=postproc_config.sector_assignment.ascending,
+        order_by=config.postprocessing.sector_assignment.method,
+        ascending=config.postprocessing.sector_assignment.ascending,
     )
 
     # Drop all but essential columns
@@ -959,7 +672,6 @@ def run_pipeline(config: DictConfig | ListConfig):
     logger.info(f"Saved final sectors GeoJSON with stats to {output_dir}")
 
     logger.info("Creating summary figure...")
-    sector_colors = postproc_config.sector_assignment.sector_colors
     sector_figure_path = plot_sectors_summary(
         sectors=sectors,
         points_by_sector=pts_by_sector,

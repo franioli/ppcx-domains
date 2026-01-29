@@ -30,7 +30,6 @@ class DataConfig:
     dt_max: float | None = None
     roi_path: str | None = None
     sector_prior_path: str | None = None
-    variables_names: list[str] = field(default_factory=lambda: ["V"])
 
 
 @dataclass
@@ -50,25 +49,28 @@ class PreprocessingFilterConfig:
 
 @dataclass
 class PreprocessingConfig:
+    variables_names: list[str] = field(default_factory=lambda: ["V"])
+    feature_weights: list[float] | None = None
     subsample_factor: int = 1
     subsample_method: str = "regular"
     filter_kwargs: PreprocessingFilterConfig = field(
         default_factory=PreprocessingFilterConfig
     )
-
-
-@dataclass
-class PriorFadeOptions:
-    idw: dict = field(default_factory=lambda: {"power": 2})
-    linear: dict = field(default_factory=lambda: {"max_distance": 100})
-    exponential: dict = field(default_factory=lambda: {"decay_rate": 0.001})
+    velocity_transform: str | None = None
+    transform_params: dict | None = None
 
 
 @dataclass
 class PriorsConfig:
     probability: dict | None = None
     fade_method: str = "constant"
-    fade_options: PriorFadeOptions = field(default_factory=PriorFadeOptions)
+    fade_options: dict = field(default_factory=dict)
+
+
+@dataclass
+class GaussianMixtureModelConfig:
+    mu_params: dict = field(default_factory=lambda: {"mu": 0, "sigma": 1})
+    sigma_params: dict = field(default_factory=lambda: {"sigma": 1})
 
 
 @dataclass
@@ -78,46 +80,42 @@ class McmcSampleOptions:
     tune: int = 1000
     chains: int = 4
     cores: int = 4
-    random_seed: int = 8927
+    random_seed: int | str = "${...random_seed}"  # up two levels to the root
+
+
+@dataclass
+class MrfOptions:
+    n_neighbors: int = 8
+    length_scale: float = 50
+    beta: float = 2.0
+    n_iter: int = 5
 
 
 @dataclass
 class McmcConfig:
+    priors: PriorsConfig = field(default_factory=PriorsConfig)
+    model_options: GaussianMixtureModelConfig = field(
+        default_factory=GaussianMixtureModelConfig
+    )
     sample_options: McmcSampleOptions = field(default_factory=McmcSampleOptions)
-    model_options: dict = field(
-        default_factory=lambda: {
-            "mu_params": {"mu": 0, "sigma": 1},
-            "sigma_params": {"sigma": 1},
-        }
-    )
-    velocity_transform: str | None = None
-    transform_params: dict = field(default_factory=dict)
     mrf_regularization: bool = True
-    mrf_kwargs: dict = field(
-        default_factory=lambda: {
-            "n_neighbors": 8,
-            "length_scale": 50,
-            "beta": 2.0,
-            "n_iter": 5,
-        }
-    )
+    mrf_kwargs: MrfOptions = field(default_factory=MrfOptions)
     second_pass: str = "short"
-    second_pass_sample_args: dict = field(
-        default_factory=lambda: {
-            "draws": 500,
-            "tune": 300,
-            "chains": 4,
-            "cores": 4,
-            "target_accept": 0.9,
-        }
+    second_pass_sample_args: McmcSampleOptions = field(
+        default_factory=lambda: McmcSampleOptions(
+            draws=500, tune=300, target_accept=0.9
+        )
     )
 
 
 @dataclass
 class MultiscaleConfig:
-    sigma_values: list[float] = field(default_factory=lambda: [0.0])
+    sigma_values: list[float] | None = None
     aggregation: dict = field(
-        default_factory=lambda: {"similarity_threshold": 0.7, "overall_threshold": 0.8}
+        default_factory=lambda: {
+            "similarity_threshold": 0.7,
+            "overall_threshold": 0.8,
+        }
     )
 
 
@@ -137,17 +135,21 @@ class VectorizationConfig:
 
 
 @dataclass
+class SectorColorConfig:
+    sector_colors: dict[str, str] | None = None
+    # Example of custom colors: sector_colors = field(default_factory=lambda: {
+    #         "A": "#b3140b", # Red
+    #         "B": "#ee9c21", # Orange
+    #         "C": "#f1ee30", # Yellow
+    #         "D": "#5fb61c", # Green
+    # }
+
+
+@dataclass
 class SectorAssignmentConfig:
     method: str = "y_position"
     ascending: bool = False
-    sector_colors: dict = field(
-        default_factory=lambda: {
-            "A": "#b3140b",
-            "B": "#ee9c21",
-            "C": "#f1ee30",
-            "D": "#5fb61c",
-        }
-    )
+    sector_colors: SectorColorConfig = field(default_factory=SectorColorConfig)
 
 
 @dataclass
@@ -156,9 +158,6 @@ class PostProcessingConfig:
     sector_assignment: SectorAssignmentConfig = field(
         default_factory=SectorAssignmentConfig
     )
-    # Generic fields can be typed as Any or specific types if known
-    split_disconnected_components: bool = True
-    min_cluster_size: int = 50
 
 
 @dataclass
@@ -179,7 +178,7 @@ class ApiConfig:
 
 
 @dataclass
-class AppConfig:
+class PipelineConfig:
     """Top Level Configuration"""
 
     data: DataConfig = field(default_factory=DataConfig)
@@ -239,7 +238,7 @@ def load_config(config_path: Path | str | None = None) -> ListConfig | DictConfi
 
     # 1. Initialize strictly typed configuration from schema
     # This sets up the default values and expected types
-    base_cfg = OmegaConf.structured(AppConfig)
+    base_cfg = OmegaConf.structured(PipelineConfig)
 
     # 2. Merge from file
     path_to_load = Path(config_path) if config_path else _find_config_path()

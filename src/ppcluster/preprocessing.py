@@ -4,6 +4,7 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 from scipy import ndimage
+from sklearn.preprocessing import StandardScaler
 
 from ppcluster.griddata import create_2d_grid_from_df
 from ppcluster.lamma_filter import vector_field_filter
@@ -404,7 +405,70 @@ def spatial_subsample(df, n_subsample=5, method="regular"):
 
 
 # === Feature preprocessing ===
-def preprocess_velocity_features(
+
+
+def preprocess_features(
+    df_input: pd.DataFrame,
+    variables_names: list[str] | None = None,
+    transform_velocity: str = "none",
+    transform_params: dict | None = None,
+    feature_weights: np.ndarray | None = None,
+) -> tuple[np.ndarray, StandardScaler, np.ndarray, dict]:
+    """
+    Preprocess velocity and additional features for clustering.
+
+    Args:
+        df_input (pd.DataFrame): Input dataframe with columns 'x', 'y', 'V' (and optionally more features).
+        variables_names (list[str], optional): List of feature names to use. Default is ["V"].
+        transform_velocity (str, optional): Type of velocity transformation. Default is "none".
+        transform_params (dict, optional): Parameters for velocity transformation. Default is None.
+        feature_weights (np.ndarray, optional): Optional feature weights for features. Default is None.
+
+    Returns:
+        data_array_scaled (np.ndarray): Scaled feature array for clustering.
+        scaler (StandardScaler): Fitted scaler object.
+        velocities (np.ndarray): Transformed velocity array.
+        transform_info (dict): Info about the velocity transformation.
+    """
+    if variables_names is None:
+        variables_names = ["V"]
+
+    if "V" not in df_input.columns:
+        raise ValueError("Input dataframe must contain 'V' column for velocities.")
+
+    velocities, transform_info = apply_velocity_transform(
+        velocities=df_input["V"].to_numpy(),
+        velocity_transform=transform_velocity,
+        velocity_params=transform_params,
+    )
+
+    if len(variables_names) > 1:
+        additional_vars = variables_names.copy()
+        if "V" in additional_vars:
+            additional_vars.remove("V")
+        additional_data = df_input[additional_vars].to_numpy()
+        data_array = np.column_stack((velocities, additional_data))
+    else:
+        data_array = velocities.reshape(-1, 1)
+
+    scaler = StandardScaler()
+    scaler.fit(data_array)
+    data_array_scaled = scaler.transform(data_array)
+
+    # If feature weights provided, scale data accordingly
+    if feature_weights is not None:
+        n_features = data_array_scaled.shape[1]
+        if len(feature_weights) != n_features:
+            raise ValueError(
+                f"Feature weights length {len(feature_weights)} does not match number of features {n_features}."
+            )
+        feature_weights = np.array(feature_weights)
+        data_array_scaled = data_array_scaled * feature_weights[np.newaxis, :]
+
+    return data_array_scaled, scaler, velocities, transform_info
+
+
+def apply_velocity_transform(
     velocities: np.ndarray,
     velocity_transform: str = "power",
     velocity_params: dict | None = None,

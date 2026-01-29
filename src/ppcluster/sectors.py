@@ -21,6 +21,30 @@ from smoothify import smoothify
 logger = logging.getLogger("ppcx")
 
 
+def get_sector_colors(
+    sector_config: dict, sector_labels: list[str], default_colormap: str = "tab10"
+) -> dict[str, str]:
+    """
+    Generate a dictionary mapping sector labels to colors.
+
+    Args:
+        sector_config (dict): Configuration dictionary, may contain a 'sector_colors' key with a custom color mapping.
+        sector_labels (list[str]): List of sector label strings to assign colors to.
+        default_colormap (str, optional): Name of the matplotlib colormap to use if no custom colors are provided. Defaults to "tab10".
+
+    Returns:
+        dict[str, str]: Dictionary mapping each sector label to a hex color string.
+    """
+    sector_colors = sector_config.get("sector_colors", None)
+    if sector_colors is not None:
+        return sector_colors
+    cmap = plt.get_cmap(default_colormap)
+    return {
+        label: mcolors.to_hex(cmap(i % cmap.N))
+        for i, label in enumerate(sorted(sector_labels))
+    }
+
+
 def vectorize_gridded_sectors(
     cluster_grid: np.ndarray,
     X: np.ndarray,

@@ -9,11 +9,14 @@ data:
   dt_max: 100  # Maximum time difference between images in hours
   sector_prior_path: "data/${data.year}*.zip" # Path to CVAT ZIP file containing sector prior polygons (and optionally ROI polygon)
   # roi_path: "data/roi.xml" # Path to CVAT XML file containing ROI polygon (optional, if not already included in sector_prior_path)
-  variables_names: ["V"] # The feature vector used for clustering (Velocity)
   output_dir: "output/${data.year}" # Output directory for results
 
 # Data preprocessing parameters
 preprocessing:
+  variables_names: ["V"] # The feature vector used for clustering (Velocity)
+  feature_weights: null  # e.g., [1.0] # Weights for each feature in variables_names. Used only if multiple features are used.
+  velocity_transform: null  # # Use if velocity distribution is heavily skewed (non-Gaussian) ["power" | "exponential" | "sigmoid" | null]
+  transform_params: null # e.g., {"midpoint_percentile": 70, "steepness": 2.0}
   subsample_factor: 1 # 2 means keep every 2nd point, 1 means no subsampling
   subsample_method: "regular"  # or 'random'
   filter_kwargs:
@@ -29,24 +32,17 @@ preprocessing:
     lamma_method: "Neighbours"
     lamma_k: 8
 
-# Prior probability for each sector
-priors: 
-  probability:
-    A: [1.0, 0.0, 0.0, 0.0]
-    B: [0.1, 0.7, 0.2, 0.0]
-    C: [0.0, 0.2, 0.8, 0.0]
-    D: [0.0, 0.0, 0.3, 0.7]
-  fade_method: "exponential"  # "constant" | "idw" | "linear" | "exponential"
-  fade_options: 
-    idw:
-      power: 2
-    linear:
-      max_distance: 100
-    exponential:
-      decay_rate: 0.001 # Higher values lead to faster decay
-
 # MCMC parameters
 mcmc:
+  priors:  # Prior probability for each sector
+    probability:
+      A: [1.0, 0.0, 0.0, 0.0]
+      B: [0.1, 0.7, 0.2, 0.0]
+      C: [0.0, 0.2, 0.8, 0.0]
+      D: [0.0, 0.0, 0.3, 0.7]
+    fade_method: "exponential"  # "constant" | "idw" | "linear" | "exponential"
+    fade_options: # The options are passed to the selected method. Check the mcmc.assign_spatial_priors() function for details.
+      decay_rate: 0.001 # Higher values lead to faster decay
   sample_options:
     target_accept: 0.9 # Higher (0.9+) reduces divergent transitions but slows sampling
     draws: 1500 # Increase (>2000) if posterior distributions are rough/unconverged
@@ -59,8 +55,6 @@ mcmc:
       sigma: 1
     sigma_params:
       sigma: 1
-  velocity_transform: null  # # Use if velocity distribution is heavily skewed (non-Gaussian) ["power" | "exponential" | "sigmoid" | null]
-  transform_params: {} # e.g., {"midpoint_percentile": 70, "steepness": 2.0}
 
   # --- Markov Random Field (MRF) Regularization ---
   # Balances spatial smoothing (neighbors) against data fidelity (velocity/location).
@@ -101,7 +95,7 @@ mcmc:
 
 # Multi-scale processing parameters
 multiscale:
-  sigma_values: [0] # List of Gaussian sigma values for multi-scale processing (0 means no smoothing)
+  sigma_values: null # [0] # List of Gaussian sigma values for multi-scale processing (0 means no smoothing)
   aggregation:
     similarity_threshold: 0.7
     overall_threshold: 0.8
@@ -120,11 +114,11 @@ postprocessing:
   sector_assignment:
     method: "y_centroid"  # Sorts resulting clusters by elevation to ensure consistent labeling (A, B, C...)
     ascending: false      # False if sector A is at the bottom (lowest Y), True otherwise (the y axis is inverted in image coordinates (0 at top))
-    sector_colors:
-      A: "#b3140b"      # Red
-      B: "#ee9c21"      # Orange
-      C: "#f1ee30"      # Yellow
-      D: "#5fb61c"      # Green
+    # sector_colors:
+    #   A: "#b3140b"      # Red
+    #   B: "#ee9c21"      # Orange
+    #   C: "#f1ee30"      # Yellow
+    #   D: "#5fb61c"      # Green
 
 # Database configuration
 database:
