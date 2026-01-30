@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import arviz as az
+import jax.numpy as jnp
 import numpy as np
 import pandas as pd
 import pymc as pm
@@ -148,14 +149,27 @@ def clusterize_gaussian_mixture(
     # Initializations
     priors = prior_probs.copy()
 
-    # Build model
-    model = build_marginalized_mixture_model(
-        data_array_scaled,
-        priors,
+    # # Build model
+    # model = build_marginalized_mixture_model(
+    #     data_array_scaled,
+    #     priors,
+    #     sectors,
+    #     mu_params=mu_params,
+    #     sigma_params=sigma_params,
+    # )
+
+    # Convert to JAX arrays for GPU
+    data_jax = jnp.array(data_array_scaled)
+    priors_jax = jnp.array(priors)
+
+    model = build_marginalized_mixture_model_gpu(
+        data_jax,
+        priors_jax,
         sectors,
         mu_params=mu_params,
         sigma_params=sigma_params,
     )
+    sample_args["nuts_sampler"] = "numpyro"  # Enable JAX/CUDA
 
     # Sample model (1st pass)
     idata, convergence_flag = sample_model(model, None, None, **sample_args)
