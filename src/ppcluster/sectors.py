@@ -20,29 +20,7 @@ from smoothify import smoothify
 
 logger = logging.getLogger("ppcx")
 
-
-def get_sector_colors(
-    sector_config: dict, sector_labels: list[str], default_colormap: str = "tab10"
-) -> dict[str, str]:
-    """
-    Generate a dictionary mapping sector labels to colors.
-
-    Args:
-        sector_config (dict): Configuration dictionary, may contain a 'sector_colors' key with a custom color mapping.
-        sector_labels (list[str]): List of sector label strings to assign colors to.
-        default_colormap (str, optional): Name of the matplotlib colormap to use if no custom colors are provided. Defaults to "tab10".
-
-    Returns:
-        dict[str, str]: Dictionary mapping each sector label to a hex color string.
-    """
-    sector_colors = sector_config.get("sector_colors", None)
-    if sector_colors is not None:
-        return sector_colors
-    cmap = plt.get_cmap(default_colormap)
-    return {
-        label: mcolors.to_hex(cmap(i % cmap.N))
-        for i, label in enumerate(sorted(sector_labels))
-    }
+# === Sector Vectorization and Cleaning Functions ===#
 
 
 def vectorize_gridded_sectors(
@@ -115,6 +93,23 @@ def clean_vector_sectors(
     """
     Clean polygon sectors by removing isolated ones, merging contained ones,
     and merging small ones based on robust velocity statistics (NMAD Z-test).
+
+    Args:
+        gdf_sectors: GeoDataFrame of sector polygons.
+        df_points: DataFrame of points with coordinates and velocities.
+        min_area_px2: Minimum area threshold for sectors.
+        isolation_buffer: Buffer distance for isolation removal.
+        velocity_merge_threshold: Z-score threshold for merging by velocity.
+        target_number_of_sectors: Target number of sectors after cleaning.
+        force_minimum_sectors: If True, force reduction to target_number_of_sectors.
+        fill_holes_area: Area threshold for filling holes in polygons.
+        smooth_geometries: Whether to smooth geometries.
+        smooth_method: Smoothing method ('smoothify' or 'simplify').
+        smooth_iterations: Number of smoothing iterations.
+        raster_res: Raster resolution for smoothing.
+
+    Returns:
+        Cleaned GeoDataFrame of sectors.
     """
     if gdf_sectors.empty:
         return gdf_sectors
@@ -260,6 +255,15 @@ def assign_sector_labels(
 ) -> gpd.GeoDataFrame:
     """
     Assign letter labels (A, B, C...) to the GeoDataFrame based on geometry.
+
+    Args:
+        gdf: GeoDataFrame of polygons.
+        order_by: Sort by 'y_centroid' or 'area'.
+        ascending: Sort order.
+        label_prefix: Optional prefix for labels.
+
+    Returns:
+        GeoDataFrame with 'sector' column assigned.
     """
     from string import ascii_uppercase
 
@@ -456,13 +460,40 @@ def compute_sector_stats(
     return None
 
 
+# === Plotting Functions === #
+
+
+def get_sector_colors(
+    sector_config: dict, sector_labels: list[str], default_colormap: str = "tab10"
+) -> dict[str, str]:
+    """
+    Generate a dictionary mapping sector labels to colors.
+
+    Args:
+        sector_config (dict): Configuration dictionary, may contain a 'sector_colors' key with a custom color mapping.
+        sector_labels (list[str]): List of sector label strings to assign colors to.
+        default_colormap (str, optional): Name of the matplotlib colormap to use if no custom colors are provided. Defaults to "tab10".
+
+    Returns:
+        dict[str, str]: Dictionary mapping each sector label to a hex color string.
+    """
+    sector_colors = sector_config.get("sector_colors")
+    if sector_colors is not None:
+        return sector_colors
+    cmap = plt.get_cmap(default_colormap)
+    return {
+        label: mcolors.to_hex(cmap(i % cmap.N))
+        for i, label in enumerate(sorted(sector_labels))
+    }
+
+
 def plot_sectors(
     sectors: gpd.GeoDataFrame,
     img: np.ndarray | None = None,
     velocity_df: pd.DataFrame | gpd.GeoDataFrame | None = None,
     velocity_mode: Literal["quiver", "scatter"] = "quiver",
     sector_colors: dict | None = None,
-    velocity_cmap: str = "viridis",
+    velocity_cmap: str | None = None,
     min_cbar: float | None = None,
     max_cbar: float | None = None,
     min_cbar_percentile: float | None = None,
@@ -488,7 +519,7 @@ def plot_sectors(
         velocity_df: DataFrame/Geodataframe with velocity vectors (columns: x, y, u, v, V).
         velocity_mode: 'quiver' or 'scatter' for velocity plotting.
         sector_colors: Dict mapping sector labels to colors.
-        velocity_cmap: Colormap for velocity field, ignored if velocity_df is None (default 'viridis').
+        velocity_cmap: Colormap for velocity field, ignored if velocity_df is None (default 'Blues').
         min_cbar_percentile: Minimum percentile for velocity colorbar scaling.
         max_cbar_percentile: Maximum percentile for velocity colorbar scaling.
         label_column: Column in sectors GeoDataFrame for labeling.
@@ -502,6 +533,9 @@ def plot_sectors(
         sector_fill_kwargs: Specific keyword arguments for sector fill
         sector_edge_kwargs: Specific keyword arguments for sector edges
         label_kwargs: Keyword arguments for ax.text() labels
+
+    Returns:
+        The matplotlib Axes object with the plot.
     """
 
     if ax is None:
@@ -530,17 +564,23 @@ def plot_sectors(
         Y = velocity_df["y"].to_numpy()
         mags = velocity_df["V"].to_numpy()
 
-        # Ensure vmin/vmax are always defined, then create Normalize once
+        # Define default color normalization
+        vmin = float(np.min(mags))
+        vmax = float(np.max(mags))
+        if vmin == vmax:
+            vmin = 0.0  # avoid zero-range
+
+        # Try to get vmin/vmax from quiver_kwargs if present
+        if quiver_kwargs is not None:
+            vmin = quiver_kwargs.pop("vmin", None)
+            vmax = quiver_kwargs.pop("vmax", None)
+
+        # If min/max_cbar or min/max_cbar_percentile are provided, they take precedence
         if min_cbar is not None and max_cbar is not None:
             vmin, vmax = float(min_cbar), float(max_cbar)
         elif min_cbar_percentile is not None and max_cbar_percentile is not None:
             vmin = float(np.percentile(mags, min_cbar_percentile))
             vmax = float(np.percentile(mags, max_cbar_percentile))
-        else:
-            vmin = float(np.min(mags))
-            vmax = float(np.max(mags))
-            if vmin == vmax:
-                vmin = 0.0  # avoid zero-range
 
         norm = Normalize(vmin=vmin, vmax=vmax)
 
@@ -695,6 +735,14 @@ def render_sector_stats_table(
 ) -> Axes:
     """
     Render a formatted statistics table on a given axis.
+
+    Args:
+        ax: Matplotlib Axes to render the table on.
+        sector_stats: DataFrame containing sector statistics.
+        max_rows: Maximum number of rows to display.
+
+    Returns:
+        The matplotlib Axes object with the table.
     """
     stat_cols = [
         "sector",
@@ -767,10 +815,38 @@ def plot_sectors_summary(
     figsize: tuple = (20, 10),
     dpi: int = 300,
     save_svg: bool = False,
+    img_kwargs: dict | None = None,
+    quiver_kwargs: dict | None = None,
+    scatter_kwargs: dict | None = None,
+    sector_kwargs: dict | None = None,
+    sector_fill_kwargs: dict | None = None,
+    sector_edge_kwargs: dict | None = None,
+    label_kwargs: dict | None = None,
 ) -> Path:
     """
     Plot kinematic sectors summary with velocity field and statistics table.
-    coordinates the sub-plotting functions.
+
+    Args:
+        sectors: GeoDataFrame with sector geometries and labels.
+        points_by_sector: DataFrame or GeoDataFrame with velocity data and sector labels.
+        img: Background image as a numpy array.
+        colors: Dictionary mapping sector labels to colors.
+        output_dir: Output directory for saving the figure.
+        base_name: Base name for the output file.
+        unit: Unit for velocity and area.
+        figsize: Figure size.
+        dpi: Dots per inch for saved figure.
+        save_svg: Whether to also save as SVG.
+        img_kwargs: Keyword arguments for image plotting.
+        quiver_kwargs: Keyword arguments for quiver plotting.
+        scatter_kwargs: Keyword arguments for scatter plotting.
+        sector_kwargs: General sector plotting kwargs.
+        sector_fill_kwargs: Fill kwargs for sectors.
+        sector_edge_kwargs: Edge kwargs for sectors.
+        label_kwargs: Label kwargs for sector labels.
+
+    Returns:
+        Path to the saved summary figure.
     """
 
     # Ensure colors is a standard dictionary (Seaborn can fail with OmegaConf DictConfig)
@@ -807,6 +883,13 @@ def plot_sectors_summary(
         add_sector_labels=True,
         title="Kinematic Sectors",
         ax=ax_map,
+        img_kwargs=img_kwargs,
+        quiver_kwargs=quiver_kwargs,
+        scatter_kwargs=scatter_kwargs,
+        sector_kwargs=sector_kwargs,
+        sector_fill_kwargs=sector_fill_kwargs,
+        sector_edge_kwargs=sector_edge_kwargs,
+        label_kwargs=label_kwargs,
     )
     # If no image is passed, invert the y axis to keep the correct orientation of the sectors
     if img is None:
@@ -921,6 +1004,12 @@ def plot_sectors_summary(
 def split_disconnected_polygons(gdf_in: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """
     Explodes MultiPolygons into individual Polygons and assigns unique cluster IDs.
+
+    Args:
+        gdf_in: Input GeoDataFrame with (possibly) MultiPolygon geometries.
+
+    Returns:
+        GeoDataFrame with only single Polygon geometries and unique cluster IDs.
     """
     # Explode multipolygons to single polygons
     out = gdf_in.explode(index_parts=False).reset_index(drop=True)
@@ -936,7 +1025,16 @@ def split_disconnected_polygons(gdf_in: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 def filter_small_sectors(
     gdf: gpd.GeoDataFrame, min_area_px2: float
 ) -> gpd.GeoDataFrame:
-    """Explode multipolygons and remove those smaller than threshold."""
+    """
+    Remove polygons smaller than a minimum area threshold.
+
+    Args:
+        gdf: GeoDataFrame of polygons.
+        min_area_px2: Minimum area threshold.
+
+    Returns:
+        Filtered GeoDataFrame.
+    """
     # Remove very small noise polygons
     gdf["area"] = gdf.geometry.area
     n_before = len(gdf)
@@ -952,7 +1050,16 @@ def filter_small_sectors(
 def remove_isolated_sectors(
     gdf: gpd.GeoDataFrame, isolation_buffer: float
 ) -> gpd.GeoDataFrame:
-    """Remove polygons that do not intersect with any other polygon (buffered)."""
+    """
+    Remove polygons that do not intersect with any other polygon (buffered).
+
+    Args:
+        gdf: GeoDataFrame of polygons.
+        isolation_buffer: Buffer distance for intersection check.
+
+    Returns:
+        Filtered GeoDataFrame.
+    """
     keep_indices = []
     for idx in gdf.index:
         geom = gdf.geometry[idx]
@@ -968,7 +1075,15 @@ def remove_isolated_sectors(
 
 
 def merge_contained_sectors(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """Diffusely merge polygons contained within others or filling holes."""
+    """
+    Merge polygons that are contained within others or fill holes.
+
+    Args:
+        gdf: GeoDataFrame of polygons.
+
+    Returns:
+        GeoDataFrame with merged polygons.
+    """
     gdf = gdf.copy()
     changed = True
     while changed:
@@ -1004,7 +1119,18 @@ def merge_sectors_by_velocity(
     threshold: float,
     target_n: int,
 ) -> gpd.GeoDataFrame:
-    """Iteratively merge sectors based on velocity similarity until target is reached."""
+    """
+    Iteratively merge sectors based on velocity similarity until target is reached.
+
+    Args:
+        gdf: GeoDataFrame of polygons.
+        df_points: DataFrame of points with velocities.
+        threshold: Z-score threshold for merging.
+        target_n: Target number of sectors.
+
+    Returns:
+        GeoDataFrame with merged sectors.
+    """
 
     def _get_robust_stats(values: np.ndarray) -> tuple[float, float]:
         """Calculate median and NMAD for robust statistics."""
@@ -1094,7 +1220,16 @@ def merge_sectors_by_velocity(
 
 
 def enforce_sector_limit(gdf: gpd.GeoDataFrame, limit: int) -> gpd.GeoDataFrame:
-    """Force reduction to N sectors by keeping the largest by area."""
+    """
+    Force reduction to N sectors by keeping the largest by area.
+
+    Args:
+        gdf: GeoDataFrame of polygons.
+        limit: Maximum number of sectors to keep.
+
+    Returns:
+        GeoDataFrame with at most 'limit' sectors.
+    """
     if len(gdf) > limit:
         logger.info(f"Forcing reduction to {limit} sectors (keeping largest).")
         gdf["area"] = gdf.geometry.area
@@ -1103,7 +1238,16 @@ def enforce_sector_limit(gdf: gpd.GeoDataFrame, limit: int) -> gpd.GeoDataFrame:
 
 
 def fill_polygon_holes(gdf: gpd.GeoDataFrame, threshold: float) -> gpd.GeoDataFrame:
-    """Fills holes within polygons that are smaller than the threshold area."""
+    """
+    Fills holes within polygons that are smaller than the threshold area.
+
+    Args:
+        gdf: GeoDataFrame of polygons.
+        threshold: Area threshold for filling holes.
+
+    Returns:
+        GeoDataFrame with holes filled.
+    """
 
     def _fill(geom):
         if geom is None or geom.is_empty:
@@ -1135,7 +1279,19 @@ def smooth_polygons(
     smooth_iterations: int = 3,
     **kwargs,
 ) -> gpd.GeoDataFrame:
-    """Smooth polygon geometries using specified method."""
+    """
+    Smooth polygon geometries using specified method.
+
+    Args:
+        gdf: GeoDataFrame of polygons.
+        smooth_method: Smoothing method ('smoothify' or 'simplify').
+        raster_res: Raster resolution for smoothing.
+        smooth_iterations: Number of smoothing iterations.
+        **kwargs: Additional keyword arguments for smoothing.
+
+    Returns:
+        GeoDataFrame with smoothed geometries.
+    """
     logger.info(f"Smoothing polygons using method '{smooth_method}'")
 
     if smooth_method == "smoothify":

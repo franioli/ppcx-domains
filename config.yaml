@@ -44,11 +44,11 @@ mcmc:
     fade_options: # The options are passed to the selected method. Check the mcmc.assign_spatial_priors() function for details.
       decay_rate: 0.001 # Higher values lead to faster decay
   sample_options:
-    target_accept: 0.9 # Higher (0.9+) reduces divergent transitions but slows sampling
-    draws: 1500 # Increase (>2000) if posterior distributions are rough/unconverged
-    tune: 500
-    chains: 4
-    cores: 4
+    target_accept: 0.95 # Higher (0.9+) reduces divergent transitions but slows sampling
+    draws: 1000 # Increase (>2000) if posterior distributions are rough/unconverged
+    tune: 500 # Number of tuning steps (discarded samples)
+    chains: 8 # Number of parallel chains. With fewer chains, increase draws to compensate.
+    cores: 8  # Number of CPU cores to use for parallel sampling (usually set to number of chains)
   model_options:
     mu_params:
       mu: 0
@@ -119,6 +119,12 @@ postprocessing:
     #   B: "#ee9c21"      # Orange
     #   C: "#f1ee30"      # Yellow
     #   D: "#5fb61c"      # Green
+
+plotting:
+  quiver:
+    cmap: "OrRd"
+    vmin: 0
+    vmax: 15
 
 # Database configuration
 database:

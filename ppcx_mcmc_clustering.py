@@ -672,6 +672,7 @@ def run_pipeline(config: DictConfig | ListConfig):
     logger.info(f"Saved final sectors GeoJSON with stats to {output_dir}")
 
     logger.info("Creating summary figure...")
+
     sector_figure_path = plot_sectors_summary(
         sectors=sectors,
         points_by_sector=pts_by_sector,
@@ -680,6 +681,7 @@ def run_pipeline(config: DictConfig | ListConfig):
         output_dir=output_dir,
         base_name=base_name,
         unit="px",
+        quiver_kwargs=config.plotting.quiver,
         figsize=(20, 10),
         dpi=300,
         save_svg=True,

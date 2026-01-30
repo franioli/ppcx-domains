@@ -161,6 +161,11 @@ class PostProcessingConfig:
 
 
 @dataclass
+class PlottingConfig:
+    quiver: dict | None = None
+
+
+@dataclass
 class DatabaseConfig:
     # Uses oc.env to pull from environment variables, defaults to localhost if not found
     host: str = "${oc.env:DB_HOST,localhost}"
@@ -187,6 +192,7 @@ class PipelineConfig:
     mcmc: McmcConfig = field(default_factory=McmcConfig)
     multiscale: MultiscaleConfig = field(default_factory=MultiscaleConfig)
     postprocessing: PostProcessingConfig = field(default_factory=PostProcessingConfig)
+    plotting: PlottingConfig = field(default_factory=PlottingConfig)
 
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     api: ApiConfig = field(default_factory=ApiConfig)

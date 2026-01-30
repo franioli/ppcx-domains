@@ -1,6 +1,7 @@
 import logging
 from typing import Any
 
+import jax.numpy as jnp
 import numpy as np
 import pymc as pm
 from pymc import math as pm_math
@@ -15,6 +16,66 @@ rng = np.random.default_rng(RANDOM_SEED)
 
 
 """ Mixture models with spatial priors"""
+
+
+def build_marginalized_mixture_model_gpu(
+    data: jnp.ndarray,
+    prior_probs: jnp.ndarray,
+    sectors: dict[str, Any],
+    mu_params: dict[str, Any] | None = None,
+    sigma_params: dict[str, Any] | None = None,
+):
+    """
+    Build a marginalized mixture PyMC model (no discrete z), GPU/JAX version.
+    Returns a PyMC model object (not sampled).
+    """
+    n_data = data.shape[0]
+    n_features = data.shape[1]
+    k = len(sectors)
+
+    model = pm.Model(
+        coords={"obs": range(n_data), "cluster": range(k), "feature": range(n_features)}
+    )
+
+    # Parse mu and sigma parameters
+    if mu_params is None:
+        mu_params = {"mu": 0, "sigma": 1}
+    if sigma_params is None:
+        sigma_params = {"sigma": 1}
+
+    with model:
+        obs_data = pm.Data("obs_data", data, dims=("obs", "feature"))
+        prior_w = pm.Data(
+            "prior_w", prior_probs.reshape(n_data, k), dims=("obs", "cluster")
+        )
+
+        mu = pm.Normal(
+            "mu", mu_params["mu"], mu_params["sigma"], dims=("cluster", "feature")
+        )
+        sigma = pm.HalfNormal(
+            "sigma", sigma_params["sigma"], dims=("cluster", "feature")
+        )
+
+        # Log weights with small constant to avoid log(0)
+        log_w = pm.Deterministic(
+            "log_w", pm_math.log(prior_w + 1e-12), dims=("obs", "cluster")
+        )
+
+        # Per-cluster log-likelihood
+        x_centered = (obs_data[:, None, :] - mu[None, :, :]) / sigma[None, :, :]
+        logp_feat = -0.5 * (
+            pm_math.log(2 * jnp.pi) + 2 * pm_math.log(sigma[None, :, :]) + x_centered**2
+        )
+        logp_clusters = logp_feat.sum(axis=2)  # (obs, cluster)
+
+        # Mixture log likelihood (marginalized over clusters)
+        log_mix = pm.math.logsumexp(logp_clusters + log_w, axis=1)  # (obs,)
+
+        # Total logp as Potential
+        pm.Potential("mixture_logp", log_mix.sum())
+
+    logger.info("Marginalized mixture model (un-sampled, GPU/JAX) created.")
+    return model
 
 
 def build_marginalized_mixture_model(
