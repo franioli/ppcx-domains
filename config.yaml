@@ -47,7 +47,7 @@ mcmc:
     target_accept: 0.95 # Higher (0.9+) reduces divergent transitions but slows sampling
     draws: 1000 # Increase (>2000) if posterior distributions are rough/unconverged
     tune: 500 # Number of tuning steps (discarded samples)
-    chains: 8 # Number of parallel chains. With fewer chains, increase draws to compensate.
+    chains: 8 # aNumber of parallel chains. With fewer chains, increase draws to compensate.
     cores: 8  # Number of CPU cores to use for parallel sampling (usually set to number of chains)
   model_options:
     mu_params:
@@ -106,6 +106,7 @@ postprocessing:
     min_area_px2: 100000.0
     isolation_buffer: 30.0
     velocity_merge_threshold: 1
+    force_minimum_sectors: true
     target_number_of_sectors: 4
     fill_holes_area: 80000.0
     smooth_geometries: true
@@ -121,6 +122,8 @@ postprocessing:
     #   D: "#5fb61c"      # Green
 
 plotting:
+  default_discrete_cmap: "tab10"  # Colormap for discrete sector colors when not specified
+  default_continuous_cmap: "OrRd"  # Colormap for continuous data plotting (e.g., velocity)
   quiver:
     cmap: "OrRd"
     vmin: 0

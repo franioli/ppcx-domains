@@ -242,9 +242,6 @@ def run_pipeline(config: DictConfig | ListConfig):
         sector_names=sector_names,
         roi_path=config.data.roi_path,
     )
-    sector_colors = get_sector_colors(
-        config.postprocessing.sector_assignment.sector_colors, sector_names
-    )
 
     # Date range for data selection
     reference_start_date = None
@@ -604,6 +601,7 @@ def run_pipeline(config: DictConfig | ListConfig):
         min_area_px2=vect_config.min_area_px2,
         isolation_buffer=vect_config.isolation_buffer,
         velocity_merge_threshold=vect_config.velocity_merge_threshold,
+        force_minimum_sectors=vect_config.force_minimum_sectors,
         target_number_of_sectors=vect_config.target_number_of_sectors,
         fill_holes_area=vect_config.fill_holes_area,
         smooth_geometries=vect_config.smooth_geometries,
@@ -611,7 +609,25 @@ def run_pipeline(config: DictConfig | ListConfig):
         smooth_iterations=vect_config.smooth_iterations,
         raster_res=2 * raster_res,
     )
+
+    # 2. Assign Labels (A, B, C...)
+    # We use the centroid Y position to order sectors from bottom to top (A=lowest Y). The y axis is inverted in image coordinates (0 at top), hence ascending=False
+    sectors = assign_sector_labels(
+        sectors,
+        order_by=config.postprocessing.sector_assignment.method,
+        ascending=config.postprocessing.sector_assignment.ascending,
+    )
+
+    # Drop all but essential columns and sort by sector label
+    sectors = (
+        sectors[["geometry", "sector"]].sort_values(by="sector").reset_index(drop=True)
+    )
+
     # Plot raw clusters vs vectorized sectors
+    sector_colors = get_sector_colors(
+        sectors["sector"].tolist(),
+        colormap=config.plotting.default_discrete_cmap,
+    )
     fig, (ax_raw, ax_vectorized) = plt.subplots(1, 2, figsize=(14, 7))
     plot_clustering_grid(
         ax=ax_raw,
@@ -630,25 +646,13 @@ def run_pipeline(config: DictConfig | ListConfig):
         img=img,
         velocity_df=None,
         sector_colors=sector_colors,
-        label_column="cluster_id",
+        label_column="sector",
         add_sector_labels=False,
         title=f"Cleaned vectorized sectors (n={len(sectors)})",
     )
     fig.tight_layout()
     fig.savefig(output_dir / f"{base_name}_clustering_raw_vs_vectorized.jpg", dpi=150)
     plt.close(fig)
-
-    # 2. Assign Labels (A, B, C...)
-    # We use the centroid Y position to order sectors from bottom to top (A=lowest Y)
-    # The y axis is inverted in image coordinates (0 at top), hence ascending=False
-    sectors = assign_sector_labels(
-        sectors,
-        order_by=config.postprocessing.sector_assignment.method,
-        ascending=config.postprocessing.sector_assignment.ascending,
-    )
-
-    # Drop all but essential columns
-    sectors = sectors[["geometry", "sector"]].copy()
 
     # 3. Classify the original points dataframe and compute statistics
     pts_by_sector = classify_points_by_polygons(sectors, dic_df, x_col="x", y_col="y")
@@ -672,7 +676,6 @@ def run_pipeline(config: DictConfig | ListConfig):
     logger.info(f"Saved final sectors GeoJSON with stats to {output_dir}")
 
     logger.info("Creating summary figure...")
-
     sector_figure_path = plot_sectors_summary(
         sectors=sectors,
         points_by_sector=pts_by_sector,

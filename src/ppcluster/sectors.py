@@ -464,23 +464,19 @@ def compute_sector_stats(
 
 
 def get_sector_colors(
-    sector_config: dict, sector_labels: list[str], default_colormap: str = "tab10"
+    sector_labels: list[str], colormap: str = "tab10"
 ) -> dict[str, str]:
     """
     Generate a dictionary mapping sector labels to colors.
 
     Args:
-        sector_config (dict): Configuration dictionary, may contain a 'sector_colors' key with a custom color mapping.
         sector_labels (list[str]): List of sector label strings to assign colors to.
         default_colormap (str, optional): Name of the matplotlib colormap to use if no custom colors are provided. Defaults to "tab10".
 
     Returns:
         dict[str, str]: Dictionary mapping each sector label to a hex color string.
     """
-    sector_colors = sector_config.get("sector_colors")
-    if sector_colors is not None:
-        return sector_colors
-    cmap = plt.get_cmap(default_colormap)
+    cmap = plt.get_cmap(colormap)
     return {
         label: mcolors.to_hex(cmap(i % cmap.N))
         for i, label in enumerate(sorted(sector_labels))
@@ -861,6 +857,10 @@ def plot_sectors_summary(
         if sec not in colors:
             colors[sec] = plt.colors.to_hex(cmap(i % 10))
 
+    # Sort sectors and points_by_sector by sector for consistent plotting
+    sectors = sectors.sort_values(by="sector").copy()
+    pts = points_by_sector.sort_values(by="sector").copy()
+
     # --- Figure Layout ---
     fig = plt.figure(figsize=figsize)
     gs = gridspec.GridSpec(
@@ -878,7 +878,7 @@ def plot_sectors_summary(
     plot_sectors(
         sectors=sectors,
         img=img,
-        velocity_df=points_by_sector,
+        velocity_df=pts,
         sector_colors=colors,
         add_sector_labels=True,
         title="Kinematic Sectors",
@@ -898,7 +898,7 @@ def plot_sectors_summary(
     # 2. Right Panel Top: Boxplot of Velocities
     ax_box = fig.add_subplot(gs[0, 1])
     sns.boxplot(
-        data=points_by_sector,
+        data=pts,
         x="sector",
         y="V",
         palette=colors,
@@ -915,7 +915,7 @@ def plot_sectors_summary(
     # 3. Right Panel Middle: Histogram of Velocities
     ax_hist = fig.add_subplot(gs[1, 1])
     sns.histplot(
-        data=points_by_sector,
+        data=pts,
         x="V",
         hue="sector",
         palette=colors,
@@ -927,7 +927,7 @@ def plot_sectors_summary(
     )
     # Dynamically limit Y-axis to avoid squashing the boxes
     # We show up to the 98th percentile + 20% padding
-    all_velocities = points_by_sector["V"].dropna()
+    all_velocities = pts["V"].dropna()
     if not all_velocities.empty:
         y_limit = np.percentile(all_velocities, 98) * 1.2
         ax_box.set_ylim(0, y_limit)
@@ -944,7 +944,7 @@ def plot_sectors_summary(
 
     # Prepare table data
     header = ["Sector", "Median V", "NMAD", f"Area [{unit}²]", "N points"]
-    relevant_sectors = sorted(points_by_sector["sector"].unique())
+    relevant_sectors = sorted(pts["sector"].unique())
     stats_data = []
     for sec in relevant_sectors:
         row = sectors[sectors["sector"] == sec]

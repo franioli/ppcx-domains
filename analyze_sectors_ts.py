@@ -1,3 +1,4 @@
+import argparse
 import logging
 import re
 from pathlib import Path
@@ -21,18 +22,64 @@ from ppcluster.sectors import plot_sectors
 
 logger = setup_logger(logging.INFO, name="ppcx")
 
-input_dir = Path("output/2022")
-output_dir = input_dir / "kinematic_sectors_time_series"
 
-config = load_config()
+# ==== Default options for CLI parser ====
+DEFAULT_OUTPUT_SUBDIR = "kinematic_sectors_time_series"
+DEFAULT_DIR_PATTERN = r".*_\d{4}-\d{2}-\d{2}$"
+DEFAULT_RESULTS_PATTERN = "*results.joblib"
+DEFAULT_N_JOBS = 1
+DEFAULT_SECTORS = ["A", "B", "C"]
+DEFAULT_UNIT = "px"
+DEFAULT_UNIT_SCALE = 1.0
 
-if not input_dir.exists():
-    raise FileNotFoundError(f"Input directory not found: {input_dir}")
 
-output_dir.mkdir(parents=True, exist_ok=True)
-
-UNIT = "px"
-UNIT_SCALE = 1.0  # 1 for px, or the m/px conversion factor
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Analyze sectors time series (batch-friendly)."
+    )
+    parser.add_argument(
+        "--input-dir",
+        "-i",
+        type=str,
+        required=True,
+        help="Base input directory containing result folders (required)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        "-o",
+        type=str,
+        default=None,
+        help=f"Output directory (default: <input-dir>/{DEFAULT_OUTPUT_SUBDIR})",
+    )
+    parser.add_argument(
+        "--dir-pattern",
+        type=str,
+        default=DEFAULT_DIR_PATTERN,
+        help=f"Regex to match result folders (default: {DEFAULT_DIR_PATTERN})",
+    )
+    parser.add_argument(
+        "--results-pattern",
+        type=str,
+        default=DEFAULT_RESULTS_PATTERN,
+        help=f"Glob pattern to find results bundle files (default: {DEFAULT_RESULTS_PATTERN})",
+    )
+    parser.add_argument(
+        "--make-mosaic",
+        action="store_true",
+        help="Enable creation of mosaic of daily sector plots (disabled by default).",
+    )
+    parser.add_argument(
+        "--n-jobs",
+        type=int,
+        default=DEFAULT_N_JOBS,
+        help=f"Number of parallel jobs for mosaic creation (default: {DEFAULT_N_JOBS})",
+    )
+    parser.add_argument(
+        "--show",
+        action="store_true",
+        help="Show interactive plots.",
+    )
+    return parser.parse_args(argv)
 
 
 def find_result_folders(
@@ -720,7 +767,7 @@ def plot_sectors_velocity_area_time_series(
     area_bin_edges: list[float] | None = None,
     fallback_n_bins: int = 5,
     max_panels: int = 4,
-    unit: str = UNIT,
+    unit: str = DEFAULT_UNIT,
     save_svg: bool = True,
 ) -> Figure:
     """
@@ -1033,6 +1080,7 @@ def create_sectors_evolution_mosaic(
     max_dates_per_figure: int = 24,
     ncols: int = 6,
     nrows: int | None = None,
+    sectors_colors: dict[str, Any] | None = None,
     velocity_mode: Literal["quiver", "scatter"] = "scatter",
     velocity_cmap: str = "viridis",
     min_cbar: float | None = None,
@@ -1140,13 +1188,6 @@ def create_sectors_evolution_mosaic(
     n_total_dates = len(unique_dates)
 
     sectors_list = sorted(df_sectors["sector"].unique())
-    try:
-        sectors_colors = config.postprocessing.sector_assignment.get(
-            "sector_colors", {}
-        )
-    except Exception:
-        logger.warning("Unable to get sector colors from config file")
-        sectors_colors = None
     if not sectors_colors:
         cmap = plt.get_cmap("tab10")
         sectors_colors = {s: cmap(i % cmap.N) for i, s in enumerate(sectors_list)}
@@ -1182,98 +1223,149 @@ def create_sectors_evolution_mosaic(
     logger.info("Completed mosaic plotting.")
 
 
-if __name__ == "__main__":
-    dir_pattern = r".*_\d{4}-\d{2}-\d{2}$"
-    results_pattern = "*results.joblib"
+def main(args):
+    in_dir = Path(args.input_dir)
+    out_dir = (
+        Path(args.output_dir) if args.output_dir else in_dir / DEFAULT_OUTPUT_SUBDIR
+    )
+    dir_pattern = args.dir_pattern
+    results_pattern = args.results_pattern
+    make_mosaic = args.make_mosaic
+    n_jobs = args.n_jobs
+    show_plots = args.show
 
-    # Find result folders
-    logger.info(f"Searching for result folders in {input_dir}...")
-    folders = find_result_folders(input_dir, pattern=dir_pattern)
+    year = in_dir.name.split("_")[0]
+
+    if not in_dir.exists():
+        logger.error(f"Input directory not found: {in_dir}")
+        return
+
+    # Load the config file
+    config = load_config()
+    if not config:
+        logger.error("Failed to load configuration; aborting.")
+        return
+
+    # Create output directory
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    logger.info(f"Searching for result folders in {in_dir}...")
+    folders = find_result_folders(in_dir, pattern=dir_pattern)
     logger.info(f"Found {len(folders)} result folders")
 
-    # Load results from all dates
     logger.info("Loading results from all dates...")
     results_list = []
     for folder in folders:
-        result = load_sector_results(folder, search_pattern=results_pattern)
-        if result is not None:
-            results_list.append(result)
+        res = load_sector_results(folder, search_pattern=results_pattern)
+        if not res:
+            continue
+        results_list.append(res)
 
     logger.info(f"Successfully loaded {len(results_list)} / {len(folders)} results")
 
-    # Collect sector statistics into a DataFrame
+    # Collect and prepare data
     df_sectors = collect_statistics(results_list)
-    logger.info(
-        f"Successfully loaded {len(df_sectors)} records from {len(df_sectors['date'].unique())} dates"
-    )
-
-    # Collect point-level time series data
+    if df_sectors.empty:
+        logger.warning("No sector-level data collected; aborting plotting steps.")
     df_points_ts = collect_points_time_series(results_list)
-    columns_to_drop = ["geometry", "cluster_id", "area"]
-    df_points_ts = df_points_ts.drop(columns=columns_to_drop, errors="ignore")
+    df_points_ts = df_points_ts.drop(
+        columns=["geometry", "cluster_id", "area"], errors="ignore"
+    )
 
     logger.info(f"Points time series shape: {df_points_ts.shape}")
-    logger.info(f"Columns: {df_points_ts.columns.tolist()}")
-
-    _ = plot_sector_evolution_boxplots(
-        df_points_ts,
-        col="V",
-        unit=UNIT,
-        sectors=["A", "B", "C"],
-        output_path=output_dir / "sectors_velocity_boxplot_evolution.png",
+    logger.debug(
+        f"Columns: {df_points_ts.columns.tolist() if not df_points_ts.empty else 'no columns'}"
     )
 
-    # Figure with time series of velocity and area of each sector
-    output_path = output_dir / "sectors_time_series.png"
-    colors = config.postprocessing.sector_assignment.get("sector_colors", {})
-    create_time_series_plot(
-        df_sectors,
-        df_points_ts,
-        output_path,
-        unit=UNIT,
-        sector_colors=colors,
-        sector_pairs=[("A", "B")],
-        rolling_days_area=3,
-        rolling_days_sep=3,
-        rolling_function="mean",
-        show=True,
-    )
+    # Sector colors
+    sector_colors = config.postprocessing.sector_assignment.sector_colors
+    if not sector_colors:
+        cmap = plt.get_cmap("tab10")
+        sectors_list = sorted(df_sectors["sector"].unique())
+        sector_colors = {s: cmap(i % cmap.N) for i, s in enumerate(sectors_list)}
+    velocity_cmap = config.plotting.default_continuous_cmap or "OrRd"
 
-    # Replace inline block with a single function call
-    output_path = output_dir / "sectors_velocity_area_time_series.png"
-    fig = plot_sectors_velocity_area_time_series(df_sectors, output_path)
+    # Boxplots evolution
+    try:
+        _ = plot_sector_evolution_boxplots(
+            df_points_ts,
+            col="V",
+            unit=DEFAULT_UNIT,
+            sectors=DEFAULT_SECTORS,
+            output_path=out_dir / "sectors_velocity_boxplot_evolution.png",
+        )
+    except Exception:
+        logger.exception("Failed to create sector evolution boxplots")
 
-    # Swimmer plot: vertical movement of sectors' centroid over time
-    fig_separate = plot_swimmer_all_sectors(
-        df_sectors,
-        colors,
-        plot_sector_extent=False,
-        subtract_mean=True,
-        rolling_days=5,
-    )
-    fig_separate.savefig(output_dir / "sectors_centroid_location.png", dpi=300)
+    # Time series figure (velocity, area, separation)
+    try:
+        ts_out = out_dir / f"{year}_sectors_time_series.png"
+        create_time_series_plot(
+            df_sectors,
+            df_points_ts,
+            ts_out,
+            unit=DEFAULT_UNIT,
+            sector_colors=sector_colors,
+            sector_pairs=[("A", "B")],
+            rolling_days_area=3,
+            rolling_days_sep=3,
+            rolling_function="mean",
+            show=show_plots,
+        )
+    except Exception:
+        logger.exception("Failed to create time series plot")
 
-    # Generate mosaic for all available data
-    output_path_mosaic = output_dir / "sectors_evolution_mosaic"
-    plt.close("all")  # close any existing figures
-    # create_sectors_evolution_mosaic(
-    #     df_sectors,
-    #     output_path_mosaic,
-    #     image=None,
-    #     df_points=df_points_ts,
-    #     max_dates_per_figure=30,
-    #     ncols=6,
-    #     nrows=None,
-    #     velocity_mode="scatter",
-    #     velocity_cmap="Blues",
-    #     min_cbar=0.0,
-    #     max_cbar=10.0,
-    #     img_kwargs=None,
-    #     quiver_kwargs=None,
-    #     scatter_kwargs={"s": 10, "alpha": 0.6},
-    #     sector_kwargs=None,
-    #     sector_fill_kwargs={"alpha": 0},
-    #     sector_edge_kwargs={"linewidth": 5.0},
-    #     save_svg=False,
-    #     n_jobs=1,
-    # )
+    # Velocity / area panels per sector
+    try:
+        out_varea = out_dir / f"{year}_sectors_velocity_area_time_series.png"
+        plot_sectors_velocity_area_time_series(df_sectors, out_varea)
+    except Exception:
+        logger.exception("Failed to create sectors velocity/area panels")
+
+    # Swimmer plots (centroid movement)
+    try:
+        fig_sep = plot_swimmer_all_sectors(
+            df_sectors,
+            sector_colors,
+            plot_sector_extent=False,
+            subtract_mean=True,
+            rolling_days=5,
+        )
+        if fig_sep is not None:
+            fig_sep.savefig(out_dir / f"{year}_sectors_centroid_location.png", dpi=300)
+    except Exception:
+        logger.exception("Failed to create swimmer plots")
+
+    # Mosaic plots (optional)
+    if make_mosaic:
+        try:
+            output_path_mosaic = out_dir / f"{year}_sectors_evolution_mosaic"
+            create_sectors_evolution_mosaic(
+                df_sectors,
+                output_path_mosaic,
+                image=None,
+                df_points=df_points_ts,
+                max_dates_per_figure=30,
+                ncols=6,
+                nrows=None,
+                velocity_mode="scatter",
+                velocity_cmap=velocity_cmap,
+                min_cbar=0.0,
+                max_cbar=10.0,
+                quiver_kwargs=None,
+                scatter_kwargs={"s": 10, "alpha": 0.6},
+                sector_kwargs=None,
+                sector_fill_kwargs={"alpha": 0},
+                sector_edge_kwargs={"linewidth": 5.0},
+                save_svg=False,
+                n_jobs=n_jobs,
+            )
+        except Exception:
+            logger.exception("Failed to create mosaic plots")
+
+    logger.info(f"All outputs saved to {out_dir}")
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    main(args)

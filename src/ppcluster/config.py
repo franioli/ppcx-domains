@@ -127,6 +127,7 @@ class VectorizationConfig:
     min_area_px2: float = 100000.0
     isolation_buffer: float = 30.0
     velocity_merge_threshold: float = 1.0
+    force_minimum_sectors: bool = True
     target_number_of_sectors: int = 4
     fill_holes_area: float = 80000.0
     smooth_geometries: bool = True
@@ -135,7 +136,9 @@ class VectorizationConfig:
 
 
 @dataclass
-class SectorColorConfig:
+class SectorAssignmentConfig:
+    method: str = "y_position"
+    ascending: bool = False
     sector_colors: dict[str, str] | None = None
     # Example of custom colors: sector_colors = field(default_factory=lambda: {
     #         "A": "#b3140b", # Red
@@ -143,13 +146,6 @@ class SectorColorConfig:
     #         "C": "#f1ee30", # Yellow
     #         "D": "#5fb61c", # Green
     # }
-
-
-@dataclass
-class SectorAssignmentConfig:
-    method: str = "y_position"
-    ascending: bool = False
-    sector_colors: SectorColorConfig = field(default_factory=SectorColorConfig)
 
 
 @dataclass
@@ -162,6 +158,8 @@ class PostProcessingConfig:
 
 @dataclass
 class PlottingConfig:
+    default_discrete_cmap: str = "tab10"
+    default_continuous_cmap: str = "OrRd"
     quiver: dict | None = None
 
 
@@ -258,6 +256,28 @@ def load_config(config_path: Path | str | None = None) -> ListConfig | DictConfi
         logger.debug(f"Loaded config from {path_to_load}")
     else:
         logger.debug(f"Config file not found at {path_to_load}. Using defaults.")
+
+    # If sector colors are not defined, set default colors for the sectors defined in the priors section
+    if base_cfg.postprocessing.sector_assignment.sector_colors is None:
+        import matplotlib.colors as mcolors
+        import matplotlib.pyplot as plt
+
+        colormap = base_cfg.plotting.default_discrete_cmap
+        logger.info(
+            f"No sector colors defined in config; assigning default colors from colormap '{colormap}'."
+        )
+
+        try:
+            sector_labels = list(base_cfg.mcmc.priors.probability.keys())
+            cmap = plt.get_cmap(colormap)
+            colors = {
+                label: mcolors.to_hex(cmap(i % cmap.N))
+                for i, label in enumerate(sorted(sector_labels))
+            }
+
+            base_cfg.postprocessing.sector_assignment.sector_colors = colors
+        except Exception as e:
+            logger.error(f"Failed to assign default sector colors: {e}")
 
     # Note: We no longer need the manual env_overrides loop because
     # the DataClasses use "${oc.env:VAR_NAME,default}" which OmegaConf resolves automatically.
