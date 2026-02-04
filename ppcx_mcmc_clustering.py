@@ -467,10 +467,16 @@ def run_pipeline(config: DictConfig | ListConfig):
             convergence_flag=result.convergence_flag,
             idata=result.idata,
             output_dir=output_dir,
-            base_name=base_name,
+            base_name=f"{base_name}_mcmc",
+            make_plots=True,
+            df_input=df_run,
+            cluster_pred=result.cluster_pred,
+            posterior_probs=result.posterior_probs,
+            scaler=scaler,
+            img=img,
         )
 
-        # Otherwise extract the single result
+        # Extract results
         cluster_pred = result.cluster_pred
         posterior_probs = result.posterior_probs
         entropy = -np.sum(posterior_probs * np.log(posterior_probs + 1e-10), axis=1)
