@@ -271,18 +271,22 @@ def compute_cluster_statistics(
 
         # Model parameters for the selected cluster
         if model_mu is not None and model_sigma is not None:
-            if model_mu.shape[0] != len(np.unique(cluster_pred)):
+            n_model_clusters = model_mu.shape[0]
+
+            if int(label) >= n_model_clusters:
                 logger.warning(
-                    "Number of clusters in model parameters does not match number of unique cluster labels."
+                    f"Cluster label {label} exceeds number of clusters in model ({n_model_clusters})."
                 )
                 model_mu_val = None
                 model_sigma_val = None
             elif model_mu.shape[1] > 1:
-                model_mu_val = model_mu[i, :]
-                model_sigma_val = model_sigma[i, :]
+                # Multi-feature case: return the vector for the cluster
+                model_mu_val = model_mu[int(label), :]
+                model_sigma_val = model_sigma[int(label), :]
             else:
-                model_mu_val = float(model_mu[i])
-                model_sigma_val = float(model_sigma[i])
+                # Single-feature case: use [label, 0] to get the scalar element correctly
+                model_mu_val = float(model_mu[int(label), 0])
+                model_sigma_val = float(model_sigma[int(label), 0])
         else:
             model_mu_val = None
             model_sigma_val = None
