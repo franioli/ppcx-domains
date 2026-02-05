@@ -266,12 +266,23 @@ def _gaussian_loglik(X, mu, sigma):
 
 
 def _responsibilities(X, mu, sigma, prior_probs):
+    # 1. Calculate Log-Likelihood of data given Gaussian parameters
+    # shape: (N, K) - for N points and K clusters
     log_lik = _gaussian_loglik(X, mu, sigma)  # (N,K)
+
+    # 2. Add the Log-Prior probability (the spatial weight)
+    # shape: (N, K)
     log_prior = np.log(prior_probs + EPS)  # (N,K)
+
+    # 3. Compute unnormalized log-posterior (logits)
+    # log(Likelihood * Prior) = log(Likelihood) + log(Prior)
     logits = log_lik + log_prior
+
+    # Softmax calculation
     a = logits.max(axis=1, keepdims=True)
     q = np.exp(logits - a)
     q /= q.sum(axis=1, keepdims=True)
+    
     return q
 
 
