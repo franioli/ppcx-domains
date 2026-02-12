@@ -12,7 +12,7 @@ from matplotlib import pyplot as plt
 from omegaconf import DictConfig, ListConfig, OmegaConf
 from sqlalchemy import create_engine
 
-from ppcluster import load_config, mcmc, setup_logger
+from ppcluster import Timer, load_config, mcmc, setup_logger
 from ppcluster.cvat import (
     filter_dataframe_by_polygons,
     read_polygons_from_cvat,
@@ -212,6 +212,9 @@ def run_pipeline(config: DictConfig | ListConfig):
     """
     Main execution pipeline taking a fully merged configuration object.
     """
+
+    timer = Timer()
+
     if not isinstance(config, DictConfig | ListConfig):
         raise ValueError("config must be an OmegaConf DictConfig or ListConfig object.")
 
@@ -328,6 +331,7 @@ def run_pipeline(config: DictConfig | ListConfig):
     dic_df.to_csv(output_dir / f"{base_name}_preprocessed_dic_data.csv", index=False)
     logger.info("Sample of preprocessed DIC data:")
     logger.info(dic_df.head())
+    timer.update("data_loading_and_preprocessing")
 
     # ===  MCMC CLUSTERING   === #
     # --- Assign Priors (Spatial or Velocity-based) ---
@@ -459,6 +463,7 @@ def run_pipeline(config: DictConfig | ListConfig):
             mrf_kwargs=config.mcmc.mrf_kwargs,
             second_pass=config.mcmc.second_pass,
             second_pass_sample_args=config.mcmc.second_pass_sample_args,
+            force_cpu=config.mcmc.force_cpu,
             random_seed=config.random_seed,
         )
 
@@ -571,6 +576,7 @@ def run_pipeline(config: DictConfig | ListConfig):
         cluster_aggregation_outs,
         output_dir / f"{mcmc_base_name}_clustering_results_raw.joblib",
     )
+    timer.update("mcmc_clustering")
 
     # ===  POST-PROCESSING AND CLEANING OF FINAL CLUSTERING  === #
 
@@ -717,8 +723,10 @@ def run_pipeline(config: DictConfig | ListConfig):
         "pts_by_sector": pts_by_sector,
     }
     joblib.dump(bundle, output_dir / f"{base_name}_results.joblib")
+    timer.update("post-processing")
 
     logger.info("Processing complete.")
+    timer.print()
 
 
 if __name__ == "__main__":

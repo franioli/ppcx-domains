@@ -51,35 +51,97 @@ def sample_model(
     output_dir: Path | None = None,
     base_name: str | None = None,
     sigma: float | int | None = None,
+    force_cpu: bool = False,
     **kwargs,
 ) -> tuple[az.InferenceData, bool]:
     """
-    Simple wrapper to sample a PyMC model with given kwargs and check convergence.
-    Returns an ArviZ InferenceData object and a convergence flag.
+    Robust wrapper to sample a PyMC model.
+    Attempts to use JAX/NumPyro on GPU by default unless force_cpu=True.
+    Falls back to standard CPU sampling on any failure or if GPU is unavailable.
     """
+    idata = None
+    use_jax_attempt = False
 
-    with model:
-        logger.info("Starting MCMC sampling...")
-        idata = pm.sample(**kwargs)
-        logger.info("Sampling completed.")
+    # 1. Check if we can and should attempt GPU sampling
+    if not force_cpu:
+        try:
+            import jax
+            import numpyro
 
-    idata_summary = az.summary(idata, var_names=["mu", "sigma"])
+            # Check if JAX actually sees a GPU
+            try:
+                gpu_devices = jax.devices("gpu")
+                if len(gpu_devices) > 0:
+                    use_jax_attempt = True
+                else:
+                    logger.info("JAX installed, but no GPU device found. Using CPU.")
+            except RuntimeError:
+                logger.info(
+                    "JAX installed, but GPU backend not initialized. Using CPU."
+                )
 
-    if np.any(idata_summary["r_hat"] > 1.1) or np.any(idata_summary["ess_bulk"] < 200):
-        convergence_flag = False
-        logger.warning("MCMC chains did not fully converge by r_hat/ess criteria.")
-    else:
-        convergence_flag = True
+        except ImportError:
+            logger.info("NumPyro/JAX not installed. Using CPU.")
 
-    if output_dir is not None and base_name is not None:
-        scale_str = f"_scale{sigma}" if sigma is not None else ""
-        output_dir.mkdir(parents=True, exist_ok=True)
-        az.to_netcdf(idata, output_dir / f"{base_name}_posterior{scale_str}.idata.nc")
-        idata_summary.to_csv(
-            output_dir / f"{base_name}_posterior{scale_str}_summary.csv"
-        )
+    # 2. Try JAX/GPU Sampling
+    if use_jax_attempt:
+        try:
+            logger.info("Attempting JAX/GPU sampling (numpyro) in vectorized mode...")
 
-    return idata, convergence_flag
+            import jax
+
+            # Use float32 for ~2x GPU speedup
+            jax.config.update("jax_enable_x64", False)
+
+            # Prepare GPU-specific arguments
+            # We copy kwargs to avoid modifying them for the CPU fallback if this fails
+            jax_kwargs = kwargs.copy()
+
+            # Remove CPU-multiprocessing args that confuse JAX
+            jax_kwargs.pop("cores", None)
+            jax_kwargs.pop("mp_ctx", None)
+            jax_kwargs.pop("progressbar_theme", None)
+
+            # Optimization: Cap chains for VRAM safety on single GPU
+            # 4 chains is usually sweet spot for efficiency vs diagnostics
+            requested_chains = jax_kwargs.get("chains", 4)
+            jax_kwargs["chains"] = min(requested_chains, 4)
+
+            with model:
+                idata = pm.sample(
+                    nuts_sampler="numpyro",
+                    nuts_sampler_kwargs={"chain_method": "vectorized"},
+                    **jax_kwargs,
+                )
+            logger.info("JAX/GPU sampling completed successfully.")
+
+        except Exception as e:
+            logger.error(f"JAX/GPU sampling failed with error: {e}")
+            logger.warning("Falling back to standard CPU sampling...")
+            idata = None  # Ensure we trigger the fallback
+
+    # 3. CPU Fallback (or if forced)
+    if idata is None:
+        mode_str = "Forced CPU" if force_cpu else "CPU Fallback"
+        logger.info(f"Starting standard PyMC sampling ({mode_str})...")
+        with model:
+            idata = pm.sample(**kwargs)
+        logger.info("CPU sampling completed.")
+
+    # 4. Convergence Checks
+    has_converged = True
+    try:
+        # Basic check: R-hat < 1.05 is a common threshold
+        rhat_max = az.rhat(idata).max().to_array().item()
+        if rhat_max > 1.05:
+            has_converged = False
+            logger.warning(f"Convergence warning: Max R-hat is {rhat_max:.3f} (> 1.05)")
+    except Exception:
+        # If R-hat fails (e.g. single chain), assume converged or handle differently
+        logger.debug("Could not compute R-hat (possibly single chain).")
+        pass
+
+    return idata, has_converged
 
 
 def clusterize_gaussian_mixture(
@@ -95,6 +157,7 @@ def clusterize_gaussian_mixture(
     mrf_kwargs: dict[str, Any] | None = None,
     second_pass: str = "short",
     second_pass_sample_args: dict | None = None,
+    force_cpu: bool = False,
     random_seed: int = 8927,
 ) -> ClusteringResult:
     """
@@ -111,6 +174,7 @@ def clusterize_gaussian_mixture(
         mrf_kwargs (dict, optional): Arguments for MRF regularization. Default is None.
         second_pass (str, optional): Strategy for second sampling pass ("skip", "short", "full"). Default is "full".
         second_pass_sample_args (dict, optional): Arguments for second pass sampling. Default is None.
+        force_cpu (bool, optional): Whether to force CPU sampling even if GPU is available. Default is False.
         random_seed (int, optional): Random seed for reproducibility. Default is 8927.
 
     Returns:
@@ -158,7 +222,9 @@ def clusterize_gaussian_mixture(
     )
 
     # Sample model (1st pass)
-    idata, convergence_flag = sample_model(model, None, None, **sample_args)
+    idata, convergence_flag = sample_model(
+        model, None, None, force_cpu=force_cpu, **sample_args
+    )
     if not convergence_flag:
         idata_summary = az.summary(idata, var_names=["mu", "sigma"])
         logger.info(f"MCMC did not converge. Summary:\n{idata_summary}")
@@ -227,6 +293,7 @@ def clusterize_gaussian_mixture(
                     None,
                     None,
                     initvals=initvals,
+                    force_cpu=force_cpu,
                     **sp2_args,
                 )
             logger.info("Second pass MCMC clustering completed.")

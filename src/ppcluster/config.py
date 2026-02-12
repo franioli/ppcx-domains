@@ -81,6 +81,7 @@ class McmcSampleOptions:
     chains: int = 4
     cores: int = 4
     random_seed: int | str = "${...random_seed}"  # up two levels to the root
+    init: str | None = None
 
 
 @dataclass
@@ -106,6 +107,7 @@ class McmcConfig:
             draws=500, tune=300, target_accept=0.9
         )
     )
+    force_cpu: bool = False
 
 
 @dataclass
