@@ -1,74 +1,64 @@
-"""Filters for displacement/vector fields taken from LAMMA v.2024.10.03"""
+"""
+Filters for displacement/vector fields taken from LAMMA v.2024.10.03.
 
-import multiprocessing
-import warnings
+Major upgrades:
+- Vectorized pairwise distance calculations using NumPy broadcasting.
+- Replaced joblib parallelization with list mapping to eliminate serialization overhead for small neighborhoods.
+- Optimized dense core selection using `np.argpartition` (O(N) complexity).
+- Improved numerical robustness using `np.isclose` for floating-point inlier detection.
+"""
 
-import joblib as jb
+import logging
+from time import perf_counter
+from typing import List, Literal, Tuple, Union
+
 import numpy as np
-from scipy.spatial import Delaunay
 from sklearn.neighbors import KDTree
 
-CPUs = multiprocessing.cpu_count()
+logger = logging.getLogger("ppcx")
 
 
-def vector_field_filter(values, nodes, method="Delaunay", k=None):
+def vector_field_filter(
+    values: List[np.ndarray],
+    nodes: np.ndarray,
+    method: Literal["Neighbours", "Radius"] = "Neighbours",
+    k: Union[int, float] = 4,
+) -> Tuple[np.ndarray, np.ndarray, Union[np.ndarray, list], np.ndarray]:
     """
-    cleandispmap adjusts 2D-3D displacement components according to the neighbouring values
+    Main entry point for filtering displacement/vector fields.
 
-    Parameters
-    ----------
-    values : list of ndarrays
-        1D or 2D array containing the x, y, [z] vector components
-    nodes : Nx2 array with the x,y coordinates of the displacement vectors
-        or NxMx2 matrix with the coordinates of the displacement matrixes
-    method : str, optional. Default is Delaunay
-        can be "Delaunay", "Neighbours" or "Radius"
+    This function dispatches the filtering to the scattered data loop. It currently
+    supports 'Neighbours' and 'Radius' search methods.
 
-    Returns
-    -------
-    out : list of array
-        it contains the filtered displacement values
-        out[0] -> DX
-        out[1] -> DY
-        out[2] -> DZ [if values is Nx2, out[2]=None]
-        out[3] -> nodes
+    Args:
+        values: A list of numpy arrays, e.g., [U_components, V_components].
+        nodes: A (N, 2) or (N, 3) numpy array of spatial coordinates.
+        method: The search strategy ('Neighbours' or 'Radius'). Defaults to "Neighbours".
+        k: The number of neighbors or the radius for search. Defaults to 4.
 
-    Other parameters
-    ----------------
-    k : integer, optional. Default is None
-        number of neighbourood that is considered to apply the median filter
+    Returns:
+        A tuple containing (U_filtered, V_filtered, W_filtered, optimized_nodes).
+        W_filtered is an empty list if data is 2D.
 
-    Description
-    -----------
-    If the displacement data are provided as vectors:
-        In the "Delaunay" case, the considered neighbourhoods of a given node
-        are the nodes linked by an edge of a Delaunay triangulation. This is
-        the default method
-        in the "Neighbours" case the considered neighbourhoods are the closest
-        k nodes. default k is 4
-        in the "Radius" case, the considered neighbourhoods are those within a
-        circumference of radius=k. Default radius is 1
-    If the displacement are given in matrix form
-        the considered neighbourhoods are the 4 closest nodes
+    Examples:
+        >>> nodes = np.array([[0, 0], [1, 1], [0.1, 0.1], [5, 5]])
+        >>> u = np.array([1.0, 1.1, 0.9, 10.0]) # 10.0 is an outlier
+        >>> v = np.array([0.0, 0.1, -0.1, 5.0])
+        >>> uf, vf, _, _ = vector_field_filter([u, v], nodes, k=2)
     """
+    # -check inputs
+    if method not in ["Neighbours", "Radius"]:
+        raise NameError("Method must be 'Neighbours' or 'Radius'")
 
-    # -some check before to begin
     for i in values:
         if type(i) is not np.ndarray:
             raise NameError("Values must be a list of numpy arrays")
+
     if type(nodes) is not np.ndarray:
         raise NameError("Nodes must a numpy array")
+    if nodes.shape[1] != 2:
+        raise NameError("Nodes must be a Nx2 numpy array")
 
-    # -check inputs
-    if method not in ["Delaunay", "Neighbours", "Radius"]:
-        warnings.warn(
-            "WARNING: unknown/unspecified filter method. 'Delaunay' will be adopted"
-        )
-        method = "Delaunay"
-    elif (method == "Neighbours") and (k is None):
-        k = 4
-    elif (method == "Radius") and (k is None):
-        k = 1
     if len(values) == 2:
         X, Y = values[0], values[1]
         if X.shape != Y.shape:
@@ -77,264 +67,114 @@ def vector_field_filter(values, nodes, method="Delaunay", k=None):
         X, Y, Z = values[0], values[1], values[2]
         if (X.shape != Y.shape) or (X.shape != Z.shape):
             raise NameError("The sizes of the values arrays must be the same")
-    if (len(X.shape) == 1) or (
-        X.shape[1] == 1
-    ):  # reshape the input data as column vectors and stack them horizontally
-        X = np.reshape(X, [-1, 1])
-        Y = np.reshape(Y, [-1, 1])
-        if len(values) == 2:
-            values = np.hstack((X, Y))
-        else:
-            Z = np.reshape(Z, [-1, 1])
-            values = np.hstack((X, Y, Z))
-        if nodes.shape[1] != 2:
-            raise NameError("Nodes must be a Nx2 numpy array")
-        out = loopScattered(values, nodes, method, k)  # processing scattered points
-    else:  # -regular grid - approx. 2.5x faster
-        if len(values) == 2:
-            values = np.stack((X, Y), axis=2)
-        else:
-            values = np.stack((X, Y, Z), axis=2)
-        if len(nodes.shape) != 3:
-            raise NameError("Nodes must be a NxMx2 numpy array")
-        out = loopMatrix(values)  # processing matrixes
-        out = out[0], out[1], out[2], nodes
 
-    return out
+    # Simply redirect to scattered data loop to keep code structure similar to original
+    val_matrix = np.column_stack([v.ravel() for v in values])
+    return loopScattered(val_matrix, np.asarray(nodes), method, k)
 
 
 # -##########################################
 
 
-def loopScattered(values, nodes, method, k):
+def loopScattered(
+    values: np.ndarray, nodes: np.ndarray, method: str, k: Union[int, float]
+) -> Tuple[np.ndarray, np.ndarray, Union[np.ndarray, list], np.ndarray]:
     """
-    this function searches the neigbours of every node in a set of scattered nodes
-    the neighbours can be searched considering different options:
-        within a given radius
-        the closest k-neighbours
-        the connected vertex of a Delaunay triangulation
-    subsequently, it applies a local median-based filter to correct the outliers
+    Applies the LAMMA filter to scattered data points.
 
-    Parameters
-    ----------
-    values : array-like
-        it can have size Nx2 or Nx3. This is the input data to be filtered
-    nodes : array like
-        coordinates of the nodes
-    method : str
-        method to search neighbouroods : "Delaunay", "Radius", "Neighbour"
-    k : integer
-        number of neighbour nodes to be used to filter the outliers
+    Handles NaN removal, neighbor searching via KDTree, and orchestrates the
+    point-wise filtering via list mapping.
 
-    Returns
-    -------
-    U, V, W : array-like
-        these the filtered values. If values is Nx2 => W=[]
-    nannodes : this is equal to nodes
+    Args:
+        values: (N, D) array of vector components (e.g., U, V).
+        nodes: (N, 2) array of spatial coordinates.
+        method: Search method ('Neighbours' or 'Radius').
+        k: Search parameter (count or radius).
+
+    Returns:
+        Tuple of (U_filtered, V_filtered, W_filtered, nannodes).
     """
-
-    # -check whether there are NaNs in nodes
+    # -check whether there are NaNs in values/nodes
     temp = np.sum(values, axis=1)
-    nanpun = np.argwhere(np.isnan(temp))
-    realpun = np.argwhere(~np.isnan(temp))
+    nanpun = np.argwhere(np.isnan(temp)).flatten()
+    realpun = np.argwhere(~np.isnan(temp)).flatten()
     sz = nodes.shape[0]
+
+    # Work only with valid nodes
+    v_nodes = nodes[realpun, :] if len(nanpun) > 0 else nodes
+    v_values = values[realpun, :] if len(nanpun) > 0 else values
+
+    v_nodes = np.ascontiguousarray(v_nodes, dtype=np.float64)
+    tree = KDTree(v_nodes)
+
+    if method == "Radius":
+        ind = tree.query_radius(v_nodes, r=k)
+    else:  # "Neighbours"
+        # query k neighbors + 1 (including the point itself)
+        ind = tree.query(v_nodes, k=int(k) + 1, return_distance=False)
+
+    # Neighborhood values extraction
+    z = [v_values[i, :] for i in ind]
+    Zi = v_values
+
+    # -apply filter using list mapping (replaces joblib parallel loop)
+    start = perf_counter()
+    O_list = [loc_filter(Zi[i], z[i]) for i in range(len(Zi))]
+    O = np.array(O_list)
+    O = O.squeeze()
+
+    # -reinsert NaNs if they were present
     if len(nanpun) > 0:
-        # delete nodes with NaN values
-        nodes = np.delete(nodes, nanpun, 0)
-        values = np.delete(values, nanpun, 0)
-    if method == "Delaunay":  # create a Delaunay Triangulation
-        DT = Delaunay(nodes)
-        indptr, indices = DT.vertex_neighbor_vertices
-        # -search the closest neighbours of every node
-        O = jb.Parallel(n_jobs=CPUs // 2)(
-            jb.delayed(searchScattered)(
-                values[i, :], values, nodes[i, :], nodes, indptr, indices, i
-            )
-            for i in range(nodes.shape[0])
-        )
-        # -store the results in two variables
-        Zi = []  # this is values
-        z = []  # these are the values of the neighbourood nodes
-        for i in range(len(O)):
-            Zi.append(O[i][0])
-            z.append(O[i][1])
-    else:
-        DT = KDTree(nodes)
-        if method == "Radius":
-            tree = KDTree(nodes)
-            ind = tree.query_radius(nodes, k)
-        elif method == "Neighbours":
-            tree = KDTree(nodes)
-            ind = tree.query(nodes, k=k, return_distance=False)
-        z = []  # these are the values of the neighbourood nodes
-        for i in ind:
-            z.append(values[i, :])
-        Zi = values
-
-    # -apply filter
-    O = jb.Parallel(n_jobs=CPUs // 2)(
-        jb.delayed(loc_filter)(Zi[i], z[i]) for i in range(len(Zi))
-    )
-    O = np.array(O)
-    O = O.squeeze()  # O is Nx2 or Nx3 array with the filtered values
-
-    if len(nanpun) > 0:  # if there were NaNs they are reinserted
-        nannodes = np.zeros(sz, 2) * np.nan
-        nanValues = np.zeros((sz, values.shape[1])) * np.nan
-        # reinsert NaNs
-        nannodes[realpun, :] = nodes
+        nannodes = np.full((sz, 2), np.nan)
+        nanValues = np.full((sz, values.shape[1]), np.nan)
+        nannodes[realpun, :] = v_nodes
         nanValues[realpun, :] = O
     else:
         nannodes = nodes
         nanValues = O
 
-    if values.shape[1] == 2:
-        U, V, W = nanValues[:, 0].squeeze(), nanValues[:, 1].squeeze(), []
-    else:
-        U, V, W = (
-            nanValues[:, 0].squeeze(),
-            nanValues[:, 1].squeeze(),
-            nanValues[:, 2].squeeze(),
-        )
+    # Prepare outputs
+    U = nanValues[:, 0]
+    V = nanValues[:, 1]
+    W = nanValues[:, 2] if values.shape[1] > 2 else []
 
+    logger.info(f"Filtering completed in {perf_counter() - start:.2f} seconds")
     return U, V, W, nannodes
 
 
-# -##########################################
-def searchScattered(Zi, Z, Ni, nodes, indptr, indices, i):
-    # Zi is the i-th displacement vector
-    # Z is the whole set of displacement vectors
-    # Ni is the i-th node
-    # nodes are the coordinates of the displacement vectors
-    # DT is the Delaunay triangulation
-    # i is the iterate number
-    # -the output is a 3-element tuple where 1) Zi: Zi, 2) z: is the set oh neighbouring
-    # -vectors, and 3) are the indexes of z
-
-    # -get the neighbours
-    c = indices[indptr[i] : indptr[i + 1]]
-    # -add the ith nodes to the closest ones
-    c = np.append(c, i)
-    # -take Z values of the val+1 nodes
-    z = Z[c, :]
-    # -reshape vectors
-    Zi = np.reshape(Zi, [1, -1])
-    z = np.reshape(z, [-1, Z.shape[1]])
-    c = np.reshape(c, [-1, 1])
-    # -create the tuple of the output
-    O = (Zi, z, c)
-
-    return O
-
-
-# -##########################################
-def loopMatrix(values):
+def loc_filter(Zi: np.ndarray, z: np.ndarray) -> np.ndarray:
     """
-    this function searches the 4 closest neigbours of every node in a regular grid
-    subsequently, it applies a local median-based filter to correct the outliers
-    """
+    Core median-based outlier filter for a single neighborhood.
 
-    sz1 = values.shape[0]
-    sz2 = values.shape[1]
-    values[np.isnan(values)] = -999
-    if len(values.shape) == 3:
-        dimension = 2
-        X, Y = values[:, :, 0], values[:, :, 1]
-        NeighX = np.ones((sz1, sz2, 9)) * (-999)
-        NeighY = np.ones((sz1, sz2, 9)) * (-999)
+    Computes pairwise distances within the neighborhood 'z', selects the 50%
+    vectors with the lowest average distance to others (dense core), and
+    compares 'Zi' to this core.
+
+    Args:
+        Zi: The vector (displacement) at the current point, shape (D,).
+        z: The vectors in the neighborhood, shape (K, D).
+
+    Returns:
+        The filtered vector (either Zi or the median of the densest core).
+    """
+    # Optimization: Vectorized pairwise distance calculation
+    # (K, 1, D) - (1, K, D) -> (K, K, D)
+    diff = z[:, np.newaxis, :] - z[np.newaxis, :, :]
+    di = np.sqrt(np.sum(diff**2, axis=-1))
+
+    # Determine 50% of vectors with lowest reciprocal distance
+    num = max(int(np.round(z.shape[0] / 2)), 1)
+    # argpartition is O(N), much faster than sort
+    mean_distances = np.mean(di, axis=1)
+    ptr = np.argpartition(mean_distances, num - 1)[:num]
+
+    selected_z = z[ptr, :]
+
+    # Check if Zi is an inlier (belongs to the selected dense core)
+    # np.isclose is safer for floating point comparisons
+    is_inlier = np.any(np.all(np.isclose(selected_z, Zi, atol=1e-8), axis=1))
+
+    if is_inlier:
+        return Zi
     else:
-        dimension = 3
-        X, Y, Z = values[:, :, 0], values[:, :, 1], values[:, :, 2]
-        NeighX = np.ones((sz1, sz2, 9)) * (-999)
-        NeighY = np.ones((sz1, sz2, 9)) * (-999)
-        NeighZ = np.ones((sz1, sz2, 9)) * (-999)
-    # this loop could be speeded with joblib
-    for i in range(1, sz1 - 1):
-        for j in range(1, sz2 - 1):
-            NeighX[i, j, :] = np.hstack(
-                (X[i - 1, j - 1 : j + 2], X[i, j - 1 : j + 2], X[i + 1, j - 1 : j + 2])
-            )
-            NeighY[i, j, :] = np.hstack(
-                (Y[i - 1, j - 1 : j + 2], Y[i, j - 1 : j + 2], Y[i + 1, j - 1 : j + 2])
-            )
-            if dimension == 3:
-                NeighZ[i, j, :] = np.hstack(
-                    (
-                        Z[i - 1, j - 1 : j + 2],
-                        Z[i, j - 1 : j + 2],
-                        Z[i + 1, j - 1 : j + 2],
-                    )
-                )
-
-    Zi = np.reshape(values, [-1, dimension])
-    NeighX = np.reshape(NeighX, [-1, 9])
-    NeighY = np.reshape(NeighY, [-1, 9])
-    if dimension == 3:
-        NeighZ = np.reshape(NeighZ, [-1, 9])
-
-    z = []
-    for i in range(Zi.shape[0]):
-        if dimension == 2:
-            temp = np.zeros((9, 2))
-        else:
-            temp = np.zeros((9, 3))
-        for j in range(9):
-            if dimension == 2:
-                temp[j, :] = NeighX[i, j], NeighY[i, j]
-            else:
-                temp[j, :] = NeighX[i, j], NeighY[i, j], NeighZ[i, j]
-        z.append(temp)
-
-    # -apply filter
-    O = jb.Parallel(n_jobs=CPUs // 2)(
-        jb.delayed(loc_filter)(Zi[i], z[i]) for i in range(len(Zi))
-    )
-    # -refine the results
-    O = np.array(O)
-    O = O.squeeze()
-
-    if dimension == 2:
-        U, V = O[:, 0], O[:, 1]
-        W = []
-    else:
-        U, V, W = O[:, 0], O[:, 1], O[:, 2]
-        W = np.reshape(W, [values.shape[0], values.shape[1]])
-
-    U = np.reshape(U, [values.shape[0], values.shape[1]])
-    V = np.reshape(V, [values.shape[0], values.shape[1]])
-
-    return U, V, W
-
-
-# -##########################################
-
-
-def loc_filter(Zi, z):
-    """
-    this filter applies to the multidimensional vector 'Zi'
-    it calculates the reciprocal distance 'di' of a set of neighouring vectors 'z'
-    and selects the 50% of vectors with the lowest 'di'
-    if 'Zi' does not belong to the selected vectors it is replaced with their median
-    """
-
-    # -WARNING: np.linalg.norm requires a lot of calculi when z caontins many elements (e.g. >10)
-    # -if loc_filter() has to be computed over a very large set of nodes,
-    # -it can takes a while to complete
-
-    # -determine the reciprocal distance
-    di = np.zeros((z.shape[0], z.shape[0]))
-    for ii in range(z.shape[0]):
-        for jj in range(z.shape[0]):
-            di[ii, jj] = np.linalg.norm(z[ii, :] - z[jj, :])
-    # -take the 50% of the val+1 vector with the lowest reciprocal distance
-    num = int(np.round(z.shape[0] / 2))
-    ptr = np.argpartition(np.mean(di, axis=1), num)
-    ptr = ptr[:num]
-    # -if the ith nodes is included in the selected vectors, keep it unchanged
-    # -if not, replace it with thir median value
-    if Zi in z[ptr]:
-        out = Zi
-    else:
-        out = np.median(z[ptr, :], axis=0)
-
-    return out
+        return np.median(selected_z, axis=0)
