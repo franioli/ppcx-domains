@@ -3,7 +3,7 @@ import time
 from collections import OrderedDict
 from functools import wraps
 
-logger = logging.getLogger("dim")
+logger = logging.getLogger("ppcx")
 
 
 def timeit(func):
@@ -63,7 +63,7 @@ class Timer:
         self.will_print = OrderedDict()
         self.smoothing = smoothing
         self.cumulate_by_key = cumulate_by_key
-        self.logger = logger if logger is not None else logging.getLogger(__name__)
+        self.logger = logger if logger is not None else logging.getLogger("ppcx")
 
         if log_level is not None:
             try:
@@ -124,7 +124,7 @@ class Timer:
             sep (str, optional): Separator between timing entries. Defaults to ", ".
         """
         total = 0.0
-        msg = f"[Timer] | [{text}] "
+        msg = f"[{text}] | "
         for key in self.times:
             val = self.times[key]
             if self.will_print[key]:

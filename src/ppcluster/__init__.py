@@ -11,6 +11,7 @@ from ppcluster import (
 # Import specific functions and classes
 from ppcluster.config import load_config  # noqa: F401
 from ppcluster.utils.logger import get_logger, set_log_level, setup_logger  # noqa: F401
+from ppcluster.utils.timer import Timer  # noqa: F401
 
 # Create the logger but DO NOT add StreamHandlers/FileHandlers here.
 # Only set a default level (INFO), but no output will happen yet.
