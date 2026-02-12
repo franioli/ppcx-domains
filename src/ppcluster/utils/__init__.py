@@ -6,3 +6,4 @@ from .database import (
     get_multi_dic_data,  # noqa: F401
 )
 from .logger import get_logger, setup_logger  # noqa: F401
+from .timer import Timer  # noqa: F401
