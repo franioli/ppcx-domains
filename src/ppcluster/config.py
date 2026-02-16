@@ -20,16 +20,34 @@ load_dotenv(find_dotenv(usecwd=True), override=False)
 
 @dataclass
 class DataConfig:
-    output_dir: str = "output"
-    reference_date: str | None = None
     year: str | None = None
+    reference_date: str | None = None
+    source: str = "database"
+
+    # File source parameters
+    file_path: str | None = None
+    search_dir: str | None = (
+        None  # Directory to search for files when source is "file". Should be used in conjunction with search_pattern.
+    )
+    search_pattern: str | None = (
+        None  # Regex pattern to match files when searching in search_dir. Should include named groups for 'slave', 'master', and 'dt'.
+    )
+    image_dir: str | None = None  # Directory where input images are stored
+
+    # Query parameters for database source
     camera_name: str | None = "PPCX_Tele"
     days_before_to_include: int = 0
     days_after_to_include: int = 0
+
+    # Dt-filtering parameters (applicable to both sources)
     dt_min: float | None = None  # Float to allow 0.5 hours etc
     dt_max: float | None = None
-    roi_path: str | None = None
+
+    # Prior and ROI paths (can be used for both file and database sources)
     sector_prior_path: str | None = None
+    roi_path: str | None = None
+    # Output directory
+    output_dir: str = "output"
 
 
 @dataclass

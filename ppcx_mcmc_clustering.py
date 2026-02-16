@@ -3,19 +3,23 @@ import logging
 import shutil
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
-import geopandas as gpd
 import joblib
 import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
 from omegaconf import DictConfig, ListConfig, OmegaConf
-from sqlalchemy import create_engine
 
 from ppcluster import Timer, load_config, mcmc, setup_logger
 from ppcluster.cvat import (
     filter_dataframe_by_polygons,
-    read_polygons_from_cvat,
+)
+from ppcluster.data import (
+    find_ensemble_file,
+    load_sectors_and_roi,
+    read_data_from_db,
+    read_data_from_pylamma_nc,
 )
 from ppcluster.griddata import create_2d_grid, plot_clustering_grid
 from ppcluster.mcmc.clustering import (
@@ -38,12 +42,6 @@ from ppcluster.sectors import (
     plot_sectors,
     plot_sectors_summary,
     vectorize_gridded_sectors,
-)
-from ppcluster.utils.database import (
-    fetch_dic_analysis_ids,
-    get_dic_analysis_by_ids,
-    get_image,
-    get_multi_dic_data,
 )
 
 logger = setup_logger(level=logging.INFO, name="ppcx")
@@ -88,124 +86,53 @@ def parse_arguments():
     return p.parse_args()
 
 
-def read_sectors_from_file(sector_prior_path: Path, sector_names: list[str]):
+def preprocess_dic_data(
+    out: dict[Any, pd.DataFrame],
+    roi: Any,
+    preproc_config: DictConfig | ListConfig,
+) -> pd.DataFrame:
     """
-    Load sector polygons from a CVAT XML or geospatial file.
-    Returns: sectors_dict.
-    """
-    sectors = {}
-    if sector_prior_path.suffix.lower() in (".xml", ".zip"):
-        logger.info(f"Loading sectors from CVAT XML: {sector_prior_path}")
-        sectors = read_polygons_from_cvat(
-            sector_prior_path,
-            image_ids=[0],
-            include_labels=sector_names,
-        )
-    elif sector_prior_path.suffix.lower() in (".geojson", ".shp", ".gpkg"):
-        logger.info(f"Loading sectors from geospatial file: {sector_prior_path}")
-        gdf_priors = gpd.read_file(sector_prior_path)
-        label_col = None
-        for candidate in ["sector", "label", "name", "class", "id"]:
-            if candidate in gdf_priors.columns:
-                label_col = candidate
-                break
-        if not label_col:
-            raise ValueError(
-                f"Could not find a classification label column in {sector_prior_path}."
-            )
-        for _, row in gdf_priors.iterrows():
-            lbl = str(row[label_col])
-            geom = row.geometry
-            if lbl in sector_names:
-                if lbl in sectors:
-                    sectors[lbl] = sectors[lbl].union(geom)
-                else:
-                    sectors[lbl] = geom
-    else:
-        raise ValueError(
-            f"Unsupported sector prior file format: {sector_prior_path.suffix}"
-        )
-    return sectors
+    Run spatial filtering, DIC filters, stacking, and subsampling on raw DIC data.
 
+    Args:
+        out: Dictionary mapping source IDs to raw DIC DataFrames.
+        roi: ROI polygon for spatial filtering.
+        preproc_config: Dictionary of preprocessing parameters.
 
-def read_roi_from_file(path: Path):
+    Returns:
+        pd.DataFrame: The fully preprocessed and stacked DataFrame.
     """
-    Load ROI polygon from a CVAT XML or geospatial file.
-    Returns: roi_polygon or None.
-    """
-    roi = None
-    if not path or not Path(path).exists():
-        return None
-
-    path = Path(path)
-    if path.suffix.lower() in (".xml", ".zip"):
+    processed = []
+    for src_id, df_src in out.items():
         try:
-            logger.info(f"Loading ROI from CVAT XML: {path}")
-            roi_poly = read_polygons_from_cvat(
-                path, image_ids=[0], include_labels=["ROI", "roi"]
-            )
-            roi = roi_poly.get("ROI") or roi_poly.get("roi")
-        except Exception as e:
-            logger.warning(f"Failed to read ROI from XML {path}: {e}")
-    elif path.suffix.lower() in (".geojson", ".shp", ".gpkg"):
-        try:
-            logger.info(f"Loading ROI from geospatial file: {path}")
-            gdf_roi = gpd.read_file(path)
-            roi = gdf_roi.geometry.union_all()
-        except Exception as e:
-            logger.warning(f"Failed to read ROI from geospatial file {path}: {e}")
-    else:
-        logger.warning(
-            f"Unsupported ROI file format: {path.suffix}. Skipping ROI loading."
+            # Filter only points inside the spatial priors sectors
+            if roi is not None:
+                df_src = filter_dataframe_by_polygons(df_src, polygon=roi)
+
+            # Apply other DIC filters if any
+            df_src = apply_dic_filters(df_src, **preproc_config.filter_kwargs)
+
+            # Append processed dataframe to the list
+            processed.append(df_src)
+        except Exception as exc:
+            logger.warning(f"Filtering failed for {src_id}: {exc}")
+    if not processed:
+        raise RuntimeError("No dataframes left after filtering.")
+
+    # Stack all processed dataframes
+    dic_df = pd.concat(processed, ignore_index=True)
+    logger.info(f"Data shape after filtering and stacking: {dic_df.shape}")
+
+    # Apply subsampling
+    if preproc_config.subsample_factor > 1:
+        dic_df = spatial_subsample(
+            dic_df,
+            n_subsample=preproc_config.subsample_factor,
+            method=preproc_config.subsample_method,
         )
-    return roi
+        logger.info(f"Data shape after subsampling: {dic_df.shape}")
 
-
-def load_sectors_and_roi(
-    sector_prior_path: Path | str,
-    sector_names: list[str],
-    roi_path: Path | str | None = None,
-):
-    """
-    Load sector polygons and ROI polygon from a CVAT XML or geospatial file.
-    Returns: (sectors_dict, roi_polygon or None).
-    """
-
-    # Find matching sector prior file (supports glob patterns)
-    prior_file_pattern = Path(sector_prior_path)
-    sector_prior_paths = list(
-        prior_file_pattern.parent.glob(Path(prior_file_pattern).name)
-    )
-    if len(sector_prior_paths) == 0:
-        raise FileNotFoundError(
-            f"No sector prior file found matching: {sector_prior_path}"
-        )
-    if len(sector_prior_paths) > 1:
-        logger.warning(
-            f"Multiple sector prior files matched. Using the first one found: {list(sector_prior_paths)}"
-        )
-    sector_prior_path = sector_prior_paths[0]
-
-    # Load sectors
-    sectors = read_sectors_from_file(sector_prior_path, sector_names)
-    # if not sectors or any(name not in sectors for name in sector_names):
-    #     missing = [name for name in sector_names if name not in sectors]
-    #     raise ValueError(
-    #         f"Sectors missing in prior file {sector_prior_path}: {missing}. Expected: {sector_names}"
-    #     )
-
-    # Try to read ROI from separate file if provided, else from sector_prior_path
-    roi = None
-    if roi_path is not None:
-        roi_path = Path(roi_path)
-        roi = read_roi_from_file(roi_path)
-    if roi is None:
-        roi = read_roi_from_file(sector_prior_path)
-
-    if roi is None:
-        logger.warning("No ROI polygon provided. Skipping spatial filtering.")
-
-    return sectors, roi
+    return dic_df
 
 
 def run_pipeline(config: DictConfig | ListConfig):
@@ -237,6 +164,7 @@ def run_pipeline(config: DictConfig | ListConfig):
     config_path = output_dir / f"{base_name}_config.yaml"
     OmegaConf.save(config, config_path)
 
+    # === LOAD DATA ===
     # Read sectors for spatial priors and ROI
     # sectors is now dict[str, shapely.Polygon]
     sector_names = list(config.mcmc.priors.probability.keys())
@@ -246,91 +174,79 @@ def run_pipeline(config: DictConfig | ListConfig):
         roi_path=config.data.roi_path,
     )
 
-    # Date range for data selection
-    reference_start_date = None
-    reference_end_date = None
-    if config.data.days_before_to_include > 0:
-        reference_start_date = reference_date_dt - pd.Timedelta(
-            days=config.data.days_before_to_include
-        )
-    if config.data.days_after_to_include > 0:
-        reference_end_date = reference_date_dt + pd.Timedelta(
-            days=config.data.days_after_to_include
-        )
+    # Load dic data and image
+    data_source = config.data.get("source", "database")
+    if data_source == "file":
+        logger.info("Reading data from local file.")
 
-    # Fetch DIC ids
-    db_engine = create_engine(config.db_url)
-    dic_ids = fetch_dic_analysis_ids(
-        db_engine,
-        camera_name=config.data.camera_name,
-        reference_date=reference_date,
-        reference_date_start=reference_start_date,
-        reference_date_end=reference_end_date,
-        dt_hours_min=config.data.dt_min,
-        dt_hours_max=config.data.dt_max,
-    )
-    if len(dic_ids) < 1:
-        raise ValueError("No DIC analyses found for the given criteria")
+        # Determine the actual file path
+        file_path = config.data.get("file_path")
+        if file_path and Path(file_path).is_file():
+            nc_path = Path(file_path)
+        else:
+            # Auto-discovery mode
+            search_dir = Path(config.data.get("search_dir", "."))
+            if file_path and Path(file_path).is_dir():
+                search_dir = Path(file_path)
+            pattern = config.data.get("search_pattern")
+            nc_path = find_ensemble_file(
+                search_dir=search_dir,
+                reference_date=reference_date,
+                dt_hours_min=config.data.dt_min,
+                dt_hours_max=config.data.dt_max,
+                filename_pattern=pattern,
+            )
 
-    # Get DIC analysis metadata and save to CSV
-    dic_analyses = get_dic_analysis_by_ids(db_engine=db_engine, dic_ids=dic_ids)
-    logger.info("Fetched DIC analysis:")
-    for _, row in dic_analyses.iterrows():
-        logger.info(
-            f"DIC ID: {row['dic_id']}, date: {row['reference_date']}, dt (hrs): {row['dt_hours']}, Master: {row['master_timestamp']}, Slave: {row['slave_timestamp']}"
+        try:
+            # Pass image_dir from config if available
+            base_img_dir = config.data.get("image_dir")
+            out, dic_analyses, img = read_data_from_pylamma_nc(
+                nc_path, base_image_dir=Path(base_img_dir) if base_img_dir else None
+            )
+
+        except Exception as e:
+            raise ValueError(
+                f"Failed to read or parse selected file {nc_path}: {e}"
+            ) from e
+
+    elif data_source == "database":
+        logger.info("Reading data from database.")
+
+        # Date range for data selection
+        days_before_to_include = config.data.get("days_before_to_include", 0)
+        ref_date_start = reference_date_dt - pd.Timedelta(days=days_before_to_include)
+        days_after_to_include = config.data.get("days_after_to_include", 0)
+        ref_date_end = reference_date_dt + pd.Timedelta(days=days_after_to_include)
+
+        # Load data from database with the specified date range
+        out, dic_analyses, img = read_data_from_db(
+            config, reference_date, ref_date_start, ref_date_end
         )
+    else:
+        raise ValueError(f"Unknown data source: {data_source}")
+
     date_start = dic_analyses.iloc[0]["master_timestamp"].strftime("%Y-%m-%d")
     date_end = dic_analyses.iloc[0]["slave_timestamp"].strftime("%Y-%m-%d")
     dic_analyses.to_csv(
-        output_dir / f"{date_start}_{date_end}_selected_dic_analyses.csv", index=False
+        output_dir
+        / f"{base_name}_master_{date_start}_slave{date_end}_dic_analyses.csv",
+        index=False,
     )
     logger.info("Selected DIC analyses:")
     logger.info(dic_analyses.head())
 
-    # Get master image
-    master_image_id = dic_analyses["master_image_id"].iloc[0]
-    img = get_image(image_id=master_image_id, config=config.api)
-
-    # Fetch DIC data
-    out = get_multi_dic_data(dic_ids, stack_results=False, config=config.api)
-    logger.info(f"Found stack of {len(out)} DIC dataframes.")
-
     # Apply filter for each df in the dictionary and then stack them
     preproc_config = config.preprocessing
-    processed = []
-    for src_id, df_src in out.items():
-        try:
-            # Filter only points inside the spatial priors sectors
-            if roi is not None:
-                df_src = filter_dataframe_by_polygons(df_src, polygon=roi)
-
-            # Apply other DIC filters if any
-            df_src = apply_dic_filters(df_src, **preproc_config.filter_kwargs)
-
-            # Append processed dataframe to the list
-            processed.append(df_src)
-        except Exception as exc:
-            logger.warning(f"Filtering failed for {src_id}: {exc}")
-    if not processed:
-        raise RuntimeError("No dataframes left after filtering.")
-
-    # Stack all processed dataframes
-    dic_df = pd.concat(processed, ignore_index=True)
-    logger.info(f"Data shape after filtering and stacking: {dic_df.shape}")
-
-    # Apply subsampling
-    if preproc_config.subsample_factor > 1:
-        dic_df = spatial_subsample(
-            dic_df,
-            n_subsample=preproc_config.subsample_factor,
-            method=preproc_config.subsample_method,
-        )
-        logger.info(f"Data shape after subsampling: {dic_df.shape}")
-
+    dic_df = preprocess_dic_data(
+        out=out,
+        roi=roi,
+        preproc_config=preproc_config,
+    )
     # Save preprocessed DIC data
     dic_df.to_csv(output_dir / f"{base_name}_preprocessed_dic_data.csv", index=False)
     logger.info("Sample of preprocessed DIC data:")
     logger.info(dic_df.head())
+
     timer.update("data_loading_and_preprocessing")
 
     # ===  MCMC CLUSTERING   === #

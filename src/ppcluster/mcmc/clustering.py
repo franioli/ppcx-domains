@@ -66,7 +66,6 @@ def sample_model(
     if not force_cpu:
         try:
             import jax
-            import numpyro
 
             # Check if JAX actually sees a GPU
             try:
@@ -82,6 +81,13 @@ def sample_model(
 
         except ImportError:
             logger.info("NumPyro/JAX not installed. Using CPU.")
+
+    n_data = len(model.coords["obs"])
+    if n_data < 500 and not force_cpu:
+        logger.info(
+            f"Data size {n_data} is small; skipping JAX JIT overhead and using CPU."
+        )
+        use_jax_attempt = False
 
     # 2. Try JAX/GPU Sampling
     if use_jax_attempt:
