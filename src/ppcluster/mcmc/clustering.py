@@ -44,6 +44,7 @@ class ClusteringResult:
     cluster_pred: np.ndarray
     uncertainty: np.ndarray
     priors: np.ndarray
+    entropy: np.ndarray | None = None
 
 
 def sample_model(
@@ -130,8 +131,13 @@ def sample_model(
     if idata is None:
         mode_str = "Forced CPU" if force_cpu else "CPU Fallback"
         logger.info(f"Starting standard PyMC sampling ({mode_str})...")
+
+        # Remove any GPU-specific args that might have been added for the JAX attempt
+        cpu_kwargs = kwargs.copy()
+        cpu_kwargs.pop("chain_method", None)
+        cpu_kwargs.pop("init", None)
         with model:
-            idata = pm.sample(**kwargs)
+            idata = pm.sample(**cpu_kwargs)
         logger.info("CPU sampling completed.")
 
     # 4. Convergence Checks
@@ -309,6 +315,9 @@ def clusterize_gaussian_mixture(
         idata, n_posterior_samples=200
     )
 
+    # Compute entropy as an additional uncertainty measure
+    entropy = -np.sum(posterior_probs * np.log(posterior_probs + 1e-10), axis=1)
+
     result = ClusteringResult(
         convergence_flag=convergence_flag,
         idata=idata,
@@ -316,6 +325,7 @@ def clusterize_gaussian_mixture(
         cluster_pred=cluster_pred,
         uncertainty=uncertainty,
         priors=priors,
+        entropy=entropy,
     )
 
     return result

@@ -98,8 +98,7 @@ class McmcSampleOptions:
     tune: int = 1000
     chains: int = 4
     cores: int = 4
-    random_seed: int | str = "${...random_seed}"  # up two levels to the root
-    init: str | None = None
+    random_seed: int | None = None
 
 
 @dataclass
@@ -169,6 +168,29 @@ class SectorAssignmentConfig:
 
 
 @dataclass
+class AnomalyDetectionConfig:
+    run_anomaly_detection: bool = False
+    target_sector: str = "A"
+    prior_percentile_threshold: float = 90
+    model_options: GaussianMixtureModelConfig = field(
+        default_factory=lambda: GaussianMixtureModelConfig(
+            mu_params={"mu": 0, "sigma": 4},
+            sigma_params={"sigma": 2},
+        )
+    )
+    sample_options: McmcSampleOptions = field(
+        default_factory=lambda: McmcSampleOptions(
+            draws=1000, tune=500, target_accept=0.9
+        )
+    )
+    mrf_options: MrfOptions = field(
+        default_factory=lambda: MrfOptions(
+            n_neighbors=8, length_scale=50, beta=1.0, n_iter=5
+        )
+    )
+
+
+@dataclass
 class PostProcessingConfig:
     vectorization: VectorizationConfig = field(default_factory=VectorizationConfig)
     sector_assignment: SectorAssignmentConfig = field(
@@ -185,7 +207,7 @@ class PlottingConfig:
 
 @dataclass
 class DatabaseConfig:
-    # Uses oc.env to pull from environment variables, defaults to localhost if not found
+    # Uses oc.env to pull from environment variables, defaults to localhost if not fo}und
     host: str = "${oc.env:DB_HOST,localhost}"
     port: str = "${oc.env:DB_PORT,5432}"
     name: str = "${oc.env:DB_NAME,planpincieux}"
@@ -195,7 +217,7 @@ class DatabaseConfig:
 
 @dataclass
 class ApiConfig:
-    host: str = "${oc.env:APP_HOST,localhost}"
+    host: str = "${oc.env:APP_HOST,localhost"
     port: str = "${oc.env:APP_PORT,8080}"
     image_view: str = "${oc.env:GET_IMAGE_VIEW,images}"
 
@@ -211,11 +233,14 @@ class PipelineConfig:
     multiscale: MultiscaleConfig = field(default_factory=MultiscaleConfig)
     postprocessing: PostProcessingConfig = field(default_factory=PostProcessingConfig)
     plotting: PlottingConfig = field(default_factory=PlottingConfig)
+    anomaly_detection: AnomalyDetectionConfig = field(
+        default_factory=AnomalyDetectionConfig
+    )
 
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     api: ApiConfig = field(default_factory=ApiConfig)
 
-    random_seed: int = 8927
+    random_seed: int | None = None
 
     # Computed variables (Interpolations)
     db_url: str = "postgresql://${database.user}:${database.password}@${database.host}:${database.port}/${database.name}"

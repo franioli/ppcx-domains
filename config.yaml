@@ -66,7 +66,6 @@ mcmc:
     tune: 1000 # Number of tuning steps (discarded samples)
     chains: 4 # Number of parallel chains. With fewer chains, increase draws to compensate.
     cores: 4  # Number of CPU cores to use for parallel sampling (usually set to number of chains)
-    # init: "jitter+adapt_diag" # Fast initialization
   force_cpu: false # Whether to force CPU sampling even if GPU is available (default: false, use GPU if available)
   model_options:
     mu_params:
@@ -106,7 +105,7 @@ mcmc:
   # - "skip": fastest, rely only on MRF priors, no re-sampling
   second_pass: "short"  # "skip" | "short" | "full"
   second_pass_sample_args:
-    draws: 500
+    draws: 1000
     tune: 200
     chains: 4
     cores: 4
@@ -139,6 +138,16 @@ postprocessing:
     #   B: "#ee9c21"      # Orange
     #   C: "#f1ee30"      # Yellow
     #   D: "#5fb61c"      # Green
+
+anomaly_detection:
+  run_anomaly_detection: true
+  target_sector: "A" # Sector to analyze for anomalies (e.g., "A")
+  prior_percentile_threshold: 90 # Percentile threshold for velocity-based priors (e.g., 90 means points above the 90th percentile of velocity are more likely to be anomalies)
+  mrf_options: # MRF settings specific for anomaly detection (can be more aggressive to capture small anomalous features)
+    n_neighbors: 8
+    length_scale: 50
+    beta: 1.0
+    n_iter: 20
 
 plotting:
   default_discrete_cmap: "tab10"  # Colormap for discrete sector colors when not specified
