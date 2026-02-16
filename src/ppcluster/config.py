@@ -207,7 +207,7 @@ class PlottingConfig:
 
 @dataclass
 class DatabaseConfig:
-    # Uses oc.env to pull from environment variables, defaults to localhost if not fo}und
+    # Uses oc.env to pull from environment variables, defaults to localhost if not found
     host: str = "${oc.env:DB_HOST,localhost}"
     port: str = "${oc.env:DB_PORT,5432}"
     name: str = "${oc.env:DB_NAME,planpincieux}"
@@ -217,7 +217,7 @@ class DatabaseConfig:
 
 @dataclass
 class ApiConfig:
-    host: str = "${oc.env:APP_HOST,localhost"
+    host: str = "${oc.env:APP_HOST,localhost}"
     port: str = "${oc.env:APP_PORT,8080}"
     image_view: str = "${oc.env:GET_IMAGE_VIEW,images}"
 
