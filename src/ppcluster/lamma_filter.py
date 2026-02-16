@@ -10,7 +10,7 @@ Major upgrades:
 
 import logging
 from time import perf_counter
-from typing import List, Literal, Tuple, Union
+from typing import Literal
 
 import numpy as np
 from sklearn.neighbors import KDTree
@@ -19,11 +19,11 @@ logger = logging.getLogger("ppcx")
 
 
 def vector_field_filter(
-    values: List[np.ndarray],
+    values: list[np.ndarray],
     nodes: np.ndarray,
     method: Literal["Neighbours", "Radius"] = "Neighbours",
-    k: Union[int, float] = 4,
-) -> Tuple[np.ndarray, np.ndarray, Union[np.ndarray, list], np.ndarray]:
+    k: int | float = 4,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | list, np.ndarray]:
     """
     Main entry point for filtering displacement/vector fields.
 
@@ -42,7 +42,7 @@ def vector_field_filter(
 
     Examples:
         >>> nodes = np.array([[0, 0], [1, 1], [0.1, 0.1], [5, 5]])
-        >>> u = np.array([1.0, 1.1, 0.9, 10.0]) # 10.0 is an outlier
+        >>> u = np.array([1.0, 1.1, 0.9, 10.0])  # 10.0 is an outlier
         >>> v = np.array([0.0, 0.1, -0.1, 5.0])
         >>> uf, vf, _, _ = vector_field_filter([u, v], nodes, k=2)
     """
@@ -77,8 +77,8 @@ def vector_field_filter(
 
 
 def loopScattered(
-    values: np.ndarray, nodes: np.ndarray, method: str, k: Union[int, float]
-) -> Tuple[np.ndarray, np.ndarray, Union[np.ndarray, list], np.ndarray]:
+    values: np.ndarray, nodes: np.ndarray, method: str, k: int | float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | list, np.ndarray]:
     """
     Applies the LAMMA filter to scattered data points.
 
