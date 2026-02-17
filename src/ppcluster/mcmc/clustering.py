@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from dataclasses import dataclass
 from itertools import combinations
 from pathlib import Path
@@ -35,6 +36,131 @@ logger = logging.getLogger("ppcx")
 
 COLORMAP = plt.get_cmap("tab10")
 
+# ============================================================
+# Module-level JAX initialization and pre-warming
+# Pay the cost once at import, not at first sample_model() call
+# ============================================================
+USE_JAX = False
+_JAX_GPU_AVAILABLE = False
+
+os.environ.setdefault("JAX_ENABLE_X64", "True")
+
+try:
+    import jax
+    import jax.numpy as jnp
+
+    jax.config.update("jax_enable_x64", True)
+
+    # Trigger platform init and a tiny compilation to warm up XLA
+    _warmup = jnp.ones(1) + jnp.ones(1)
+    _warmup.block_until_ready()  # Force synchronous execution
+    del _warmup
+
+    USE_JAX = True
+
+    # Check GPU availability once at import
+    try:
+        _gpu_devices = jax.devices("gpu")
+        if len(_gpu_devices) > 0:
+            _JAX_GPU_AVAILABLE = True
+            logger.debug(f"JAX GPU initialized. Devices: {_gpu_devices}")
+            # Pre-warm GPU with a slightly larger operation to trigger CUDA context
+            _gpu_warmup = jnp.ones((100, 100), device=_gpu_devices[0]) @ jnp.ones(
+                (100, 1), device=_gpu_devices[0]
+            )
+            _gpu_warmup.block_until_ready()
+            del _gpu_warmup
+        else:
+            logger.debug("JAX installed, no GPU device found.")
+    except RuntimeError:
+        logger.debug("JAX installed, GPU backend not available.")
+
+    logger.debug(f"JAX initialized. USE_JAX={USE_JAX}, GPU={_JAX_GPU_AVAILABLE}")
+
+except ImportError:
+    logger.debug("JAX not installed. All sampling will use CPU.")
+
+
+# ============================================================
+# Compilation cache for numpyro sampler
+# ============================================================
+# JAX/numpyro recompiles every time pm.sample() is called,
+# even if the model structure is identical.
+# We cache the "model shape signature" to detect when we can
+# reuse a previous compilation by passing the same model.
+_COMPILED_MODEL_SIGNATURE: tuple | None = None
+
+
+def _get_model_signature(model: pm.Model) -> tuple:
+    """
+    Create a hashable signature of the model structure.
+    If two models have the same signature, JAX can reuse the compiled kernel.
+    """
+    try:
+        n_obs = len(model.coords.get("obs", []))
+        n_components = len(model.coords.get("cluster", []))
+        n_features = len(model.coords.get("feature", []))
+        var_names = tuple(sorted(v.name for v in model.free_RVs))
+        return (n_obs, n_components, n_features, var_names)
+    except Exception:
+        return None
+
+
+def _should_use_gpu(
+    n_data: int,
+    n_draws: int,
+    n_tune: int,
+    n_chains: int,
+    force_cpu: bool,
+    model_signature: tuple | None = None,
+) -> bool:
+    """
+    Heuristic to decide GPU vs CPU based on workload size and compilation cache.
+
+    GPU JIT overhead is ~10-15s. It's only worth it when:
+    - Data is large enough (>500 points)
+    - Total sampling work is large enough (>2000 total iterations across chains)
+    - OR the model is already compiled (same signature as last run)
+    """
+    global _COMPILED_MODEL_SIGNATURE
+
+    if force_cpu or not USE_JAX or not _JAX_GPU_AVAILABLE:
+        return False
+
+    total_work = (n_draws + n_tune) * n_chains
+
+    # If the model signature matches the cached one, JIT is (mostly) free
+    is_cached = (
+        model_signature is not None and _COMPILED_MODEL_SIGNATURE == model_signature
+    )
+
+    if is_cached:
+        logger.debug(
+            "Model signature matches cache. GPU recompilation should be minimal."
+        )
+        # Even for small workloads, GPU is fine if already compiled
+        return n_data >= 100
+
+    # Cold start: need substantial workload to justify JIT
+    min_data_for_gpu = 500
+    min_work_for_gpu = 4000  # e.g., 1000 draws * 4 chains
+
+    if n_data < min_data_for_gpu:
+        logger.info(
+            f"Data size {n_data} < {min_data_for_gpu}. "
+            f"Skipping GPU to avoid JIT overhead."
+        )
+        return False
+
+    if total_work < min_work_for_gpu:
+        logger.info(
+            f"Total work {total_work} < {min_work_for_gpu}. "
+            f"Skipping GPU to avoid JIT overhead."
+        )
+        return False
+
+    return True
+
 
 @dataclass
 class ClusteringResult:
@@ -48,69 +174,62 @@ class ClusteringResult:
 
 
 def sample_model(
-    model: pm.Model,
-    output_dir: Path | None = None,
-    base_name: str | None = None,
-    sigma: float | int | None = None,
-    force_cpu: bool = False,
-    **kwargs,
+    model: pm.Model, force_cpu: bool = False, **kwargs
 ) -> tuple[az.InferenceData, bool]:
     """
     Robust wrapper to sample a PyMC model.
     Attempts to use JAX/NumPyro on GPU by default unless force_cpu=True.
     Falls back to standard CPU sampling on any failure or if GPU is unavailable.
+
+    Optimizations:
+    - Pre-warmed JAX at module level (no cold-start penalty)
+    - Size-based heuristic to skip GPU for small workloads
+    - Model signature caching to detect when JIT recompilation can be avoided
     """
+    global _COMPILED_MODEL_SIGNATURE
+
     idata = None
-    use_jax_attempt = False
 
-    # 1. Check if we can and should attempt GPU sampling
-    if not force_cpu:
+    # Extract workload parameters
+    n_data = len(model.coords.get("obs", []))
+    n_draws = kwargs.get("draws", 1000)
+    n_tune = kwargs.get("tune", 500)
+    n_chains = kwargs.get("chains", 4)
+
+    # Get model signature for caching
+    model_signature = _get_model_signature(model)
+
+    # Decide GPU vs CPU using heuristic
+    use_gpu = _should_use_gpu(
+        n_data=n_data,
+        n_draws=n_draws,
+        n_tune=n_tune,
+        n_chains=n_chains,
+        force_cpu=force_cpu,
+        model_signature=model_signature,
+    )
+
+    # ---- GPU Sampling Path ----
+    if use_gpu:
         try:
             import jax
 
-            # Check if JAX actually sees a GPU
-            try:
-                gpu_devices = jax.devices("gpu")
-                if len(gpu_devices) > 0:
-                    use_jax_attempt = True
-                else:
-                    logger.info("JAX installed, but no GPU device found. Using CPU.")
-            except RuntimeError:
-                logger.info(
-                    "JAX installed, but GPU backend not initialized. Using CPU."
-                )
+            logger.info(
+                f"GPU sampling: n_data={n_data}, draws={n_draws}, "
+                f"tune={n_tune}, chains={n_chains}"
+            )
 
-        except ImportError:
-            logger.info("NumPyro/JAX not installed. Using CPU.")
-
-    n_data = len(model.coords["obs"])
-    if n_data < 500 and not force_cpu:
-        logger.info(
-            f"Data size {n_data} is small; skipping JAX JIT overhead and using CPU."
-        )
-        use_jax_attempt = False
-
-    # 2. Try JAX/GPU Sampling
-    if use_jax_attempt:
-        try:
-            logger.info("Attempting JAX/GPU sampling (numpyro) in vectorized mode...")
-
-            import jax
-
-            # Use float32 for ~2x GPU speedup
+            # Use float32 on GPU for ~2x speedup
             jax.config.update("jax_enable_x64", False)
 
             # Prepare GPU-specific arguments
-            # We copy kwargs to avoid modifying them for the CPU fallback if this fails
             jax_kwargs = kwargs.copy()
 
             # Remove CPU-multiprocessing args that confuse JAX
-            jax_kwargs.pop("cores", None)
-            jax_kwargs.pop("mp_ctx", None)
-            jax_kwargs.pop("progressbar_theme", None)
+            for cpu_key in ("cores", "mp_ctx", "progressbar_theme"):
+                jax_kwargs.pop(cpu_key, None)
 
-            # Optimization: Cap chains for VRAM safety on single GPU
-            # 4 chains is usually sweet spot for efficiency vs diagnostics
+            # Cap chains for VRAM safety on single GPU
             requested_chains = jax_kwargs.get("chains", 4)
             jax_kwargs["chains"] = min(requested_chains, 4)
 
@@ -120,43 +239,77 @@ def sample_model(
                     nuts_sampler_kwargs={"chain_method": "vectorized"},
                     **jax_kwargs,
                 )
-            logger.info("JAX/GPU sampling completed successfully.")
+
+            # Update compilation cache on success
+            _COMPILED_MODEL_SIGNATURE = model_signature
+            logger.info("GPU sampling completed successfully.")
+
+            # Restore float64 for downstream numpy operations
+            jax.config.update("jax_enable_x64", True)
 
         except Exception as e:
-            logger.error(f"JAX/GPU sampling failed with error: {e}")
-            logger.warning("Falling back to standard CPU sampling...")
-            idata = None  # Ensure we trigger the fallback
+            logger.error(f"GPU sampling failed: {e}")
+            logger.warning("Falling back to CPU sampling...")
+            idata = None
 
-    # 3. CPU Fallback (or if forced)
+            # Restore float64 even on failure
+            try:
+                import jax
+
+                jax.config.update("jax_enable_x64", True)
+            except Exception:
+                pass
+
+    # ---- CPU Sampling Path (fallback or forced) ----
     if idata is None:
-        mode_str = "Forced CPU" if force_cpu else "CPU Fallback"
-        logger.info(f"Starting standard PyMC sampling ({mode_str})...")
+        mode_str = (
+            "Forced CPU"
+            if force_cpu
+            else (
+                "CPU (small workload)"
+                if not force_cpu and USE_JAX and _JAX_GPU_AVAILABLE
+                else "CPU"
+            )
+        )
+        logger.info(
+            f"Starting PyMC sampling ({mode_str}): n_data={n_data}, "
+            f"draws={n_draws}, tune={n_tune}, chains={n_chains}"
+        )
 
-        # Remove any GPU-specific args that might have been added for the JAX attempt
         cpu_kwargs = kwargs.copy()
-        cpu_kwargs.pop("chain_method", None)
-        cpu_kwargs.pop("init", None)
+        # Remove any GPU-specific args
+        for gpu_key in ("chain_method",):
+            cpu_kwargs.pop(gpu_key, None)
+
         with model:
             idata = pm.sample(**cpu_kwargs)
         logger.info("CPU sampling completed.")
 
-    # 4. Convergence Checks
+    # ---- Convergence Checks ----
     has_converged = True
     try:
-        # Basic check: R-hat < 1.05 is a common threshold
-        rhat_max = az.rhat(idata).max().to_array().item()
+        rhat_max = az.rhat(idata).max().to_array().values.max()
         if rhat_max > 1.05:
             has_converged = False
             logger.warning(f"Convergence warning: Max R-hat is {rhat_max:.3f} (> 1.05)")
+        else:
+            logger.debug(f"Convergence OK: Max R-hat = {rhat_max:.3f}")
     except Exception:
-        # If R-hat fails (e.g. single chain), assume converged or handle differently
         logger.debug("Could not compute R-hat (possibly single chain).")
-        pass
 
-    logger.debug(f"Sampling summary:\n{az.summary(idata, var_names=['mu', 'sigma'])}")
-    logger.info(
-        f"Mcmc sampling completed in {idata.constant_data.sampling_time:.2f} seconds."
-    )
+    try:
+        logger.debug(
+            f"Sampling summary:\n{az.summary(idata, var_names=['mu', 'sigma'])}"
+        )
+        sampling_time = float(idata.attrs.get("sampling_time", 0))
+        if sampling_time == 0:
+            try:
+                sampling_time = float(idata.constant_data.sampling_time)
+            except Exception:
+                pass
+        logger.info(f"MCMC sampling completed in {sampling_time:.2f} seconds.")
+    except Exception as e:
+        logger.debug(f"Could not log sampling summary: {e}")
 
     return idata, has_converged
 
@@ -239,9 +392,7 @@ def clusterize_gaussian_mixture(
     )
 
     # Sample model (1st pass)
-    idata, convergence_flag = sample_model(
-        model, None, None, force_cpu=force_cpu, **sample_args
-    )
+    idata, convergence_flag = sample_model(model, force_cpu=force_cpu, **sample_args)
     if not convergence_flag:
         idata_summary = az.summary(idata, var_names=["mu", "sigma"])
         logger.info(f"MCMC did not converge. Summary:\n{idata_summary}")
@@ -262,18 +413,6 @@ def clusterize_gaussian_mixture(
         priors, q_mrf = mrf_regularization(
             data_array_scaled, idata, priors, x_pos, y_pos, **mrf_kwargs
         )
-        # try:
-        #     fig, _ = plot_spatial_priors(df_input, prior_mrf, img=img)
-        #     fig.savefig(
-        #         output_dir
-        #         / f"{base_name}_mrf_priors_neig{mrf_kwargs['n_neighbors']}_ls{mrf_kwargs['length_scale']}_beta{mrf_kwargs['beta']}.jpg",
-        #         dpi=150,
-        #         bbox_inches="tight",
-        #     )
-        #     plt.close(fig)
-        # except Exception as exc:
-        #     logger.warning(f"Could not plot MRF priors: {exc}")
-
         if second_pass.lower() == "skip":
             logger.info(
                 "Skipping re-sampling after MRF regularization. Using pre-sampled MCMC posteriors."
@@ -307,10 +446,8 @@ def clusterize_gaussian_mixture(
             with model:
                 idata, convergence_flag = sample_model(
                     model,
-                    None,
-                    None,
+                    force_cpu=True,  # Force CPU for second pass to avoid GPU memory issues with MRF regularization
                     initvals=initvals,
-                    force_cpu=force_cpu,
                     **sp2_args,
                 )
             logger.info("Second pass MCMC clustering completed.")
