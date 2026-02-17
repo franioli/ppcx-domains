@@ -172,10 +172,11 @@ class AnomalyDetectionConfig:
     run_anomaly_detection: bool = False
     target_sector: str = "A"
     prior_percentile_threshold: float = 90
+    variables_names: list[str] = field(default_factory=lambda: ["V"])
     model_options: GaussianMixtureModelConfig = field(
         default_factory=lambda: GaussianMixtureModelConfig(
-            mu_params={"mu": 0, "sigma": 4},
-            sigma_params={"sigma": 2},
+            mu_params={"mu": 0, "sigma": 2},
+            sigma_params={"sigma": 1},
         )
     )
     sample_options: McmcSampleOptions = field(
@@ -185,7 +186,7 @@ class AnomalyDetectionConfig:
     )
     mrf_options: MrfOptions = field(
         default_factory=lambda: MrfOptions(
-            n_neighbors=8, length_scale=50, beta=1.0, n_iter=5
+            n_neighbors=8, length_scale=50, beta=3.0, n_iter=5
         )
     )
 

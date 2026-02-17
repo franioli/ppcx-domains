@@ -18,8 +18,8 @@ data:
   days_before_to_include: 0 # Number of days before the reference date to include in the analysis. 
   days_after_to_include: 0 # Number of days after the reference date to include in the analysis.
 
-  dt_min: 70  # Minimum time difference between images in hours. Used both for files and database sources.
-  dt_max: 100  # Maximum time difference between images in hours. Used both for files and database sources.
+  dt_min: 24  # Minimum time difference between images in hours. Used both for files and database sources. 70
+  dt_max: 120  # Maximum time difference between images in hours. Used both for files and database sources. 100
 
   # Priors and ROI
   sector_prior_path: "data/${data.year}*.zip" # Path to CVAT ZIP file containing sector prior polygons (and optionally ROI polygon)
@@ -83,7 +83,7 @@ mcmc:
     # - Low (4-6): Local influence only, better for small sharp features.
     n_neighbors: 16
 
-      # Spatial Decay: How influence drops with physical distance.
+    # Spatial Decay: How influence drops with physical distance.
     # - Increase: Distant neighbors bridge gaps (good for sparse data).
     # - Decrease: Only immediate vicinity exerts influence.
     length_scale: 200
@@ -139,16 +139,6 @@ postprocessing:
     #   C: "#f1ee30"      # Yellow
     #   D: "#5fb61c"      # Green
 
-anomaly_detection:
-  run_anomaly_detection: true
-  target_sector: "A" # Sector to analyze for anomalies (e.g., "A")
-  prior_percentile_threshold: 90 # Percentile threshold for velocity-based priors (e.g., 90 means points above the 90th percentile of velocity are more likely to be anomalies)
-  mrf_options: # MRF settings specific for anomaly detection (can be more aggressive to capture small anomalous features)
-    n_neighbors: 8
-    length_scale: 50
-    beta: 1.0
-    n_iter: 20
-
 plotting:
   default_discrete_cmap: "tab10"  # Colormap for discrete sector colors when not specified
   default_continuous_cmap: "OrRd"  # Colormap for continuous data plotting (e.g., velocity)
@@ -156,6 +146,27 @@ plotting:
     cmap: "OrRd"
     vmin: 0
     vmax: 15
+
+anomaly_detection:
+  run_anomaly_detection: true
+  target_sector: "A" # Sector to analyze for anomalies (e.g., "A")
+  prior_percentile_threshold: 98 # Percentile threshold for velocity-based priors (e.g., 90 means points above the 90th percentile of velocity are more likely to be anomalies)
+  variables_names: ["V", "u"] # The feature vector used for clustering (Velocity)
+  model_options:
+    mu_params:
+      mu: 0
+      sigma: 10
+    sigma_params:
+      sigma: 0.5
+  sample_options:
+    target_accept: 0.95
+    draws: 4000
+    tune: 2000
+  mrf_options: # MRF settings specific for anomaly detection (can be more aggressive to capture small anomalous features)
+    n_neighbors: 12
+    length_scale: 50
+    beta: 4.0
+    n_iter: 20
 
 # Database configuration
 database:

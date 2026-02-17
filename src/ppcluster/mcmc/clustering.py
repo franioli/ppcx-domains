@@ -153,6 +153,11 @@ def sample_model(
         logger.debug("Could not compute R-hat (possibly single chain).")
         pass
 
+    logger.debug(f"Sampling summary:\n{az.summary(idata, var_names=['mu', 'sigma'])}")
+    logger.info(
+        f"Mcmc sampling completed in {idata.constant_data.sampling_time:.2f} seconds."
+    )
+
     return idata, has_converged
 
 
@@ -386,6 +391,23 @@ def save_sampling_summary(
             bbox_inches="tight",
         )
         plt.close(fig)
+
+    if (
+        make_plots
+        and df_input is not None
+        and idata is not None
+        and "idata.constant_data.prior_w" in idata.constant_data
+    ):
+        fig, ax = plot_spatial_priors(
+            df=df_input,
+            prior_probs=idata.constant_data.prior_w.data,
+            img=img,
+        )
+        fig.savefig(
+            output_dir / f"{base_name}_spatial_priors.jpg",
+            dpi=150,
+            bbox_inches="tight",
+        )
 
 
 # --- Multiscale clustering aggregation ---

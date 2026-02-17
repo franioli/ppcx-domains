@@ -1,5 +1,6 @@
 import argparse
 import logging
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,7 @@ from ppcluster.mcmc.clustering import (
     clusterize_gaussian_mixture,
     save_sampling_summary,
 )
+from ppcluster.mcmc.priors import plot_spatial_priors
 from ppcluster.preprocessing import (
     apply_2d_gaussian_filter,
     apply_dic_filters,
@@ -203,6 +205,29 @@ def run_mcmc_clustering(
         img=img,
     )
 
+    # Plot spatial priors before and after MRF regularization to visualize the effect of the MRF on the spatial distribution of cluster probabilities.
+    # TODO: move this plotting logic inside the save_sampling_summary function
+    fig, _ = plot_spatial_priors(
+        df=dic_df,
+        prior_probs=prior_probs_array,
+        img=img,
+    )
+    fig.savefig(
+        output_dir / f"{base_name}_spatial_priors_beforeMRF.jpg",
+        dpi=150,
+        bbox_inches="tight",
+    )
+    fig, _ = plot_spatial_priors(
+        df=dic_df,
+        prior_probs=result.idata.constant_data.prior_w.data,
+        img=img,
+    )
+    fig.savefig(
+        output_dir / f"{base_name}_spatial_priors_afterMRF.jpg",
+        dpi=150,
+        bbox_inches="tight",
+    )
+
     return result, scaler
 
 
@@ -305,7 +330,6 @@ def process_clustering_results(
     base_name: str,
     config: DictConfig | ListConfig,
     img: Any = None,
-    save_summary_figure: bool = True,
 ) -> Any:
     """
     Vectorize clusters, clean geometries, assign labels, compute stats, and save results.
@@ -375,7 +399,7 @@ def process_clustering_results(
     )
 
     # 6. Plotting
-    if save_summary_figure and img is not None:
+    if img is not None:
         sector_colors = get_sector_colors(
             sectors["sector"].tolist(),
             colormap=config.plotting.default_discrete_cmap,
@@ -401,21 +425,6 @@ def process_clustering_results(
         )
         fig.savefig(output_dir / f"{base_name}_raw_vs_vec.jpg", dpi=150)
         plt.close(fig)
-
-        # Plot full summary
-        plot_sectors_summary(
-            sectors=sectors,
-            points_by_sector=pts_by_sector,
-            img=img,
-            colors=sector_colors,
-            output_dir=output_dir,
-            base_name=base_name,
-            unit="px",
-            quiver_kwargs=config.plotting.quiver,
-            figsize=(20, 10),
-            dpi=300,
-            save_svg=True,
-        )
 
     return sectors, pts_by_sector
 
@@ -464,15 +473,15 @@ def run_anomaly_detection(
     # Initialize priors: High V points get high probability for Class 1
     for i, v in enumerate(v_data):
         if v > threshold:
-            prior_probs[i] = [0.3, 0.7]
+            prior_probs[i] = [0.2, 0.8]
         else:
-            prior_probs[i] = [0.7, 0.3]
+            prior_probs[i] = [0.8, 0.2]
 
     # 3. Preprocess Features
     # Recalculate scaler specifically for this subset
     data_array, scaler, _, _ = preprocess_features(
         df_input=df_sub,
-        variables_names=config.preprocessing.variables_names,
+        variables_names=anomaly_config.variables_names,
         # We might want strict raw velocity here, or re-use transforms
         transform_velocity="none",
     )
@@ -508,6 +517,29 @@ def run_anomaly_detection(
         posterior_probs=result.posterior_probs,
         scaler=scaler,
         img=img,
+    )
+
+    # 6. Plot spatial priors for the anomaly detection step (before-after MRF)
+    fig, ax = plot_spatial_priors(
+        df=df_sub,
+        prior_probs=prior_probs,
+        img=img,
+    )
+    fig.savefig(
+        output_dir / f"{anomaly_base_name}_spatial_priors_beforeMRF.jpg",
+        dpi=150,
+        bbox_inches="tight",
+    )
+
+    fig, ax = plot_spatial_priors(
+        df=df_sub,
+        prior_probs=result.idata.constant_data.prior_w.data,
+        img=img,
+    )
+    fig.savefig(
+        output_dir / f"{anomaly_base_name}_spatial_priors_afterMRF.jpg",
+        dpi=150,
+        bbox_inches="tight",
     )
 
     # === MANUAL POST-PROCESSING FOR ANOMALY IDENTIFICATION ===
@@ -560,10 +592,6 @@ def run_anomaly_detection(
                     "v_max": anomaly_df["V"].max(),
                 }
             )
-
-        # Smooth the anomaly geometry slightly to make it more visually coherent, but keep it tight
-        anomaly_polys = smoothify(anomaly_polys)
-
     else:
         logger.warning(
             f"Anomaly cluster too small ({len(anomaly_df)} points). Ignored."
@@ -598,6 +626,12 @@ def run_anomaly_detection(
         gdf_refined = gpd.GeoDataFrame(
             refined_sectors_list, crs=None
         )  # Set CRS if known
+
+        # Smooth the anomaly geometry slightly to make it more visually coherent, but keep it tight
+        gdf_refined = smoothify(
+            gdf_refined, merge_multipolygons=False, merge_collection=False
+        )
+
         gdf_refined.to_file(
             output_dir / f"{anomaly_base_name}_vector.geojson",
             driver="GeoJSON",
@@ -869,7 +903,6 @@ def run_pipeline(config: DictConfig | ListConfig):
         base_name=base_name,
         config=config,
         img=img,
-        save_summary_figure=True,
     )
 
     # ==== SAVE FINAL RESULTS ==== #
@@ -888,6 +921,28 @@ def run_pipeline(config: DictConfig | ListConfig):
         "pts_by_sector": pts_by_sector,
     }
     joblib.dump(bundle, output_dir / f"{base_name}_results.joblib")
+
+    # Plot full summary
+    sector_colors = get_sector_colors(
+        sectors["sector"].tolist(),
+        colormap=config.plotting.default_discrete_cmap,
+    )
+    plot_sectors_summary(
+        sectors=sectors,
+        points_by_sector=pts_by_sector,
+        img=img,
+        colors=sector_colors,
+        output_dir=output_dir,
+        base_name=base_name,
+        unit="px",
+        quiver_kwargs=config.plotting.quiver,
+        figsize=(20, 10),
+        dpi=300,
+        save_svg=True,
+    )
+    logger.info(
+        f"Final summary figure saved to {output_dir / f'{base_name}_kinematic_sectors_summary.jpg'}"
+    )
     timer.update("post-processing")
 
     # === OPTIONAL: SECTOR REFINEMENT (e.g. Sector A sub-clustering) ===
@@ -912,6 +967,88 @@ def run_pipeline(config: DictConfig | ListConfig):
     timer.update("anomaly_detection")
 
     # Make a final summary figure comparing all results ("Bollettino style")
+    # For the moment just copy the YYYY-MM-DAY_kinematic_sectors_summary.png figure to "kinematic_sectors" dir and the anomaly detection figure (ANOMALY_DIR/YYYY-MM-DAY_sectorA_anomaly_mcmc_results.jpg) if exists. In the future we can make a more complex summary figure with all the relevant info.
+    # TODO: make a unified summary figure and remove hardcoded copying
+    kinematic_sectors_dir = output_base_dir / "kinematic_sectors"
+    kinematic_sectors_dir.mkdir(exist_ok=True)
+    summary_fig_path = output_dir / f"{base_name}_kinematic_sectors_summary.png"
+    if summary_fig_path.is_file():
+        shutil.copy(
+            summary_fig_path,
+            kinematic_sectors_dir / f"{base_name}_kinematic_sectors_summary.png",
+        )
+    else:
+        logger.warning(
+            f"Summary figure not found at {summary_fig_path}. Skipping copy."
+        )
+
+    if config.anomaly_detection.run_anomaly_detection:
+        anomaly_dir = (
+            output_base_dir / f"anomaly_{config.anomaly_detection.target_sector}"
+        )
+        anomaly_dir.mkdir(exist_ok=True)
+        anomaly_fig_path = (
+            output_dir
+            / f"anomaly_{config.anomaly_detection.target_sector}"
+            / f"{base_name}_sector{config.anomaly_detection.target_sector}_anomaly_mcmc_results.jpg"
+        )
+        if anomaly_fig_path.is_file():
+            shutil.copy(
+                anomaly_fig_path,
+                anomaly_dir
+                / f"{base_name}_sector{config.anomaly_detection.target_sector}_anomaly_mcmc_results.jpg",
+            )
+        else:
+            logger.warning(
+                f"Anomaly detection figure not found at {anomaly_fig_path}. Skipping copy."
+            )
+
+        # Concatenate the anomaly vector to the sector geodataframe for a final summary plot
+        try:
+            file = (
+                output_dir
+                / f"anomaly_{config.anomaly_detection.target_sector}"
+                / f"{base_name}_sector{config.anomaly_detection.target_sector}_anomaly_vector.geojson"
+            )
+            anomaly_gdf = gpd.GeoDataFrame.from_file(file)
+            anomaly_gdf = anomaly_gdf.loc[
+                anomaly_gdf["sector"]
+                == f"{config.anomaly_detection.target_sector}_anomaly"
+            ]
+            # rename the anomaly with Z to make it visually distinct in the plot
+            anomaly_gdf["sector"] = anomaly_gdf["sector"].str.replace(
+                f"{config.anomaly_detection.target_sector}_anomaly",
+                "Z",
+            )
+            sector_with_anomaly = gpd.GeoDataFrame(
+                pd.concat(
+                    [sectors, anomaly_gdf],
+                    ignore_index=True,
+                ),
+                crs=sectors.crs,
+            )
+
+            # Add a specific color for the anomaly sector (Z)
+            sector_anomaly_colors = sector_colors.copy()
+            sector_anomaly_colors["Z"] = "#d3ff0d"
+            plot_sectors_summary(
+                sectors=sector_with_anomaly,
+                points_by_sector=pts_by_sector,
+                img=img,
+                colors=sector_anomaly_colors,
+                output_dir=anomaly_dir,
+                base_name=f"{base_name}_sector{config.anomaly_detection.target_sector}_anomaly_vector.geojson",
+                unit="px",
+                quiver_kwargs=config.plotting.quiver,
+                figsize=(20, 10),
+                dpi=150,
+                save_svg=False,
+            )
+        except Exception as e:
+            logger.error(f"Failed to plot summary with anomaly: {e}", exc_info=True)
+    logger.info(
+        f"Final summary figure saved to {output_dir / f'{base_name}_kinematic_sectors_summary.jpg'}"
+    )
 
     logger.info("Processing complete.")
     timer.print()
