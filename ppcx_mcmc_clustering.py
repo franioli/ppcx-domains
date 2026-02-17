@@ -453,7 +453,16 @@ def run_anomaly_detection(
         logger.warning(f"Sector {target_sector} not found. Skipping refinement.")
         return
     sector_poly = sector_row.geometry.iloc[0]
-    df_sub = filter_dataframe_by_polygons(dic_df, polygon=sector_poly)
+
+    # Create a buffer to include frontier points that might have been smoothed out
+    # 64px is standard grid spacing, so 100px ensures we capture immediate neighbors
+    buffer_dist = 100.0
+    logger.info(
+        f"Applying {buffer_dist}px buffer to Sector {target_sector} for anomaly search."
+    )
+    sector_poly_buffered = sector_poly.buffer(buffer_dist)
+
+    df_sub = filter_dataframe_by_polygons(dic_df, polygon=sector_poly_buffered)
     if len(df_sub) < 50:  # Arbitrary minimum points
         logger.warning(
             f"Not enough points in Sector {target_sector} ({len(df_sub)}) for refinement."
@@ -969,7 +978,7 @@ def run_pipeline(config: DictConfig | ListConfig):
         unit="px",
         quiver_kwargs=config.plotting.quiver,
         figsize=(20, 10),
-        dpi=300,
+        dpi=150,
         save_svg=True,
     )
     logger.info(
