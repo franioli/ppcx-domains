@@ -2,10 +2,10 @@
 set -u
 
 # Simple sequential runner for clusterize_batch.py
-YEARS=(2015 2016 2018 2019 2020 2022 2023 2024)
+YEARS=(2015 2016 2018 2019 2020)
 START_MM_DD="06-01"
 END_MM_DD="10-30"
-JOBS=3
+JOBS=1
 
 PYTHON=${PYTHON:-python}
 SCRIPT=${SCRIPT:-clusterize_batch.py}

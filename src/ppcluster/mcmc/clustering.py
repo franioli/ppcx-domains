@@ -334,6 +334,7 @@ def clusterize_gaussian_mixture(
     sectors: dict[str, Any],
     mu_params: dict | None = None,
     sigma_params: dict | None = None,
+    enforce_ordered_means: bool = False,
     sample_args: dict | None = None,
     apply_mrf_regularization: bool = False,
     x_pos: np.ndarray | None = None,
@@ -353,6 +354,7 @@ def clusterize_gaussian_mixture(
         sectors (dict): Dictionary of sector names to shapely Polygons.
         mu_params (dict, optional): Parameters for the mean of the mixture components. Default is None.
         sigma_params (dict, optional): Parameters for the standard deviation of the mixture components. Default is None.
+        enforce_ordered_means (bool, optional): Whether to enforce ordered means for velocity magnitude (feature 0). Default is False.
         sample_args (dict, optional): Arguments for PyMC sampling. Default is None.
         apply_mrf_regularization (bool, optional): Whether to apply MRF regularization to spatial priors. Default is False.
         mrf_kwargs (dict, optional): Arguments for MRF regularization. Default is None.
@@ -403,6 +405,7 @@ def clusterize_gaussian_mixture(
         sectors,
         mu_params=mu_params,
         sigma_params=sigma_params,
+        enforce_ordered_means=enforce_ordered_means,
     )
 
     # Sample model (1st pass)
@@ -434,6 +437,7 @@ def clusterize_gaussian_mixture(
             posterior_probs = q_mrf
             cluster_pred = np.argmax(posterior_probs, axis=1)
             uncertainty = 1.0 - posterior_probs.max(axis=1)
+            
             return ClusteringResult(
                 idata=idata,
                 convergence_flag=convergence_flag,

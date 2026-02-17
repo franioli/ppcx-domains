@@ -1,6 +1,7 @@
 import logging
 from typing import Any
 
+import arviz as az
 import numpy as np
 import pymc as pm
 from pymc import math as pm_math
@@ -21,65 +22,149 @@ def build_marginalized_mixture_model(
     data: np.ndarray,
     prior_probs: np.ndarray,
     sectors: dict[str, Any],
-    mu_params: dict[str, Any] | None = None,
-    sigma_params: dict[str, Any] | None = None,
-):
+    mu_params: dict[str, Any],
+    sigma_params: dict[str, Any],
+    enforce_ordered_means: bool = False,
+) -> pm.Model:
     """
-    Build a marginalized mixture PyMC model (no discrete z).
-    Returns a PyMC model object (not sampled).
+    Build a marginalized Gaussian Mixture Model (GMM) in PyMC.
 
-    Works with both CPU (default PyMC sampler) and GPU/JAX (numpyro sampler).
-    The JAX/CUDA compilation is handled at sampling time by pm.sample(nuts_sampler="numpyro"),
-    so the model definition should use only numpy and PyTensor/pm_math ops.
+    This model marginalizes out the discrete cluster assignment variable 'z',
+    treating the total log-probability as a `pm.Potential`. This formulation
+    is often more robust for NUTS sampling than discrete latent variables.
+    It supports JAX/NumPyro sampling (GPU acceleration).
+
+    Args:
+        data (np.ndarray):
+            Observed data array of shape (n_obs, n_features).
+            Usually scaled (e.g., StandardScaler).
+        prior_probs (np.ndarray):
+            Prior probabilities for each point belonging to each cluster,
+            based on spatial location. Shape (n_obs, n_clusters).
+        sectors (dict[str, Any]):
+            Dictionary of sectors, used to determine the number of clusters (k).
+        mu_params (dict[str, Any]):
+            Hyperparameters for the means priors (e.g., {'mu': 0, 'sigma': 1}).
+        sigma_params (dict[str, Any]):
+            Hyperparameters for the standard deviation priors (e.g., {'sigma': 1}).
+        enforce_ordered_means (bool, optional):
+            If True, enforces that the means of the first feature (index 0) are ordered strictly (mu[0] < mu[1] < ... < mu[k]).
+            This is critical for Anomaly Detection (Base < Anomaly) to prevent
+            label switching, but likely harmful for generic spatial sector clustering. Defaults to False.
+
+    Returns:
+        pm.Model: A PyMC model object (compiled, but not sampled).
     """
     n_data = data.shape[0]
     n_features = data.shape[1]
     k = len(sectors)
 
+    # Coordinates help PyMC organize output (InferenceData) dimensions
     model = pm.Model(
         coords={"obs": range(n_data), "cluster": range(k), "feature": range(n_features)}
     )
-
-    # Parse mu and sigma parameters
-    if mu_params is None:
-        mu_params = {"mu": 0, "sigma": 1}
-    if sigma_params is None:
-        sigma_params = {"sigma": 1}
-
     with model:
+        # ------------------------------------------------------------------
+        # 1. Data Containers
+        # ------------------------------------------------------------------
+        # Using pm.Data allow us to change data values later (e.g. for
+        # re-sampling) without recompiling the JAX computation graph.
         obs_data = pm.Data("obs_data", data, dims=("obs", "feature"))
+
+        # Prior weights (spatial probabilities) -> Log-domain
+        # Shape: (n_obs, n_clusters)
         prior_w = pm.Data(
             "prior_w", prior_probs.reshape(n_data, k), dims=("obs", "cluster")
         )
+        log_w = pm_math.log(prior_w + 1e-12)  # Add epsilon to prevent log(0)
 
-        mu = pm.Normal(
-            "mu", mu_params["mu"], mu_params["sigma"], dims=("cluster", "feature")
-        )
+        # ------------------------------------------------------------------
+        # 2. Priors for Cluster Parameters (Mu, Sigma)
+        # ------------------------------------------------------------------
+
+        # -- Parameters for the FIRST feature (assumed to be Velocity 'V') --
+        if enforce_ordered_means:
+            # Enforce mu[0] < mu[1] < ... for feature 0.
+            # This breaks symmetry and prevents label switching in anomaly detection.
+            # We use an ordered transform on the first feature's means.
+            mu_0 = pm.Normal(
+                "mu_feat0",
+                mu=mu_params["mu"],
+                sigma=mu_params["sigma"],
+                shape=(k,),
+                transform=pm.distributions.transforms.ordered,
+                # Initialization helper: spread means out to help constraint satisfaction
+                initval=np.linspace(mu_params["mu"] - 1, mu_params["mu"] + 1, k),
+            )
+        else:
+            # Standard independent means for feature 0
+            mu_0 = pm.Normal(
+                "mu_feat0",
+                mu=mu_params["mu"],
+                sigma=mu_params["sigma"],
+                shape=(k,),
+            )
+
+        # -- Handle remaining features (if any) --
+        if n_features > 1:
+            # Features 1..N are always independent (no ordering constraint)
+            mu_rest = pm.Normal(
+                "mu_rest",
+                mu=mu_params["mu"],
+                sigma=mu_params["sigma"],
+                shape=(k, n_features - 1),
+            )
+            # Concatenate to form full mean matrix: (k, 1) + (k, n-1) -> (k, n)
+            mu = pm.Deterministic(
+                "mu",
+                pm_math.concatenate([mu_0[:, None], mu_rest], axis=1),
+                dims=("cluster", "feature"),
+            )
+        else:
+            # Single feature case: (k,) -> (k, 1)
+            mu = pm.Deterministic("mu", mu_0[:, None], dims=("cluster", "feature"))
+
+        # -- Standard Deviations (HalfNormal) --
+        # We assume diagonal covariance (features are independent given cluster)
         sigma = pm.HalfNormal(
             "sigma", sigma_params["sigma"], dims=("cluster", "feature")
         )
 
-        # Log weights with small constant to avoid log(0)
-        # log_w = pm.Deterministic(
-        #     "log_w", pm_math.log(prior_w + 1e-12), dims=("obs", "cluster")
-        # )
-        # Compute log weights inline (not stored in trace)
-        log_w = pm_math.log(prior_w + 1e-12)
+        # ------------------------------------------------------------------
+        # 3. Likelihood Construction (Marginalized)
+        # ------------------------------------------------------------------
+        # We implement the log-likelihood manually to ensure shape broadcasting works correctly across (obs, cluster, feature) dimensions.
 
-        # Per-cluster log-likelihood
+        # Standardize data relative to each cluster mean/sigma
+        # Shape: (n_obs, n_clusters, n_features)
         x_centered = (obs_data[:, None, :] - mu[None, :, :]) / sigma[None, :, :]
+
+        # Gaussian Log-Likelihood per feature
+        # -0.5 * (log(2pi) + 2*log(sigma) + z^2)
         logp_feat = -0.5 * (
             pm_math.log(2 * np.pi) + 2 * pm_math.log(sigma[None, :, :]) + x_centered**2
         )
-        logp_clusters = logp_feat.sum(axis=2)  # (obs, cluster)
 
-        # Mixture log likelihood (marginalized over clusters)
-        log_mix = pm.logsumexp(logp_clusters + log_w, axis=1)  # (obs,)
+        # Sum log-probs across features (independent features assumption)
+        # Shape: (n_obs, n_clusters)
+        logp_clusters = logp_feat.sum(axis=2)
 
-        # Total logp as Potential
+        # ------------------------------------------------------------------
+        # 4. Mixture Log-Likelihood
+        # ------------------------------------------------------------------
+        # Compute log( sum( w_k * N(x | mu_k, sigma_k) ) )
+        # logsumexp trick is used for numerical stability:
+        # log(sum(exp(log_w + logp_cluster)))
+        log_mix = pm.logsumexp(logp_clusters + log_w, axis=1)  # Shape: (n_obs,)
+
+        # Add total log-likelihood to model as a Potential
+        # (This is equivalent to observed=... but works effectively for marginalized models)
         pm.Potential("mixture_logp", log_mix.sum())
 
-    logger.info("Marginalized mixture model (un-sampled) created.")
+    logger.info(
+        f"Marginalized mixture model created. Shape: (N={n_data}, K={k}, D={n_features}). "
+        f"Ordered Means: {enforce_ordered_means}"
+    )
     return model
 
 
@@ -89,8 +174,24 @@ def build_discrete_marginalized_mixture_model(
     sectors: dict[str, Any],
 ) -> pm.Model:
     """
-    Simple marginalized mixture model with discrete cluster assignments.
-    The discrete assigments require Metropolis sampling (not NUTS) that is not efficient, but it can be used for testing. Prefer the marginalized model if possible.
+    Build a mixture model with discrete latent variables for cluster assignment.
+
+    WARNING: This model uses `pm.Categorical` for assignments (z). NUTS samplers
+    (including JAX/NumPyro) generally struggle with discrete parameters because
+    they cannot compute gradients. This function is provided for legacy comparison
+    or for use with Gibbs/Metropolis samplers, but `build_marginalized_mixture_model`
+    is strongly recommended for efficiency.
+
+    Args:
+        data (np.ndarray):
+            Observed data array of shape (n_obs, n_features).
+        prior_probs (np.ndarray):
+            Prior probabilities for cluster assignments. Shape (n_obs, n_clusters).
+        sectors (dict[str, Any]):
+            Dictionary defining the sectors/clusters.
+
+    Returns:
+        pm.Model: A PyMC model with discrete latent variables.
     """
 
     n_features = data.shape[1]
@@ -109,9 +210,15 @@ def build_discrete_marginalized_mixture_model(
         # Cluster assignments with spatial priors
         z = pm.Categorical("z", p=prior_probs, dims="obs")
 
-        # Likelihood: each point comes from its assigned cluster
-        observations = pm.Normal(
-            "x_obs", mu=mu[z], sigma=sigma[z], observed=data, dims=("obs", "feature")
+        # Likelihood
+        # Since 'z' is discrete, we index into mu/sigma using z.
+        # This indexing breaks gradients for NUTS.
+        pm.Normal(
+            "obs",
+            mu=mu[z],  # Select mean based on assignment z
+            sigma=sigma[z],  # Select sigma based on assignment z
+            observed=data,
+            dims=("obs", "feature"),
         )
 
         # Sample from the prior predictive distribution
@@ -141,101 +248,211 @@ def build_discrete_marginalized_mixture_model(
 
 
 def mrf_regularization(
-    data_scaled,
-    idata,
-    prior_init,
-    x,
-    y,
+    data_scaled: np.ndarray,
+    idata: az.InferenceData,
+    prior_init: np.ndarray,
+    x: np.ndarray,
+    y: np.ndarray,
     *,
-    n_neighbors=8,
-    length_scale=None,
-    beta=2.0,
-    n_iter=5,
-):
+    n_neighbors: int = 8,
+    length_scale: float | None = None,
+    beta: float = 2.0,
+    n_iter: int = 5,
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Mean-field Potts smoothing of priors:
-      log π_i <- log π_i + β ∑_{j∈N(i)} w_ij q_j
-      q_i ∝ exp(loglik_i + log π_i)
-    Uses posterior means of μ/σ from idata (scaled space).
-    Returns prior_final, q_final.
+    Apply Mean-Field approximation for MRF (Markov Random Field) spatial smoothing.
+
+    This function refines the spatial prior probabilities based on the clustering
+    results and the local neighborhood structure. It encourages spatially
+    contiguous clusters by inspecting the posterior probabilities of neighbors.
+
+    The update rule approximates a Potts model:
+      log π_i <- log(prior_i) + β * ∑_{j ∈ Neighbors(i)} w_ij * q_j
+
+    Where:
+      - π_i: Updated spatial prior for point i.
+      - q_j: Current responsibility (probability of cluster assignment) of neighbor j.
+      - w_ij: Spatial weight (distance-based or binary) between i and j.
+      - β (beta): Strength of the smoothing (inverse temperature).
+
+    Args:
+        data_scaled (np.ndarray):
+            Feature data (N, D), scaled (e.g., StandardScaler).
+        idata (az.InferenceData):
+            MCMC results containing posterior samples for 'mu' and 'sigma'.
+            Used to compute the data likelihood term.
+        prior_init (np.ndarray):
+            Initial spatial priors (N, K).
+        x (np.ndarray): X coordinates of points (N,).
+        y (np.ndarray): Y coordinates of points (N,).
+        n_neighbors (int, optional):
+            Number of nearest neighbors to construct the spatial graph. Defaults to 8.
+        length_scale (float | None, optional):
+            Length scale for Gaussian kernel weights (exp(-d^2 / 2l^2)).
+            If None, uses binary weights (1 for neighbors, 0 otherwise). Defaults to None.
+        beta (float, optional):
+            Smoothing strength. Higher values enforce stronger spatial continuity. Defaults to 2.0.
+        n_iter (int, optional):
+            Number of Mean-Field iteration steps. Defaults to 5.
+
+    Returns:
+        tuple[np.ndarray, np.ndarray]:
+            - pi (N, K): The spatially smoothed prior probabilities.
+            - q (N, K): The final responsibilities (posterior probabilities) after smoothing.
     """
-    # posterior means (chains,draws,k,d) -> (k,d)
+    # 1. Extract cluster parameters (mu, sigma) from MCMC posterior
+    # We use the mean of the posterior as a point estimate for the likelihood calculation
+    # Shape: (chains, draws, k, d) -> mean -> (k, d)
     mu = idata.posterior["mu"].mean(dim=["chain", "draw"]).values
     sigma = idata.posterior["sigma"].mean(dim=["chain", "draw"]).values
-    if mu.ndim == 1:  # (K,) -> (K,1)
+
+    # Handle single cluster case dimensions: (K,) -> (K, 1)
+    if mu.ndim == 1:
         mu = mu[:, None]
         sigma = sigma[:, None]
 
+    # 2. Build Spatial Graph (Adjacency Matrix W)
     W = build_knn_graph(x, y, n_neighbors=n_neighbors, length_scale=length_scale)
+
+    # 3. Initialize Iterative Smoothing
     pi = prior_init.copy()
+
+    # Initial responsibilities 'q' based on Data Likelihood * Initial Prior
     q = _responsibilities(data_scaled, mu, sigma, pi)
 
-    for _ in range(n_iter):
+    # 4. Mean-Field Iterations
+    for i in range(n_iter):
+        # Update priors 'pi' based on neighbors' responsibilities 'q'
         pi = _mrf_update(pi, q, W, beta)
+
+        # Update responsibilities 'q' based on new priors 'pi'
         q = _responsibilities(data_scaled, mu, sigma, pi)
 
     return pi, q
 
 
-def build_knn_graph(x, y, n_neighbors=8, length_scale=None):
+def build_knn_graph(
+    x: np.ndarray,
+    y: np.ndarray,
+    n_neighbors: int = 8,
+    length_scale: float | None = None,
+) -> csr_matrix:
     """
-    Build symmetric kNN affinity W (csr). If length_scale is given (pixels),
-    apply Gaussian weights exp(-d^2/(2*ls^2)); else use unit weights.
+    Build a symmetric k-Nearest Neighbors (kNN) affinity matrix.
+
+    Args:
+        x (np.ndarray): X coordinates.
+        y (np.ndarray): Y coordinates.
+        n_neighbors (int): Number of neighbors per point.
+        length_scale (float | None):
+            If provided, weights are Gaussian: w = exp(-dist^2 / (2*scale^2)).
+            If None, weights are binary (1.0).
+
+    Returns:
+        csr_matrix: Sparse symmetric adjacency matrix (N, N).
     """
     pts = np.column_stack([x, y]).astype(float)
-    nbrs = NearestNeighbors(n_neighbors=n_neighbors + 1).fit(pts)
-    dists, idx = nbrs.kneighbors(pts, return_distance=True)  # (N, k+1), col0=self
 
+    # Find k+1 neighbors because the first neighbor is the point itself (distance 0)
+    nbrs = NearestNeighbors(n_neighbors=n_neighbors + 1).fit(pts)
+    dists, idx = nbrs.kneighbors(pts, return_distance=True)
+
+    # Prepare sparse matrix data (exclude self-loop at index 0)
     N = pts.shape[0]
+    # Rows: [0, 0, ..., 1, 1, ...]
     rows = np.repeat(np.arange(N), n_neighbors)
+    # Cols: Flattened neighbor indices
     cols = idx[:, 1:].ravel()
+    # Dists: Flattened neighbor distances
     d = dists[:, 1:].ravel()
 
+    # Compute weights
     if length_scale is None or length_scale <= 0:
         w = np.ones_like(d)
     else:
+        # Gaussian kernel decaying with distance
         w = np.exp(-(d**2) / (2.0 * (length_scale**2)))
 
+    # Construct sparse matrix
     W = csr_matrix((w, (rows, cols)), shape=(N, N))
+
+    # Symmetrize the graph: w_ij = max(w_ij, w_ji)
+    # This ensures if i is a neighbor of j, j is effectively linked to i.
     return W.maximum(W.transpose())
 
 
-def _gaussian_loglik(X, mu, sigma):
+def _gaussian_loglik(X: np.ndarray, mu: np.ndarray, sigma: np.ndarray) -> np.ndarray:
     """
-    Log-likelihood under diagonal Gaussian, X:(N,D), mu/sigma:(K,D) -> (N,K)
+    Compute log-likelihood of data X under a diagonal Gaussian model.
+
+    Args:
+        X: Data (N, D)
+        mu: Means (K, D)
+        sigma: Standard deviations (K, D)
+
+    Returns:
+        np.ndarray: Log-likelihoods (N, K)
     """
+    # Broadcasting:
+    # X: (N, 1, D)
+    # mu: (1, K, D)
+    # Result xc: (N, K, D) - Z-scores
     xc = (X[:, None, :] - mu[None, :, :]) / (sigma[None, :, :] + EPS)
+
+    # Log PDF: -0.5 * (log(2pi) + 2*log(sigma) + z_score^2)
+    # Sum over feature dimension D (axis 2) assuming independence
     return -0.5 * (np.log(2 * np.pi) + 2 * np.log(sigma[None, :, :] + EPS) + xc**2).sum(
         axis=2
     )
 
 
-def _responsibilities(X, mu, sigma, prior_probs):
+def _responsibilities(
+    X: np.ndarray, mu: np.ndarray, sigma: np.ndarray, prior_probs: np.ndarray
+) -> np.ndarray:
+    """
+    Compute posterior cluster probabilities (responsibilities).
+
+    q(z=k | x) ∝ Likelihood(x | z=k) * Prior(z=k)
+    """
     # 1. Calculate Log-Likelihood of data given Gaussian parameters
-    # shape: (N, K) - for N points and K clusters
-    log_lik = _gaussian_loglik(X, mu, sigma)  # (N,K)
+    # shape: (N, K)
+    log_lik = _gaussian_loglik(X, mu, sigma)
 
     # 2. Add the Log-Prior probability (the spatial weight)
     # shape: (N, K)
-    log_prior = np.log(prior_probs + EPS)  # (N,K)
+    log_prior = np.log(prior_probs + EPS)
 
     # 3. Compute unnormalized log-posterior (logits)
     # log(Likelihood * Prior) = log(Likelihood) + log(Prior)
     logits = log_lik + log_prior
 
-    # Softmax calculation
+    # 4. Softmax (Numerical stability trick: subtract max)
     a = logits.max(axis=1, keepdims=True)
     q = np.exp(logits - a)
-    q /= q.sum(axis=1, keepdims=True)
+    q /= q.sum(axis=1, keepdims=True)  # Normalize to sum to 1
 
     return q
 
 
-def _mrf_update(prior_probs, q, W, beta):
-    # message term from neighbors: (N,K)
-    msg = W.dot(q)  # sparse @ dense
+def _mrf_update(
+    prior_probs: np.ndarray, q: np.ndarray, W: csr_matrix, beta: float
+) -> np.ndarray:
+    """
+    Update spatial priors based on neighbor responsibilities.
+
+    log π_new = log π_old + β * (AVG neighbors' q)
+    """
+    # Message passing: Sum of q from neighbors
+    # W (N,N) sparse dot q (N,K) dense -> msg (N,K)
+    msg = W.dot(q)
+
+    # Update step in log domain
+    # Existing Log Prior + Beta * Neighbor Influence
     logits = np.log(prior_probs + EPS) + beta * msg
+
+    # Softmax normalization to get valid probabilities
     a = logits.max(axis=1, keepdims=True)
     pi = np.exp(logits - a)
     pi /= pi.sum(axis=1, keepdims=True)
+
     return pi
