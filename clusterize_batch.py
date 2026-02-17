@@ -1,5 +1,6 @@
 import argparse
 import logging
+import os
 import random
 import subprocess
 import sys
@@ -15,8 +16,6 @@ logger = setup_logger(
     level=logging.INFO,
     name="ppcx",
     force=True,
-    # log_to_file=True,
-    # log_folder="logs",
     redirect_to_stdout=True,
 )
 
@@ -80,6 +79,18 @@ def parse_args():
         default=None,
         help="Timeout (seconds) for each run subprocess (default none).",
     )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Set the logging level (default: INFO).",
+    )
+    parser.add_argument(
+        "--log-folder",
+        default="logs",
+        help="Folder to store subprocess logs when running in parallel (default: logs).",
+    )
     return parser.parse_known_args()
 
 
@@ -89,6 +100,9 @@ def run_one_date(
     date: str,
     timeout=None,
     cleanup_on_failure=False,
+    capture_output=True,
+    log_to_file=False,
+    log_folder="logs",
     extra_args=None,
 ) -> bool:
     # Build command str
@@ -97,9 +111,35 @@ def run_one_date(
         cmd.extend(extra_args)
 
     # Run subprocess
-    logger.info(f"START {date}")
+    log_file = None
+    if log_to_file:
+        log_path = Path(log_folder)
+        log_path.mkdir(parents=True, exist_ok=True)
+        log_file = log_path / f"run_{date}.log"
+        logger.info(f"START {date} (logging to {log_file})")
+    else:
+        logger.info(f"START {date}")
+
+    # Ensure JAX in sub-processes doesn't hog all VRAM
+    env = os.environ.copy()
+    env["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if log_to_file and log_file is not None:
+            with open(log_file, "w") as f:
+                proc = subprocess.run(
+                    cmd,
+                    stdout=f,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    timeout=timeout,
+                    env=env,
+                )
+        else:
+            # Sequential mode: stream directly to terminal
+            proc = subprocess.run(
+                cmd, capture_output=False, text=True, timeout=timeout, env=env
+            )
 
         if proc.returncode == 0:
             logger.info(f"SUCCESS {date}")
@@ -241,6 +281,10 @@ if __name__ == "__main__":
     # parse arguments, including extra args for the clustering script
     args, extra_args = parse_args()
 
+    # Update logger level based on arguments
+    numeric_level = getattr(logging, args.log_level.upper(), None)
+    logger.setLevel(numeric_level)
+
     # build dates list
     if args.dates:
         dates = [d.strip() for d in args.dates.split(",") if d.strip()]
@@ -294,6 +338,8 @@ if __name__ == "__main__":
                 args.script_path,
                 d,
                 timeout=args.timeout,
+                log_to_file=True,
+                log_folder=args.log_folder,
                 extra_args=extra_args,
             )
             for d in tqdm(dates)
@@ -308,6 +354,7 @@ if __name__ == "__main__":
                 args.script_path,
                 d,
                 timeout=args.timeout,
+                log_to_file=False,
                 extra_args=extra_args,
             )
             results.append(ok)

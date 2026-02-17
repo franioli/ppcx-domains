@@ -105,7 +105,7 @@ mcmc:
   # - "skip": fastest, rely only on MRF priors, no re-sampling
   second_pass: "short"  # "skip" | "short" | "full"
   second_pass_sample_args:
-    draws: 1000
+    draws: 800
     tune: 200
     chains: 4
     cores: 4
@@ -151,7 +151,7 @@ anomaly_detection:
   run_anomaly_detection: true
   target_sector: "A" # Sector to analyze for anomalies (e.g., "A")
   prior_percentile_threshold: 98 # Percentile threshold for velocity-based priors (e.g., 90 means points above the 90th percentile of velocity are more likely to be anomalies)
-  variables_names: ["V", "u"] # The feature vector used for clustering (Velocity)
+  # variables_names: ["V", "u"] # TODO: This is hardcoded in the code, now we are using V and V_trans (direction)
   model_options:
     mu_params:
       mu: 0
