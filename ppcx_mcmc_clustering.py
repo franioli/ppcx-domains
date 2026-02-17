@@ -461,6 +461,29 @@ def run_anomaly_detection(
         return
     logger.info(f"Refining Sector {target_sector} with {len(df_sub)} points...")
 
+    # 1. Compute Median Flow Direction of the Background (Base)
+    # Use the median of u and v to find the dominant flow vector
+    u_med = df_sub["u"].median()
+    v_med = df_sub["v"].median()
+    flow_angle = np.arctan2(v_med, u_med)
+
+    # 2. Rotate velocities to align with flow
+    # Rotation matrix logic:
+    # V_long = u * cos(a) + v * sin(a)
+    # V_trans = -u * sin(a) + v * cos(a)
+    cos_a = np.cos(flow_angle)
+    sin_a = np.sin(flow_angle)
+
+    df_sub["V_long"] = df_sub["u"] * cos_a + df_sub["v"] * sin_a
+    df_sub["V_trans"] = -df_sub["u"] * sin_a + df_sub["v"] * cos_a
+
+    # 3. Select Features for Clustering
+    # We use Magnitude (V) to detect speed, and V_trans to detect directional anomalies.
+    # We usually don't need V_long if we have V, but V_long is cleaner than V because it allows negative values (noise).
+    # Let's use [V, V_trans] or [V_long, V_trans].
+    # [V, V_trans] is often best: V separates by speed, V_trans separates by direction.
+    refine_features = ["V", "V_trans"]
+
     # 2. Assign Velocity-Based Priors (Unsupervised initialization)
     # We assume 2 classes: 0=Background, 1=Fast/Anomaly
     v_data = df_sub["V"].to_numpy()
@@ -481,7 +504,7 @@ def run_anomaly_detection(
     # Recalculate scaler specifically for this subset
     data_array, scaler, _, _ = preprocess_features(
         df_input=df_sub,
-        variables_names=anomaly_config.variables_names,
+        variables_names=refine_features,
         # We might want strict raw velocity here, or re-use transforms
         transform_velocity="none",
     )
@@ -520,27 +543,31 @@ def run_anomaly_detection(
     )
 
     # 6. Plot spatial priors for the anomaly detection step (before-after MRF)
-    fig, ax = plot_spatial_priors(
-        df=df_sub,
-        prior_probs=prior_probs,
-        img=img,
-    )
-    fig.savefig(
-        output_dir / f"{anomaly_base_name}_spatial_priors_beforeMRF.jpg",
-        dpi=150,
-        bbox_inches="tight",
-    )
-
-    fig, ax = plot_spatial_priors(
-        df=df_sub,
-        prior_probs=result.idata.constant_data.prior_w.data,
-        img=img,
-    )
-    fig.savefig(
-        output_dir / f"{anomaly_base_name}_spatial_priors_afterMRF.jpg",
-        dpi=150,
-        bbox_inches="tight",
-    )
+    try:
+        fig, ax = plot_spatial_priors(
+            df=df_sub,
+            prior_probs=prior_probs,
+            img=img,
+        )
+        fig.savefig(
+            output_dir / f"{anomaly_base_name}_spatial_priors_beforeMRF.jpg",
+            dpi=150,
+            bbox_inches="tight",
+        )
+        plt.close(fig)
+        fig, ax = plot_spatial_priors(
+            df=df_sub,
+            prior_probs=result.idata.constant_data.prior_w.data,
+            img=img,
+        )
+        fig.savefig(
+            output_dir / f"{anomaly_base_name}_spatial_priors_afterMRF.jpg",
+            dpi=150,
+            bbox_inches="tight",
+        )
+        plt.close(fig)
+    except Exception as e:
+        logger.warning(f"Failed to plot spatial priors for anomaly detection: {e}")
 
     # === MANUAL POST-PROCESSING FOR ANOMALY IDENTIFICATION ===
 
@@ -628,16 +655,21 @@ def run_anomaly_detection(
         )  # Set CRS if known
 
         # Smooth the anomaly geometry slightly to make it more visually coherent, but keep it tight
+        logger.info("Smoothing refined geometries...")
         gdf_refined = smoothify(
-            gdf_refined, merge_multipolygons=False, merge_collection=False
+            gdf_refined,
+            # segment_length=sub_raster_res,  # Use the local grid resolution as a reference for smoothing
+            smooth_iterations=1,
+            merge_multipolygons=False,
+            merge_collection=False,
         )
 
+        # Save refined geometries and stats
+        logger.info("Saving refined geometries and stats...")
         gdf_refined.to_file(
             output_dir / f"{anomaly_base_name}_vector.geojson",
             driver="GeoJSON",
         )
-
-        # Save Stats
         gdf_refined.drop(columns="geometry").to_csv(
             output_dir / f"{anomaly_base_name}_stats.csv",
             index=False,
@@ -1037,7 +1069,7 @@ def run_pipeline(config: DictConfig | ListConfig):
                 img=img,
                 colors=sector_anomaly_colors,
                 output_dir=anomaly_dir,
-                base_name=f"{base_name}_sector{config.anomaly_detection.target_sector}_anomaly_vector.geojson",
+                base_name=f"{base_name}_sector{config.anomaly_detection.target_sector}_anomaly",
                 unit="px",
                 quiver_kwargs=config.plotting.quiver,
                 figsize=(20, 10),
