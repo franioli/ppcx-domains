@@ -111,7 +111,7 @@ mcmc:
     cores: 4
     target_accept: 0.9
 
-# Multi-scale processing parameters
+# Multi-scale processing parameters # DEPRECATED: This section is currently not used, but it can be reintroduced in the future for multi-scale clustering approaches.
 multiscale:
   sigma_values: null # [0] # List of Gaussian sigma values for multi-scale processing (0 means no smoothing)
   aggregation:
@@ -150,7 +150,7 @@ plotting:
 anomaly_detection:
   run_anomaly_detection: true
   target_sector: "A" # Sector to analyze for anomalies (e.g., "A")
-  prior_percentile_threshold: 98 # Percentile threshold for velocity-based priors (e.g., 90 means points above the 90th percentile of velocity are more likely to be anomalies)
+  prior_percentile_threshold: 95 # Percentile threshold for velocity-based priors (e.g., 90 means points above the 90th percentile of velocity are more likely to be anomalies)
   # variables_names: ["V", "u"] # TODO: This is hardcoded in the code, now we are using V and V_trans (direction)
   model_options:
     mu_params:

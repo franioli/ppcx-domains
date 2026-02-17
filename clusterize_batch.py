@@ -87,6 +87,12 @@ def parse_args():
         help="Set the logging level (default: INFO).",
     )
     parser.add_argument(
+        "--log-to-file",
+        default=True,
+        action="store_true",
+        help="Whether to log each subprocess output to a separate file (default: True). If False, all subprocesses will log to the terminal, which may be interleaved and harder to read but allows real-time monitoring without opening log files.",
+    )
+    parser.add_argument(
         "--log-folder",
         default="logs",
         help="Folder to store subprocess logs when running in parallel (default: logs).",
@@ -123,6 +129,8 @@ def run_one_date(
     # Ensure JAX in sub-processes doesn't hog all VRAM
     env = os.environ.copy()
     env["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+    # Limit each process to ~45% of GPU memory (safe for 2 concurrent jobs)
+    env["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.45"
 
     try:
         if log_to_file and log_file is not None:
@@ -338,7 +346,7 @@ if __name__ == "__main__":
                 args.script_path,
                 d,
                 timeout=args.timeout,
-                log_to_file=True,
+                log_to_file=args.log_to_file,
                 log_folder=args.log_folder,
                 extra_args=extra_args,
             )
@@ -354,7 +362,8 @@ if __name__ == "__main__":
                 args.script_path,
                 d,
                 timeout=args.timeout,
-                log_to_file=False,
+                log_to_file=args.log_to_file,
+                log_folder=args.log_folder,
                 extra_args=extra_args,
             )
             results.append(ok)

@@ -1,3 +1,4 @@
+import gc
 import json
 import logging
 import os
@@ -131,7 +132,7 @@ def _should_use_gpu(
 
     # If the model signature matches the cached one, JIT is (mostly) free
     is_cached = (
-        model_signature is not None and _COMPILED_MODEL_SIGNATURE == model_signature
+        model_signature is not None and model_signature == _COMPILED_MODEL_SIGNATURE
     )
 
     if is_cached:
@@ -310,6 +311,19 @@ def sample_model(
         logger.info(f"MCMC sampling completed in {sampling_time:.2f} seconds.")
     except Exception as e:
         logger.debug(f"Could not log sampling summary: {e}")
+
+    # === CLEANUP AND MEMORY PURGE ===
+    # Explicitly clear JAX caches and run garbage collection
+    # to release GPU memory references before script exit
+    if use_gpu:
+        try:
+            import jax
+
+            jax.clear_caches()
+        except ImportError:
+            pass
+
+    gc.collect()
 
     return idata, has_converged
 
@@ -889,236 +903,3 @@ def plot_velocity_clustering(
         plt.tight_layout(rect=(0, 0, 0.7, 1))
 
     return fig
-
-
-# --- DEPRECATED ---
-
-
-def clusterize_gaussian_mixture_old(
-    data_array_scaled: np.ndarray,
-    prior_probs: np.ndarray,
-    sectors: dict[str, Any],
-    output_dir: Path,
-    base_name: str,
-    df_input: pd.DataFrame,
-    scaler: StandardScaler,
-    img: np.ndarray | None = None,
-    mu_params: dict | None = None,
-    sigma_params: dict | None = None,
-    feature_weights: np.ndarray | None = None,
-    sample_args: dict | None = None,
-    apply_mrf_regularization: bool = False,
-    mrf_kwargs: dict[str, Any] | None = None,
-    second_pass: str = "full",
-    second_pass_sample_args: dict | None = None,
-    make_plots: bool = True,
-    random_seed: int = 8927,
-) -> dict:
-    """
-    Run MCMC-based clustering on preprocessed velocity/features with a Gaussian mixture model and optional MRF regularization.
-
-    Args:
-        data_array_scaled (np.ndarray): Scaled feature array for clustering.
-        prior_probs (np.ndarray): Prior probabilities array (n_samples, n_clusters).
-        sectors (dict): Dictionary of sector names to shapely Polygons.
-        output_dir (Path): Directory to save outputs.
-        base_name (str): Base name for output files.
-        df_input (pd.DataFrame): Original input dataframe (for saving results).
-        scaler (StandardScaler): Fitted scaler object.
-        img (np.ndarray, optional): Image array for plotting overlays. Default is None.
-        mu_params (dict, optional): Parameters for the mean of the mixture components. Default is None.
-        sigma_params (dict, optional): Parameters for the standard deviation of the mixture components. Default is None.
-        feature_weights (np.ndarray, optional): Optional feature weights for the model. Default is None.
-        sample_args (dict, optional): Arguments for PyMC sampling. Default is None.
-        apply_mrf_regularization (bool, optional): Whether to apply MRF regularization to spatial priors. Default is False.
-        mrf_kwargs (dict, optional): Arguments for MRF regularization. Default is None.
-        second_pass (str, optional): Strategy for second sampling pass ("skip", "short", "full"). Default is "full".
-        second_pass_sample_args (dict, optional): Arguments for second pass sampling. Default is None.
-        make_plots (bool, optional): Whether to generate and save plots. Default is True.
-        random_seed (int, optional): Random seed for reproducibility. Default is 8927.
-
-    Returns:
-        dict: Dictionary containing results:
-            - "idata": ArviZ InferenceData object
-            - "scaler": StandardScaler object
-            - "convergence_flag": bool
-            - "posterior_probs": np.ndarray
-            - "cluster_pred": np.ndarray
-            - "uncertainty": np.ndarray
-    """
-
-    # --- helper: build initvals from idata posterior means (warm-start) ---
-    def _initvals_from_idata(idata_in, n_chains):
-        mu_mean = idata_in.posterior["mu"].mean(dim=["chain", "draw"]).values
-        sigma_mean = idata_in.posterior["sigma"].mean(dim=["chain", "draw"]).values
-        # Ensure shapes match the model dims; return a list of per-chain dicts
-        init = {"mu": mu_mean, "sigma": sigma_mean}
-        return [init for _ in range(n_chains)]
-
-    logger.info(f"Running MCMC clustering for {base_name}...")
-
-    # Default parameters if not provided
-    if mu_params is None:
-        mu_params = {"mu": 0, "sigma": 1}
-    if sigma_params is None:
-        sigma_params = {"sigma": 1}
-    if sample_args is None:
-        sample_args = dict(
-            target_accept=0.95,
-            draws=2000,
-            tune=1000,
-            chains=4,
-            cores=4,
-            random_seed=random_seed,
-        )
-
-    posterior_probs = None
-    cluster_pred = None
-    uncertainty = None
-
-    # Build model
-    model = build_marginalized_mixture_model(
-        data_array_scaled,
-        prior_probs,
-        sectors,
-        mu_params=mu_params,
-        sigma_params=sigma_params,
-        feature_weights=feature_weights,
-    )
-
-    # Sample model (1st pass)
-    idata, convergence_flag = sample_model(model, output_dir, base_name, **sample_args)
-    if not convergence_flag:
-        idata_summary = az.summary(idata, var_names=["mu", "sigma"])
-        logger.info(f"MCMC did not converge. Summary:\n{idata_summary}")
-
-    # Save sampling summary
-    save_sampling_summary(convergence_flag, idata, output_dir, f"{base_name}_pass1")
-
-    logger.info("First pass MCMC clustering completed.")
-
-    # --- MRF regularization of priors and optional re-sample ---
-    if apply_mrf_regularization:
-        if mrf_kwargs is None:
-            mrf_kwargs = {
-                "n_neighbors": 8,
-                "length_scale": 50,
-                "beta": 2,
-                "n_iter": 5,
-            }
-
-        prior_used = prior_probs.copy()
-        logger.info("Applying MRF regularization to spatial priors...")
-        x_pos = df_input["x"].to_numpy()
-        y_pos = df_input["y"].to_numpy()
-        prior_mrf, q_mrf = mrf_regularization(
-            data_array_scaled, idata, prior_probs, x_pos, y_pos, **mrf_kwargs
-        )
-        prior_used = prior_mrf
-
-        if make_plots:
-            try:
-                fig, _ = plot_spatial_priors(df_input, prior_mrf, img=img)
-                fig.savefig(
-                    output_dir
-                    / f"{base_name}_mrf_priors_neig{mrf_kwargs['n_neighbors']}_ls{mrf_kwargs['length_scale']}_beta{mrf_kwargs['beta']}.jpg",
-                    dpi=150,
-                    bbox_inches="tight",
-                )
-                plt.close(fig)
-            except Exception as exc:
-                logger.warning(f"Could not plot MRF priors: {exc}")
-
-        # Decide second pass strategy
-        if second_pass.lower() == "skip":
-            logger.info(
-                "Skipping re-sampling after MRF regularization. Using pre-sampled MCMC posteriors."
-            )
-            posterior_probs = q_mrf
-            cluster_pred = np.argmax(posterior_probs, axis=1)
-            uncertainty = 1.0 - posterior_probs.max(axis=1)
-        else:
-            if mrf_regularization:
-                logger.info("Re-sampling with MRF-regularized priors...")
-                with model:
-                    pm.set_data({"prior_w": prior_used})
-
-            sp2_args = dict(**sample_args)
-            if second_pass.lower() == "short":
-                sp2_args.update(dict(draws=600, tune=400, chains=2, cores=2))
-                if second_pass_sample_args:
-                    sp2_args.update(second_pass_sample_args)
-            elif second_pass_sample_args:
-                sp2_args.update(second_pass_sample_args)
-
-            initvals = _initvals_from_idata(idata, sp2_args.get("chains", 2))
-
-            with model:
-                idata, convergence_flag = sample_model(
-                    model,
-                    output_dir,
-                    base_name + ("_mrf" if mrf_regularization else ""),
-                    initvals=initvals,
-                    **sp2_args,
-                )
-            logger.info("Second pass MCMC clustering completed.")
-
-    # Compute posterior-based assignments
-    posterior_probs, cluster_pred, uncertainty = compute_posterior_assignments(
-        idata, n_posterior_samples=200
-    )
-
-    # Generate plots
-    if make_plots:
-        fig = plot_velocity_clustering(
-            df_features=df_input,
-            img=img,
-            idata=idata,
-            cluster_pred=cluster_pred,
-            posterior_probs=posterior_probs,
-            scaler=scaler,
-        )
-        fig.savefig(
-            output_dir / f"{base_name}_results.jpg",
-            dpi=300,
-            bbox_inches="tight",
-        )
-        plt.close(fig)
-
-        fig, axes = plt.subplots(2, 2, figsize=(10, 6))
-        az.plot_trace(
-            idata, var_names=["mu", "sigma"], axes=axes, compact=True, legend=True
-        )
-        fig.savefig(output_dir / f"{base_name}_trace_plots.jpg", dpi=150)
-        plt.close(fig)
-
-        fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-        az.plot_forest(
-            idata, var_names=["mu", "sigma"], combined=True, ess=True, ax=axes
-        )
-        fig.savefig(output_dir / f"{base_name}_forest_plot.jpg", dpi=150)
-        plt.close(fig)
-
-    # Save main output results as a CSV file
-    results_df = df_input.copy()
-    results_df["cluster_pred"] = cluster_pred
-    results_df["uncertainty"] = uncertainty
-    for i in range(posterior_probs.shape[1]):
-        results_df[f"posterior_prob_{i}"] = posterior_probs[:, i]
-    results_df.to_csv(output_dir / f"{base_name}_mcmc_results.csv", index=False)
-    save_sampling_summary(convergence_flag, idata, output_dir, f"{base_name}_pass1")
-    logger.info(
-        f"Saved MCMC clustering results to {output_dir / f'{base_name}_mcmc_results.csv'}"
-    )
-
-    result = {
-        "idata": idata,
-        "scaler": scaler,
-        "convergence_flag": convergence_flag,
-        "posterior_probs": posterior_probs,
-        "cluster_pred": cluster_pred,
-        "uncertainty": uncertainty,
-    }
-
-    plt.close("all")
-    return result
