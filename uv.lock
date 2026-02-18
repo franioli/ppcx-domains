@@ -1753,12 +1753,9 @@ dependencies = [
     { name = "graphviz" },
     { name = "ipykernel" },
     { name = "ipympl" },
-    { name = "jax", extra = ["cuda12"] },
     { name = "joblib" },
     { name = "matplotlib" },
     { name = "numpy" },
-    { name = "numpyro" },
-    { name = "nutpie" },
     { name = "omegaconf" },
     { name = "opencv-python" },
     { name = "pandas" },
@@ -1778,6 +1775,13 @@ dependencies = [
     { name = "tqdm" },
 ]
 
+[package.optional-dependencies]
+cuda = [
+    { name = "jax", extra = ["cuda12"] },
+    { name = "numpyro" },
+    { name = "nutpie" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "affine", specifier = ">=2.4.0" },
@@ -1789,12 +1793,12 @@ requires-dist = [
     { name = "graphviz", specifier = ">=0.21" },
     { name = "ipykernel", specifier = ">=6.29.5" },
     { name = "ipympl", specifier = ">=0.9.7" },
-    { name = "jax", extras = ["cuda12"], specifier = ">=0.9.0.1" },
+    { name = "jax", extras = ["cuda12"], marker = "extra == 'cuda'", specifier = ">=0.9.0.1" },
     { name = "joblib", specifier = ">=1.5.1" },
     { name = "matplotlib", specifier = ">=3.5.0" },
     { name = "numpy", specifier = ">=2.0" },
-    { name = "numpyro", specifier = ">=0.20.0" },
-    { name = "nutpie", specifier = ">=0.16.5" },
+    { name = "numpyro", marker = "extra == 'cuda'", specifier = ">=0.20.0" },
+    { name = "nutpie", marker = "extra == 'cuda'", specifier = ">=0.16.5" },
     { name = "omegaconf", specifier = ">=2.3.0" },
     { name = "opencv-python", specifier = ">=4.11.0.86" },
     { name = "pandas", specifier = ">=2.3" },
@@ -1813,6 +1817,7 @@ requires-dist = [
     { name = "sqlalchemy", specifier = ">=2.0.41" },
     { name = "tqdm", specifier = ">=4.66.1" },
 ]
+provides-extras = ["cuda"]
 
 [[package]]
 name = "prompt-toolkit"

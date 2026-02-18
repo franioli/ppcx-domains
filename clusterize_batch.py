@@ -1,13 +1,12 @@
 import argparse
 import logging
 import os
-import random
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from joblib import Parallel, delayed
 from tqdm import tqdm
 
 from ppcluster.utils.logger import setup_logger
@@ -22,46 +21,72 @@ logger = setup_logger(
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Batch launcher for ppcx_mcmc_clustering.py -- run many reference dates."
+        description="""Batch launcher for ppcx_mcmc_clustering.py -- run many reference dates.
+
+This script acts as a "job generator" and runner. 
+You can run it directly (using Python's ThreadPoolExecutor) or use --dry-run to generate 
+commands for external tools like GNU Parallel.
+
+Any additional arguments passed to this script (that are not recognized flags) 
+will be forwarded directly to the underlying script. 
+
+------------------------------------------------------------------------
+EXAMPLES
+------------------------------------------------------------------------
+
+1. DIRECT EXECUTION (Python handles parallelism)
+   Run a date range with config overrides:
+     python clusterize_batch.py --date-range 2020-06-01 2020-06-05 --jobs 4 data.dt_min=12
+
+2. MULTIPLE DATE RANGES
+     python clusterize_batch.py \\
+       --date-range 2016-06-01 2016-10-30 \\
+       --date-range 2017-06-01 2017-10-30
+
+3. ROBUST BATCH EXECUTION (Recommended for production)
+   Use --dry-run to generate the list of commands, then pipe to GNU Parallel.
+
+     # Step 1: Generate command list
+     python clusterize_batch.py --date-range 2020-06-01 2020-08-01 --dry-run > jobs.txt
+
+     # Step 2: Run with GNU Parallel
+     parallel -j 4 --bar --joblog run.log --resume < jobs.txt
+
+4. GPU EXECUTION (Single Node)
+     export XLA_PYTHON_CLIENT_PREALLOCATE=false
+     export XLA_PYTHON_CLIENT_MEM_FRACTION=.45
+     parallel -j 2 --bar < jobs.txt
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--script-path",
         default="ppcx_mcmc_clustering.py",
         help="Path to the clustering script to run (default: ppcx_mcmc_clustering.py).",
     )
-    dates_group = parser.add_mutually_exclusive_group(required=True)
-    dates_group.add_argument(
+
+    # --- Date input options (not mutually exclusive: ranges + explicit dates can coexist) ---
+    parser.add_argument(
         "--dates",
         help="Comma separated list of reference dates (YYYY-MM-DD). Example: 2020-01-01,2020-02-02",
     )
-    dates_group.add_argument(
-        "--date-range",
-        action="store_true",
-        help="Run all consecutive dates between --start and --end (inclusive).",
-    )
-    dates_group.add_argument(
+    parser.add_argument(
         "--dates-file",
         help="File with one date (YYYY-MM-DD) per line.",
     )
-    dates_group.add_argument(
-        "--random",
-        type=int,
-        help="Pick N random dates between --start and --end (inclusive).",
-    )
     parser.add_argument(
-        "--start", help="Start date for random sampling or date range (YYYY-MM-DD)."
+        "--date-range",
+        nargs=2,
+        metavar=("START", "END"),
+        action="append",
+        dest="date_ranges",
+        help=(
+            "A date range START END (YYYY-MM-DD). "
+            "Can be repeated for multiple ranges. "
+            "Example: --date-range 2016-06-01 2016-10-30 --date-range 2017-06-01 2017-10-30"
+        ),
     )
-    parser.add_argument(
-        "--end", help="End date for random sampling or date range (YYYY-MM-DD)."
-    )
-    parser.add_argument(
-        "--season",
-        help="Optional season to restrict random sampling, format 'M-M' (months numeric 1-12 inclusive). Example: --season 6-10 for Jun-Oct.",
-    )
-    parser.add_argument(
-        "--exclude-months",
-        help="Optional months to exclude from random sampling. Format: comma separated months/ranges, e.g. '1-5,11-12' to exclude Jan-May and Nov-Dec.",
-    )
+
     parser.add_argument(
         "--jobs",
         type=int,
@@ -90,41 +115,110 @@ def parse_args():
         "--log-to-file",
         default=True,
         action="store_true",
-        help="Whether to log each subprocess output to a separate file (default: True). If False, all subprocesses will log to the terminal, which may be interleaved and harder to read but allows real-time monitoring without opening log files.",
+        help="Whether to log each subprocess output to a separate file (default: True).",
     )
     parser.add_argument(
         "--log-folder",
         default="logs",
         help="Folder to store subprocess logs when running in parallel (default: logs).",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the generated commands to stdout one per line and exit. Useful for piping to GNU Parallel.",
+    )
     return parser.parse_known_args()
 
 
-def run_one_date(
-    python: str,
-    script: str,
-    date: str,
+# === Date building ===
+
+
+def _expand_date_range(start: str, end: str) -> list[str]:
+    """Return all dates (inclusive) between start and end as YYYY-MM-DD strings."""
+    sd = datetime.strptime(start, "%Y-%m-%d")
+    ed = datetime.strptime(end, "%Y-%m-%d")
+    if ed < sd:
+        raise SystemExit(f"Date range error: end '{end}' must be >= start '{start}'")
+    return [
+        (sd + timedelta(days=i)).strftime("%Y-%m-%d") for i in range((ed - sd).days + 1)
+    ]
+
+
+def _load_dates_from_file(path: Path) -> list[str]:
+    dates = []
+    with open(path) as fh:
+        for row in fh:
+            s = row.strip()
+            if s:
+                dates.append(s)
+    return dates
+
+
+def build_dates_list(args) -> list[str]:
+    """
+    Build a deduplicated, sorted list of dates from all CLI date sources.
+
+    Sources (all optional, can be combined):
+      - args.dates       : comma-separated dates
+      - args.dates_file  : one date per line in a file
+      - args.date_ranges : list of [start, end] pairs (from repeated --date-range)
+    """
+    if not any([args.dates, args.dates_file, args.date_ranges]):
+        raise SystemExit(
+            "No dates provided. Use --dates, --dates-file, or --date-range."
+        )
+
+    dates: set[str] = set()
+
+    if args.dates:
+        for d in args.dates.split(","):
+            d = d.strip()
+            if d:
+                dates.add(d)
+
+    if args.dates_file:
+        dates.update(_load_dates_from_file(Path(args.dates_file)))
+
+    if args.date_ranges:
+        for start, end in args.date_ranges:
+            dates.update(_expand_date_range(start, end))
+
+    return sorted(dates)
+
+
+# === Helper functions ===
+
+
+def run_subprocess_task(
+    cmd: list[str],
+    identifier: str,
     timeout=None,
     cleanup_on_failure=False,
     capture_output=True,
     log_to_file=False,
     log_folder="logs",
-    extra_args=None,
 ) -> bool:
-    # Build command str
-    cmd = [python, script, "--date", date]
-    if extra_args:
-        cmd.extend(extra_args)
+    """
+    Generic function to run a command in a subprocess with logging and error handling.
 
+    Args:
+        cmd: List of command arguments to execute.
+        identifier: Unique identifier for this task (e.g. date string), used for logs.
+        timeout: Max execution time in seconds.
+        cleanup_on_failure: Whether to trigger cleanup routine on failure.
+        capture_output: (Unused in current logic, kept for signature compat)
+        log_to_file: Whether to write stdout/stderr to a file.
+        log_folder: Where to save log files.
+    """
     # Run subprocess
     log_file = None
     if log_to_file:
         log_path = Path(log_folder)
         log_path.mkdir(parents=True, exist_ok=True)
-        log_file = log_path / f"run_{date}.log"
-        logger.info(f"START {date} (logging to {log_file})")
+        log_file = log_path / f"run_{identifier}.log"
+        logger.info(f"START {identifier} (logging to {log_file})")
     else:
-        logger.info(f"START {date}")
+        logger.info(f"START {identifier}")
 
     # Ensure JAX in sub-processes doesn't hog all VRAM
     env = os.environ.copy()
@@ -150,32 +244,29 @@ def run_one_date(
             )
 
         if proc.returncode == 0:
-            logger.info(f"SUCCESS {date}")
+            logger.info(f"SUCCESS {identifier}")
             return True
 
         # Log minimal info on error, detailed info can be inspected if needed
         logger.error(
-            f"FAILURE {date} (exit code {proc.returncode})\n"
+            f"FAILURE {identifier} (exit code {proc.returncode})\n"
             f"STDERR snippet: {proc.stderr[-500:] if proc.stderr else 'Empty'}"
         )
         if cleanup_on_failure:
-            _cleanup_partial_results(date)
+            _cleanup_partial_results(identifier)
         return False
 
     except subprocess.TimeoutExpired:
-        logger.error(f"TIMEOUT {date} (> {timeout}s)")
+        logger.error(f"TIMEOUT {identifier} (> {timeout}s)")
         if cleanup_on_failure:
-            _cleanup_partial_results(date)
+            _cleanup_partial_results(identifier)
         return False
 
     except Exception as e:
-        logger.error(f"EXCEPTION {date}: {e}")
+        logger.error(f"EXCEPTION {identifier}: {e}")
         if cleanup_on_failure:
-            _cleanup_partial_results(date)
+            _cleanup_partial_results(identifier)
         return False
-
-
-# === Helper functions ===
 
 
 def _load_dates_from_file(path: Path):
@@ -187,70 +278,6 @@ def _load_dates_from_file(path: Path):
                 continue
             dates.append(s)
     return dates
-
-
-def _parse_months_spec(spec: str):
-    """
-    Parse a months spec like '1-5,11-12,7' into a set of ints {1,2,3,4,5,11,12,7}
-    """
-    out = set()
-    if not spec:
-        return out
-    parts = spec.split(",")
-    for p in parts:
-        p = p.strip()
-        if not p:
-            continue
-        if "-" in p:
-            a, b = p.split("-", 1)
-            a_i = int(a)
-            b_i = int(b)
-            if a_i <= b_i:
-                out.update(range(a_i, b_i + 1))
-            else:
-                # wrap-around e.g. 11-2 -> 11,12,1,2
-                out.update(list(range(a_i, 13)) + list(range(1, b_i + 1)))
-        else:
-            out.add(int(p))
-    # keep only valid months
-    return {m for m in out if 1 <= m <= 12}
-
-
-def _random_dates_between(
-    start: str, end: str, n: int, include_months=None, exclude_months=None
-):
-    """
-    Return n unique random dates between start and end (inclusive).
-    include_months / exclude_months: sets of month ints (1..12). If include_months is provided it is used;
-    otherwise exclude_months (if provided) is applied.
-    """
-    sd = datetime.strptime(start, "%Y-%m-%d")
-    ed = datetime.strptime(end, "%Y-%m-%d")
-    if ed < sd:
-        raise ValueError("end must be >= start")
-    days = (ed - sd).days + 1
-    # build candidate list of dates respecting month filters
-    candidates = []
-    for i in range(days):
-        d = sd + timedelta(days=i)
-        m = d.month
-        if include_months is not None:
-            if m in include_months:
-                candidates.append(d)
-        elif exclude_months is not None:
-            if m not in exclude_months:
-                candidates.append(d)
-        else:
-            candidates.append(d)
-    if not candidates:
-        raise ValueError("No candidate dates available after applying month filters.")
-    if n > len(candidates):
-        raise ValueError(
-            f"Requested {n} dates but only {len(candidates)} candidates available."
-        )
-    picked = sorted({random.choice(candidates) for _ in range(n)})
-    # format as YYYY-MM-DD strings
-    return [d.strftime("%Y-%m-%d") for d in picked]
 
 
 def _cleanup_partial_results(date: str):
@@ -286,6 +313,8 @@ def _cleanup_partial_results(date: str):
 
 
 if __name__ == "__main__":
+    import shlex
+
     # parse arguments, including extra args for the clustering script
     args, extra_args = parse_args()
 
@@ -293,87 +322,72 @@ if __name__ == "__main__":
     numeric_level = getattr(logging, args.log_level.upper(), None)
     logger.setLevel(numeric_level)
 
-    # build dates list
-    if args.dates:
-        dates = [d.strip() for d in args.dates.split(",") if d.strip()]
-    elif args.dates_file:
-        dates = _load_dates_from_file(Path(args.dates_file))
-    elif args.date_range:
-        if not (args.start and args.end):
-            raise SystemExit(
-                "When using --date-range you must provide --start and --end"
-            )
-        sd = datetime.strptime(args.start, "%Y-%m-%d")
-        ed = datetime.strptime(args.end, "%Y-%m-%d")
-        if ed < sd:
-            raise SystemExit("end must be >= start")
-        days = (ed - sd).days + 1
-        dates = [(sd + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
-    else:
-        if not (args.start and args.end):
-            raise SystemExit("When using --random you must provide --start and --end")
-        # prepare month filters
-        include_months = None
-        exclude_months = None
-        if args.season:
-            # season provided as "M-M"
-            try:
-                include_months = _parse_months_spec(args.season)
-            except Exception:
-                raise SystemExit(
-                    "Invalid --season format. Use M-M (e.g. 6-10)."
-                ) from None
-        elif args.exclude_months:
-            exclude_months = _parse_months_spec(args.exclude_months)
-        try:
-            dates = _random_dates_between(
-                args.start,
-                args.end,
-                args.random,
-                include_months=include_months,
-                exclude_months=exclude_months,
-            )
-        except Exception as exc:
-            raise SystemExit(f"Could not sample dates: {exc}") from None
+    # Build deduplicated, sorted list of dates from all CLI sources
+    dates = build_dates_list(args)
+    logger.info(f"Total dates to process: {len(dates)}")
 
+    # Build per-date commands
+    tasks = []
+    for d in dates:
+        cmd = [args.python, args.script_path, "--date", d]
+        if extra_args:
+            cmd.extend(extra_args)
+        tasks.append((d, cmd))
+
+    # If dry-run, just print commands and exit (useful for GNU Parallel)
+    if args.dry_run:
+        for _, cmd in tasks:
+            print(shlex.join(cmd))
+        sys.exit(0)
+
+    # === Execute tasks ===
     if args.jobs > 1:
-        # use prefer='processes' (default) if you want stronger isolation
-        # prefer='threads' is efficient if the tasks are I/O bound (waiting for subprocess).
-        logger.info(f"Running {len(dates)} jobs with {args.jobs} jobs...")
-        results = Parallel(n_jobs=args.jobs, prefer="processes")(
-            delayed(run_one_date)(
-                args.python,
-                args.script_path,
-                d,
-                timeout=args.timeout,
-                log_to_file=args.log_to_file,
-                log_folder=args.log_folder,
-                extra_args=extra_args,
-            )
-            for d in tqdm(dates)
-        )
+        logger.info(f"Running {len(tasks)} tasks with {args.jobs} parallel threads...")
+
+        # We use ThreadPoolExecutor because the actual work happens in the
+        # subprocess, not in the Python thread. This avoids the overhead
+        # of spawning Python processes (multiprocessing/joblib).
+        results = []
+        with ThreadPoolExecutor(max_workers=args.jobs) as executor:
+            future_to_date = {
+                executor.submit(
+                    run_subprocess_task,
+                    cmd=cmd,
+                    identifier=d,
+                    timeout=args.timeout,
+                    log_to_file=args.log_to_file,
+                    log_folder=args.log_folder,
+                ): d
+                for d, cmd in tasks
+            }
+
+            for future in tqdm(as_completed(future_to_date), total=len(tasks)):
+                d = future_to_date[future]
+                try:
+                    results.append((d, future.result()))
+                except Exception as exc:
+                    logger.error(f"Task for {d} generated an exception: {exc}")
+                    results.append((d, False))
 
     else:
         logger.info("Running in sequential mode.")
         results = []
-        for d in tqdm(dates):
-            ok = run_one_date(
-                args.python,
-                args.script_path,
-                d,
+        for d, cmd in tqdm(tasks):
+            ok = run_subprocess_task(
+                cmd=cmd,
+                identifier=d,
                 timeout=args.timeout,
                 log_to_file=args.log_to_file,
                 log_folder=args.log_folder,
-                extra_args=extra_args,
             )
-            results.append(ok)
+            results.append((d, ok))
 
-    # summary
-    success_count = sum(1 for ok in results if bool(ok))
-    total = len(dates)
+    # === Summary ===
+    success_count = sum(1 for _, ok in results if ok)
+    total = len(results)
     logger.info("-" * 40)
     logger.info(f"SUMMARY: {success_count}/{total} succeeded.")
     if success_count < total:
-        failed = [d for d, ok in zip(dates, results, strict=True) if not ok]
+        failed = [d for d, ok in results if not ok]
         logger.error(f"Failed dates ({len(failed)}): {', '.join(failed)}")
     logger.info("-" * 40)
