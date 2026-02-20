@@ -14,6 +14,7 @@ from matplotlib import colors as mcolors
 from matplotlib import pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib.colors import Normalize
+from matplotlib.figure import Figure
 from shapely import MultiPolygon
 from shapely.geometry import Polygon, shape
 from smoothify import smoothify
@@ -171,7 +172,7 @@ def clean_vector_sectors(
             smooth_iterations=smooth_iterations,
             merge_collection=False,
             area_tolerance=0.01,  # % of original area allowed as error
-            num_cores=target_number_of_sectors,
+            num_cores=1,  # Keep it single-threaded to avoid overhead on small datasets
         )
 
     return gdf
@@ -805,8 +806,8 @@ def plot_sectors_summary(
     points_by_sector: pd.DataFrame | gpd.GeoDataFrame,
     img: np.ndarray,
     colors: dict[str, str],
-    output_dir: Path,
-    base_name: str,
+    output_dir: Path | str | None,
+    base_name: str = "sectors_summary",
     unit: str = "px",
     figsize: tuple = (20, 10),
     dpi: int = 300,
@@ -818,7 +819,7 @@ def plot_sectors_summary(
     sector_fill_kwargs: dict | None = None,
     sector_edge_kwargs: dict | None = None,
     label_kwargs: dict | None = None,
-) -> Path:
+) -> tuple[Figure, dict[str, Axes]]:
     """
     Plot kinematic sectors summary with velocity field and statistics table.
 
@@ -842,7 +843,7 @@ def plot_sectors_summary(
         label_kwargs: Label kwargs for sector labels.
 
     Returns:
-        Path to the saved summary figure.
+        Tuple of (Figure, dict[str, Axes]) for the summary figure.
     """
 
     # Ensure colors is a standard dictionary (Seaborn can fail with OmegaConf DictConfig)
@@ -989,15 +990,25 @@ def plot_sectors_summary(
                     cell.set_text_props(weight="bold", color="black")
                     cell.set_alpha(0.6)
 
-    out_path = output_dir / f"{base_name}_kinematic_sectors_summary.png"
-    fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
-    if save_svg:
-        fig.savefig(out_path.with_suffix(".svg"), bbox_inches="tight")
+    if output_dir is not None:
+        output_dir = Path(output_dir)
+        out_path = output_dir / f"{base_name}_kinematic_sectors_summary.png"
+        fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
+        if save_svg:
+            fig.savefig(out_path.with_suffix(".svg"), bbox_inches="tight")
 
-    plt.close(fig)
-    logger.info(f"Saved summary figure to {out_path}")
+        plt.close(fig)
+        logger.info(f"Saved summary figure to {out_path}")
 
-    return out_path
+    # Return the figure and the all the axes in case the caller wants to further customize or save it.
+    axes = {
+        "map": ax_map,
+        "box": ax_box,
+        "hist": ax_hist,
+        "stats": ax_stats,
+    }
+
+    return fig, axes
 
 
 # ================= Helper Functions for Cleaning =================#

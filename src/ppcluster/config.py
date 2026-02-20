@@ -47,7 +47,8 @@ class DataConfig:
     sector_prior_path: str | None = None
     roi_path: str | None = None
     # Output directory
-    output_dir: str = "output"
+    base_output_dir: str = "outputs"
+    run_output_subdir: str | None = None
 
 
 @dataclass
@@ -309,7 +310,7 @@ def load_config(config_path: Path | str | None = None) -> ListConfig | DictConfi
         import matplotlib.pyplot as plt
 
         colormap = base_cfg.plotting.default_discrete_cmap
-        logger.info(
+        logger.debug(
             f"No sector colors defined in config; assigning default colors from colormap '{colormap}'."
         )
 

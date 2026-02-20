@@ -89,7 +89,7 @@ def find_ensemble_file(
     dt_hours_min: int,
     dt_hours_max: int,
     filename_pattern: str | None = None,
-) -> Path:
+) -> Path | None:
     """
     Find an ensemble NetCDF file in search_dir matching the reference date and dt range.
 
@@ -100,6 +100,8 @@ def find_ensemble_file(
         dt_hours_max: Maximum time delta in hours.
         filename_pattern: Optional regex pattern. If None, uses default:
                           'day_dic_(?P<slave>\d{4}-\d{2}-\d{2})_(?P<master>\d{4}-\d{2}-\d{2})_dt(?P<dt>\d+)_.*\.nc'
+    Returns:
+        Path to the selected NetCDF file, or None if no suitable file is found.
     """
     if not search_dir.exists():
         raise FileNotFoundError(f"Search directory does not exist: {search_dir}")
@@ -155,22 +157,39 @@ def find_ensemble_file(
         candidates.append(file_path)
 
     if not candidates:
-        raise FileNotFoundError(
+        logger.warning(
             f"No ensemble files found in {search_dir} matching reference date {reference_date} "
             f"and dt range {dt_days_min}-{dt_days_max} days."
         )
+        return None
 
-    # Sort candidates (e.g. by dt ascending, then name)
-    # If multiple files exist for same day/dt (e.g. different ensembles), pick first one.
-    candidates.sort(key=lambda p: p.name)
+    # Sort candidates by extracted dt (if present) and take the middle one when multiple exist
+    file_dt_pairs = []
+    for p in candidates:
+        m = regex.match(p.name)
+        dt_val = None
+        if m:
+            dt_str = m.groupdict().get("dt")
+            try:
+                dt_val = int(dt_str)
+            except Exception:
+                dt_val = None
+        # treat missing dt as -1 so they appear first in sorted order
+        file_dt_pairs.append((p, dt_val if dt_val is not None else -1))
 
-    if len(candidates) > 1:
+    # sort by dt then filename for deterministic order
+    file_dt_pairs.sort(key=lambda t: (t[1], t[0].name))
+
+    # If multiple candidates, select the one in the middle of the sorted list to avoid always picking the same one if many match
+    if len(file_dt_pairs) > 1:
         logger.warning(
-            f"Multiple matching files found: {[f.name for f in candidates]}. Using the first one."
+            f"Multiple matching files found: {[p.name for p, _ in file_dt_pairs]}. "
+            "Selecting the middle file by dt order."
         )
-
-    selected_file = candidates[0]
+    mid_idx = len(file_dt_pairs) // 2
+    selected_file = file_dt_pairs[mid_idx][0]
     logger.info(f"Auto-selected file: {selected_file}")
+
     return selected_file
 
 

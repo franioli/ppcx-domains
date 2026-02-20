@@ -1,27 +1,4 @@
-import argparse
-import logging
-import os
-import subprocess
-import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
-from pathlib import Path
-
-from tqdm import tqdm
-
-from ppcluster.utils.logger import setup_logger
-
-logger = setup_logger(
-    level=logging.INFO,
-    name="ppcx",
-    force=True,
-    redirect_to_stdout=True,
-)
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="""Batch launcher for ppcx_mcmc_clustering.py -- run many reference dates.
+"""Batch launcher for ppcx_mcmc_clustering.py -- run many reference dates.
 
 This script acts as a "job generator" and runner. 
 You can run it directly (using Python's ThreadPoolExecutor) or use --dry-run to generate 
@@ -56,8 +33,32 @@ EXAMPLES
      export XLA_PYTHON_CLIENT_PREALLOCATE=false
      export XLA_PYTHON_CLIENT_MEM_FRACTION=.45
      parallel -j 2 --bar < jobs.txt
-""",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+"""
+
+import argparse
+import logging
+import os
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from tqdm import tqdm
+
+from ppcluster.utils.logger import setup_logger
+
+logger = setup_logger(
+    level=logging.INFO,
+    name="ppcx",
+    force=True,
+    redirect_to_stdout=True,
+)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
         "--script-path",
@@ -324,7 +325,6 @@ if __name__ == "__main__":
 
     # Build deduplicated, sorted list of dates from all CLI sources
     dates = build_dates_list(args)
-    logger.info(f"Total dates to process: {len(dates)}")
 
     # Build per-date commands
     tasks = []
@@ -341,6 +341,7 @@ if __name__ == "__main__":
         sys.exit(0)
 
     # === Execute tasks ===
+    logger.info(f"Total dates to process: {len(dates)}")
     if args.jobs > 1:
         logger.info(f"Running {len(tasks)} tasks with {args.jobs} parallel threads...")
 

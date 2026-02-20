@@ -25,7 +25,9 @@ data:
   sector_prior_path: "data/${data.year}*.zip" # Path to CVAT ZIP file containing sector prior polygons (and optionally ROI polygon)
   # roi_path: "data/roi.xml" # Path to CVAT XML file containing ROI polygon (optional, if not already included in sector_prior_path)
 
-  output_dir: "output/${data.year}_${data.camera_name}" # Output directory for results
+  base_output_dir: "output/${data.year}_${data.camera_name}" # Output directory base path. The actual output of each run will be saved in a subfolder with the camera name and date (e.g., "output/2025_PPCX_Tele/2025-01-08/")
+
+  run_output_subdir: "${data.reference_date}" # Subdirectory name for the current run's output (e.g., "2025-01-08"). This will be created inside base_output_dir. If null, the base_output_dir will be used directly without creating a subfolder.
 
 
 # Data preprocessing parameters

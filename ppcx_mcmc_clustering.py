@@ -1,5 +1,6 @@
 import argparse
 import logging
+import os
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -15,7 +16,6 @@ import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
 from omegaconf import DictConfig, ListConfig, OmegaConf
-from shapely.geometry import MultiPolygon, Polygon
 from smoothify import smoothify
 
 from ppcluster import Timer, load_config, mcmc, setup_logger
@@ -80,6 +80,16 @@ def parse_arguments():
         type=str,
         default=None,
         help="Path to an optional custom config.yaml file to load instead of the default.",
+    )
+    p.add_argument(
+        "--keep-failed-output",
+        action="store_true",
+        help="Keep output directory if processing fails (for debugging). By default, output is deleted on failure.",
+    )
+    p.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip processing if the run output directory already exists.",
     )
 
     # Robust generic override mechanism using dotlist (e.g., data.dt_min=24)
@@ -235,98 +245,6 @@ def run_mcmc_clustering(
     return result, scaler
 
 
-def run_multiscale_mcmc_deprecated(
-    dic_df: pd.DataFrame,
-    prior_probs_array: np.ndarray,
-    sectors: Any,
-    config: DictConfig | ListConfig,
-):
-    """
-    DEPRECATED: Multiscale approach iterating over sigma values.
-    Kept for reference but not used in the active pipeline.
-    """
-
-    raise NotImplementedError(
-        "Multiscale MCMC clustering is currently deprecated and not maintained. This function is kept for reference but should not be used in the active pipeline. The old result dict was replaced with a ClusteringResult object that does not contain 'sigma' key anymore."
-    )
-
-    # results = []
-    # if config.multiscale.sigma_values is None:
-    #     return None
-
-    #     # Loop through smoothing scales
-    #     results = []
-    #     for sigma in config.multiscale.sigma_values:
-    #         logger.info(f"Processing with Gaussian smoothing sigma={sigma}...")
-
-    #         # Create scale-specific base name
-    #         scale_base_name = f"{mcmc_base_name}_sigma{sigma}"
-
-    #         # Apply Gaussian smoothing if needed (skipped for sigma=0)
-    #         df_run = apply_2d_gaussian_filter(dic_df, sigma=sigma)
-
-    #         # Preprocess features for clustering
-    #         data_array_scaled, scaler, velocities, transform_info = preprocess_features(
-    #             df_input=df_run,
-    #             variables_names=config.data.variables_names,
-    #             transform_velocity=config.mcmc.velocity_transform,
-    #             transform_params=config.mcmc.transform_params,
-    #         )
-    #         joblib.dump(scaler, output_dir / f"{scale_base_name}_scaler.joblib")
-
-    #         # Run MCMC clustering with the a gaussian mixture model
-    #         if sigma > 2:  # For larger sigma, tighten priors
-    #             mu_params = {"mu": 0, "sigma": 0.5}
-    #             sigma_params = {"sigma": 0.5}
-    #         else:
-    #             mu_params = config.mcmc.model_options.mu_params
-    #             sigma_params = config.mcmc.model_options.sigma_params
-    #         result = clusterize_gaussian_mixture(
-    #             data_array_scaled=data_array_scaled,
-    #             prior_probs=prior_probs_array,
-    #             sectors=sectors,
-    #             sample_args=config.mcmc.sample_options,
-    #             mu_params=mu_params,
-    #             sigma_params=sigma_params,
-    #             feature_weights=config.mcmc.feature_weights,
-    #             apply_mrf_regularization=config.mcmc.mrf_regularization,
-    #             mrf_kwargs=config.mcmc.mrf_kwargs,
-    #             second_pass=config.mcmc.second_pass,
-    #             second_pass_sample_args=config.mcmc.second_pass_sample_args,
-    #             random_seed=config.random_seed,
-    #         )
-
-    #         # --- Save sampling summary ---
-    #         save_sampling_summary(
-    #             convergence_flag=result["convergence_flag"],
-    #             idata=result["idata"],
-    #             output_dir=output_dir,
-    #             base_name=scale_base_name,
-    #         )
-
-    #         # Add scale information to result
-    #         # result["sigma"] = sigma
-
-    #         # Append to results list
-    #         results.append(result)
-
-    # # --- Save final clustering results ---
-    # cluster_aggregation_outs = {
-    #     "cluster_pred": cluster_pred,
-    #     "posterior_probs": posterior_probs,
-    #     "entropy": entropy,
-    #     "similarity_matrix": similarity_matrix,
-    #     "stability_score": stability_score,
-    #     "valid_scales": valid_scales,
-    # }
-    # joblib.dump(
-    #     cluster_aggregation_outs,
-    #     output_dir / f"{mcmc_base_name}_clustering_results_raw.joblib",
-    # )
-
-    # return results
-
-
 def process_clustering_results(
     df_points: pd.DataFrame,
     cluster_labels: np.ndarray,
@@ -334,10 +252,22 @@ def process_clustering_results(
     base_name: str,
     config: DictConfig | ListConfig,
     img: Any = None,
-) -> Any:
+) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
     """
     Vectorize clusters, clean geometries, assign labels, compute stats, and save results.
     Reusable for both main pipeline and refinement steps.
+
+    Args:
+        df_points: Original points DataFrame with x, y, and velocity columns.
+        cluster_labels: The predicted cluster labels for each point.
+        output_dir: Directory to save outputs.
+        base_name: Base name for output files.
+        config: The full configuration object for parameters.
+        img: The original image for plotting (optional).
+
+    Returns:
+        gpd.GeoDataFrame: The final sectors GeoDataFrame with statistics.
+        gpd.GeoDataFrame: The classified points GeoDataFrame with sector labels.
     """
     # 1. Create grid from points
     x = df_points["x"].to_numpy()
@@ -441,7 +371,7 @@ def run_anomaly_detection(
     output_dir: Path,
     img: Any,
     base_name: str,
-) -> tuple[gpd.GeoDataFrame, pd.DataFrame]:
+) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
     """
     Perform a second-pass clustering on a specific sector (e.g., Sector A)
     to detect sub-anomalies (e.g., small high-velocity clusters).
@@ -457,7 +387,7 @@ def run_anomaly_detection(
 
     Returns:
         gpd.GeoDataFrame: The refined geometries for the target sector with anomaly sub-sectors.
-        pd.DataFrame: The subset of points used for the anomaly detection step, with assigned labels.
+        gpd.GeoDataFrame: The classified points for the target sector with anomaly labels.
     """
     anomaly_config = config.anomaly_detection
 
@@ -510,7 +440,7 @@ def run_anomaly_detection(
     # We usually don't need V_long if we have V, but V_long is cleaner than V because it allows negative values (noise).
     # Let's use [V, V_trans] or [V_long, V_trans].
     # [V, V_trans] is often best: V separates by speed, V_trans separates by direction.
-    refine_features = ["V", "V_trans"]
+    refine_features = ["V"]  # TODO: We can experiment with adding "V_trans"
 
     # 2. Assign Velocity-Based Priors (Unsupervised initialization)
     # We assume 2 classes: 0=Background, 1=Fast/Anomaly
@@ -555,6 +485,7 @@ def run_anomaly_detection(
         y_pos=df_sub["y"].to_numpy(),
         mrf_kwargs=anomaly_config.mrf_options,  # Use specific MRF settings for anomaly detection
         random_seed=config.random_seed,
+        force_cpu=config.mcmc.force_cpu,
     )
 
     # 5. Save Sampling Summary (Trace plots, etc.)
@@ -616,96 +547,78 @@ def run_anomaly_detection(
     logger.info(f"Refinement Stats: Base={len(base_df)}, Anomaly={len(anomaly_df)}")
 
     # Process Anomaly Cluster
-    if len(anomaly_df) > 10:  # Minimum threshold to consider it a real cluster
-        logger.info(f"Vectorizing anomaly cluster with {len(anomaly_df)} points...")
-        x_a = anomaly_df["x"].to_numpy()
-        y_a = anomaly_df["y"].to_numpy()
-
-        # Create a localized grid for just the anomaly points
-        # reusing grid creation logic but locally
-        X_sub, Y_sub, label_grid_sub = create_2d_grid(
-            x=x_a,
-            y=y_a,
-            labels=np.ones(len(x_a), dtype=int) * 1,  # All are class 1 (Anomaly)
-        )
-
-        # Vectorize the anomaly cluster grid.
-        anomaly_gdf = vectorize_gridded_sectors(label_grid_sub, X_sub, Y_sub)
-
-        # Taking the union if multiple polygons are returned for the anomaly
-        if not anomaly_gdf.empty:
-            anomaly_gdf = anomaly_gdf.geometry.union_all()
-
-        # Smooth the anomaly geometry slightly to make it more visually coherent, but keep it tight
-        logger.info("Smoothing anomaly geometry...")
-        anomaly_gdf = smoothify(
-            anomaly_gdf,
-            # segment_length=sub_raster_res,  # Use the local grid resolution as a reference for smoothing
-            smooth_iterations=1,
-            merge_multipolygons=False,
-            merge_collection=False,
-        )
-
-        # Ensure the anomaly geometry is a geodataframe. If it is a multipolygon or geometry collection, we convert it to a GeoDataFrame with a single row. If it's empty or invalid, we create an empty GeoDataFrame.
-        if isinstance(anomaly_gdf, gpd.GeoSeries):
-            anomaly_gdf = gpd.GeoDataFrame(geometry=anomaly_gdf)
-        elif isinstance(anomaly_gdf, (Polygon, MultiPolygon)):
-            anomaly_gdf = gpd.GeoDataFrame(geometry=[anomaly_gdf])
-
-    else:
+    if len(anomaly_df) < 10:  # Minimum threshold to consider it a real cluster
         logger.warning(
             f"Anomaly cluster too small ({len(anomaly_df)} points). Ignored."
         )
         anomaly_gdf = gpd.GeoDataFrame(geometry=[])
 
-    if (
-        isinstance(anomaly_gdf, gpd.GeoDataFrame)
-        and not anomaly_gdf.empty
-        and anomaly_gdf.is_valid.any()
-    ):
-        # Rename te cluster_id geometry to sector and assign the "anomaly" label for stats computation
-        anomaly_gdf["sector"] = "anomaly"
-        anomaly_gdf = anomaly_gdf[[anomaly_gdf.geometry.name, "sector"]]
-        logger.info("Anomaly geometry successfully vectorized and smoothed.")
+        return anomaly_gdf, df_sub
 
-        # Compute Base as difference
-        try:
-            anomaly_poly = anomaly_gdf.geometry.union_all()
-            base_poly = sector_poly_geom.difference(anomaly_poly)
-        except Exception as e:
-            logger.error(f"Error computing base geometry difference: {e}")
-            base_poly = sector_row.geometry.iloc[0]
+    logger.info(f"Vectorizing anomaly cluster with {len(anomaly_df)} points...")
+    x_a = anomaly_df["x"].to_numpy()
+    y_a = anomaly_df["y"].to_numpy()
 
-    else:
-        logger.warning("Anomaly geometry is empty or not a valid GeoDataFrame.")
-        anomaly_gdf = gpd.GeoDataFrame(geometry=[])
-        base_poly = sector_poly
-
-    # Prepare final GeoDataFrame with both Base and Anomaly
-    base_gdf = gpd.GeoDataFrame(
-        {"geometry": [base_poly], "sector": ["base"]}, crs=sectors_gdf.crs
+    # Create a localized grid for just the anomaly points
+    # reusing grid creation logic but locally
+    X_sub, Y_sub, label_grid_sub = create_2d_grid(
+        x=x_a,
+        y=y_a,
+        labels=np.ones(len(x_a), dtype=int) * 1,  # All are class 1 (Anomaly)
     )
-    if not anomaly_gdf.empty:
-        gdf_refined = pd.concat([base_gdf, anomaly_gdf], ignore_index=True)
-        gdf_refined = gpd.GeoDataFrame(
-            gdf_refined, geometry="geometry", crs=sectors_gdf.crs
-        )
-    else:
-        gdf_refined = base_gdf
 
-    # Homogenize geometry types to multipolygons
-    gdf_refined["geometry"] = [
-        MultiPolygon([geom]) if isinstance(geom, Polygon) else geom
-        for geom in gdf_refined["geometry"]
-    ]
+    # Vectorize the anomaly cluster grid.
+    anomaly_gdf = vectorize_gridded_sectors(label_grid_sub, X_sub, Y_sub)
+
+    # Check validity and non-emptiness
+    if anomaly_gdf.empty and anomaly_gdf.is_valid.any():
+        logger.warning(
+            "Anomaly geometry is empty or invalid after vectorization. Skipping smoothing and refinement."
+        )
+        anomaly_gdf = gpd.GeoDataFrame(geometry=[])
+
+        return anomaly_gdf, df_sub
+
+    # Explode MultiPolygons into individual Polygon rows
+    anomaly_gdf = anomaly_gdf.explode(index_parts=False, ignore_index=True)
+
+    # Smooth the anomaly geometry slightly to make it more visually coherent, but keep it tight
+    logger.info("Smoothing anomaly geometry...")
+    sub_raster_res = abs(
+        float(X_sub[0, 1] - X_sub[0, 0]) if X_sub.shape[1] > 1 else 1.0
+    )
+    anomaly_gdf = smoothify(
+        anomaly_gdf,
+        segment_length=sub_raster_res,  # Use the local grid resolution as a reference for smoothing
+        smooth_iterations=2,  # Light smoothing to preserve details
+        merge_collection=True,  # Merge adjacent polygons to avoid fragmentation
+        merge_multipolygons=False,  # Don't merge separate MultiPolygons to preserve distinct anomalies if they exist
+        num_cores=1,  # Avoid parallelism for small geometries to prevent overhead
+    )
+
+    # Prepare the 'anomaly' and base geometries for combination:
+    # Keep only geometry and add new labels
+    anoms = anomaly_gdf[["geometry"]].copy()
+    anoms["sector"] = "anomaly"
+    sector_geom = sector_row.geometry.iloc[0]
+    base_geom = sector_geom.difference(anoms.geometry.union_all())
+    base = gpd.GeoDataFrame(
+        {"geometry": [base_geom], "sector": ["base"]}, crs=anomaly_gdf.crs
+    )
+    gdf_refined = pd.concat([base, anoms], ignore_index=True)
+
+    # Reclassify points by the new anomaly geometry to see how many points fall into the refined anomaly sector vs base
+    anomaly_pots = classify_points_by_polygons(
+        gdf_refined, dic_df, x_col="x", y_col="y", keep_unclassified=False
+    )
 
     # Compute statistics for the anomaly and base geometries
     gdf_refined["area_px2"] = gdf_refined.area
     gdf_refined = compute_sector_stats(
-        gdf_refined, df_sub, value_col="V", group_col="sector"
+        gdf_refined, anomaly_pots, value_col="V", group_col="sector"
     )
 
-    # Save refined geometries and stats
+    # Save refined geometries, stats and classified points
     logger.info("Saving refined geometries and stats...")
     gdf_refined.to_file(
         output_dir / f"{anomaly_base_name}_vector.geojson",
@@ -713,6 +626,10 @@ def run_anomaly_detection(
     )
     gdf_refined.drop(columns="geometry").to_csv(
         output_dir / f"{anomaly_base_name}_stats.csv",
+        index=False,
+    )
+    anomaly_pots.to_csv(
+        output_dir / f"{anomaly_base_name}_classified_points.csv",
         index=False,
     )
 
@@ -757,10 +674,10 @@ def run_anomaly_detection(
 
     logger.info(f"Refinement complete. Results in {output_dir}")
 
-    return gdf_refined, df_sub
+    return gdf_refined, anomaly_pots
 
 
-def run_pipeline(config: DictConfig | ListConfig):
+def run_pipeline(config: DictConfig | ListConfig) -> bool:
     """
     Main execution pipeline taking a fully merged configuration object.
     """
@@ -775,9 +692,28 @@ def run_pipeline(config: DictConfig | ListConfig):
         raise ValueError("reference_date must be provided via CLI or config.")
     reference_date_dt = datetime.strptime(reference_date, "%Y-%m-%d")
 
+    # Log some key configuration values for better traceability
+    logger.info(f"Processing reference date: {reference_date}")
+    logger.info(f"\tData source: {config.data.get('source', 'database')}")
+    logger.info(f"\tCamera name: {config.data.get('camera_name', 'N/A')}")
+    logger.info(
+        f"\tDt range DIC data selection: {config.data.get('dt_min')} - {config.data.get('dt_max')} hours"
+    )
+    logger.info(
+        f"\tDate range for data selection: {config.data.get('days_before_to_include', 0)} days before to {config.data.get('days_after_to_include', 0)} days after reference date"
+    )
+    logger.info(f"\tSpatial priors: {list(config.mcmc.priors.probability.keys())}")
+    logger.info(f"Spatial prior file: {config.data.sector_prior_path}")
+    logger.info(
+        f"\tInput features for clustering: {config.preprocessing.variables_names}"
+    )
+
     # Output base directory (output will be saved in a subfolder with camera name and date)
-    output_base_dir = Path(config.data.output_dir)
-    output_dir = output_base_dir / f"{config.data.camera_name}_{reference_date}"
+    output_base_dir = Path(config.data.base_output_dir)
+    if config.data.run_output_subdir:
+        output_dir = output_base_dir / config.data.run_output_subdir
+    else:
+        output_dir = output_base_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Define base names for outputs
@@ -820,11 +756,16 @@ def run_pipeline(config: DictConfig | ListConfig):
                 filename_pattern=pattern,
             )
 
+        if nc_path is None:
+            logger.error(f"No file found for reference date {reference_date}.")
+            return False
+
         try:
             # Pass image_dir from config if available
             base_img_dir = config.data.get("image_dir")
+            base_img_dir = Path(base_img_dir) if base_img_dir else None
             out, dic_analyses, img = read_data_from_pylamma_nc(
-                nc_path, base_image_dir=Path(base_img_dir) if base_img_dir else None
+                nc_path, base_image_dir=base_img_dir
             )
 
         except Exception as e:
@@ -845,8 +786,13 @@ def run_pipeline(config: DictConfig | ListConfig):
         out, dic_analyses, img = read_data_from_db(
             config, reference_date, ref_date_start, ref_date_end
         )
+
     else:
         raise ValueError(f"Unknown data source: {data_source}")
+
+    if out is None or dic_analyses is None:
+        logger.error("No valid data loaded. Aborting.")
+        return False
 
     date_start = dic_analyses.iloc[0]["master_timestamp"].strftime("%Y-%m-%d")
     date_end = dic_analyses.iloc[0]["slave_timestamp"].strftime("%Y-%m-%d")
@@ -884,20 +830,8 @@ def run_pipeline(config: DictConfig | ListConfig):
         # Overwrite the config object's dictionary with the filtered one
         config.mcmc.priors.probability = filtered_probs
 
-    # If the user asks for sectors that don't exist in the loaded polygon file,
-    # assume we want velocity-based unsupervised clustering.
-    # Example config for refinement:
-    # priors:
-    #   probability:
-    #     Base: [0.5, 0.5]
-    #     Fast: [0.5, 0.5]
+    # TODO: implement also the possibility to use other types of priors (e.g. velocity-based) without spatial sectors, but for now we require spatial priors if any priors are specified.
     use_spatial_priors = True
-    for name in config.mcmc.priors.probability:
-        if name not in sectors:
-            use_spatial_priors = False
-            break
-    use_velocity_priors_for_refinement = True  # TODO: hardcoded for now
-
     if use_spatial_priors:
         try:
             logger.info("Using SPATIAL priors from polygons.")
@@ -910,51 +844,20 @@ def run_pipeline(config: DictConfig | ListConfig):
                 fade_options=config.mcmc.priors.fade_options,
             )
         except Exception as exc:
-            logger.error(f"Failed to assign spatial priors: {exc}")
-            raise
+            raise RuntimeError(
+                "Error in spatial priors assignment. Check the sector geometries and prior probabilities configuration."
+            ) from exc
     else:
-        if use_velocity_priors_for_refinement:
-            logger.info(
-                "Target sectors not found in polygons. Switching to VELOCITY-BASED priors (Unsupervised)."
-            )
-            # Ensure we have exactly 2 components for this specific task
-            n_components = len(config.mcmc.priors.probability)
-            if n_components != 2:
-                logger.warning(
-                    "Velocity refinement is optimized for 2 components. Results may vary."
-                )
-
-            # Extract V column
-            v_data = dic_df["V"].to_numpy()
-
-            # Custom logic: Split by percentile
-            # Cluster 0 = Slow/Base, Cluster 1 = Fast
-            percentile_threshold = 90  # Top 10% guess - TODO: hardcoded for now
-            threshold = np.percentile(v_data, percentile_threshold)
-            prior_probs_array = np.zeros((len(v_data), n_components))
-            for i, v_val in enumerate(v_data):
-                if v_val > threshold:
-                    prior_probs_array[i, :] = [0.2, 0.8]  # 80% provof being Fast
-                else:
-                    prior_probs_array[i, :] = [0.8, 0.2]  # 80% chance of being Base
-
-            # Update sectors dictionary to match new fictitious names for the output handling
-            # We create a dummy geometry (envelope of all points) just to satisfy the pipeline
-            sectors = {
-                list(config.mcmc.priors.probability.keys())[0]: roi,  # Base
-                list(config.mcmc.priors.probability.keys())[1]: roi,  # Fast
-            }
-        else:
-            raise NotImplementedError(
-                "Velocity-based priors without spatial sectors is not implemented."
-            )
-            # Default: uniform priors across sectors (not used. fail if spatial priors requested)
-            # if not config.mcmc.priors.probability:
-            #     n_sectors = len(sectors)
-            #     uniform_prob = 1.0 / n_sectors
-            #     config.mcmc.priors.probability = {
-            #         name: [uniform_prob] * n_sectors for name in sectors
-            #     }
+        # Default: uniform priors across sectors (not used. fail if spatial priors requested)
+        # if not config.mcmc.priors.probability:
+        #     n_sectors = len(sectors)
+        #     uniform_prob = 1.0 / n_sectors
+        #     config.mcmc.priors.probability = {
+        #         name: [uniform_prob] * n_sectors for name in sectors
+        #     }
+        raise NotImplementedError(
+            "Velocity-based priors without spatial sectors is not implemented."
+        )
 
     # Perform MCMC clustering
     result, scaler = run_mcmc_clustering(
@@ -981,24 +884,7 @@ def run_pipeline(config: DictConfig | ListConfig):
         img=img,
     )
 
-    # ==== SAVE FINAL RESULTS ==== #
-    logger.info("Saving final sector results...")
-
-    # 1) Pythonized bundle with all dataframes and arrays
-    bundle = {
-        "reference_date": reference_date,
-        "date_start": date_start,
-        "date_end": date_end,
-        "dic_dataframe": dic_df,
-        "posterior_probs": result.posterior_probs,
-        "cluster_pred": result.cluster_pred,
-        "uncertainty": result.entropy,
-        "sectors": sectors,
-        "pts_by_sector": pts_by_sector,
-    }
-    joblib.dump(bundle, output_dir / f"{base_name}_results.joblib")
-
-    # Plot full summary
+    # Make a summary plot of the final sectors with points colored by velocity
     sector_colors = get_sector_colors(
         sectors["sector"].tolist(),
         colormap=config.plotting.default_discrete_cmap,
@@ -1016,18 +902,45 @@ def run_pipeline(config: DictConfig | ListConfig):
         dpi=150,
         save_svg=True,
     )
-    logger.info(
-        f"Final summary figure saved to {output_dir / f'{base_name}_kinematic_sectors_summary.jpg'}"
+
+    # Save Pythonized bundle with all dataframes and arrays
+    logger.info("Saving sector results...")
+    bundle = {
+        "reference_date": reference_date,
+        "date_start": date_start,
+        "date_end": date_end,
+        "dic_dataframe": dic_df,
+        "posterior_probs": result.posterior_probs,
+        "cluster_pred": result.cluster_pred,
+        "uncertainty": result.entropy,
+        "sectors": sectors,
+        "pts_by_sector": pts_by_sector,
+    }
+    joblib.dump(bundle, output_dir / f"{base_name}_results.joblib")
+
+    # Save geojson with sector geometries and stats in a common base folder
+    sector_vector_dir = output_base_dir / "kinematic_sectors_geojson"
+    sector_vector_dir.mkdir(exist_ok=True)
+    sectors.to_file(
+        sector_vector_dir / f"{base_name}_sectors_polygon.geojson",
+        driver="GeoJSON",
     )
+    pts_by_sector.to_file(
+        sector_vector_dir / f"{base_name}_sectors_points.geojson",
+        driver="GeoJSON",
+    )
+
     timer.update("post-processing")
 
     # === OPTIONAL: SECTOR REFINEMENT (e.g. Sector A sub-clustering) ===
+    anomaly_gdf = None  # Initialize anomaly_gdf to None
     if config.anomaly_detection.run_anomaly_detection:
         logger.info("Running Anomaly Detection...")
         target_sector = config.anomaly_detection.target_sector
         anomaly_dir = output_dir / f"anomaly_{target_sector}"
+
         try:
-            anomaly_gdf = run_anomaly_detection(
+            anomaly_gdf, anomaly_pts = run_anomaly_detection(
                 dic_df=dic_df,  # Pass full data, we filter inside
                 sectors_gdf=sectors,  # Pass the generated sectors from step 1
                 target_sector=target_sector,
@@ -1036,100 +949,152 @@ def run_pipeline(config: DictConfig | ListConfig):
                 img=img,
                 base_name=base_name,
             )
+
+            # Save anomaly geometry and points to geojson in a common folder for all days
+            anomaly_vector_dir = output_base_dir / "anomaly_A_geojson"
+            anomaly_vector_dir.mkdir(exist_ok=True)
+            anomaly_gdf.to_file(
+                anomaly_vector_dir / f"{base_name}_anomaly_A_polygon.geojson",
+                driver="GeoJSON",
+            )
+            anomaly_pts.to_file(
+                anomaly_vector_dir / f"{base_name}_anomaly_A_points.geojson",
+                driver="GeoJSON",
+            )
         except Exception as e:
             logger.error(f"Anomaly detection failed: {e}", exc_info=True)
 
     timer.update("anomaly_detection")
 
     # Make a final summary figure comparing all results ("Bollettino style")
-    # For the moment just copy the YYYY-MM-DAY_kinematic_sectors_summary.png figure to "kinematic_sectors" dir and the anomaly detection figure (ANOMALY_DIR/YYYY-MM-DAY_sectorA_anomaly_mcmc_results.jpg) if exists. In the future we can make a more complex summary figure with all the relevant info.
     # TODO: make a unified summary figure and remove hardcoded copying
     kinematic_sectors_dir = output_base_dir / "kinematic_sectors"
     kinematic_sectors_dir.mkdir(exist_ok=True)
-    summary_fig_path = output_dir / f"{base_name}_kinematic_sectors_summary.png"
-    if summary_fig_path.is_file():
-        shutil.copy(
-            summary_fig_path,
-            kinematic_sectors_dir / f"{base_name}_kinematic_sectors_summary.png",
-        )
-    else:
-        logger.warning(
-            f"Summary figure not found at {summary_fig_path}. Skipping copy."
+
+    sector_figure_path = output_dir / f"{base_name}_kinematic_sectors_summary.png"
+    summary_fig_path = kinematic_sectors_dir / f"{base_name}_bollettino.png"
+
+    # - Make the final bollettino figure with or without anomaly depending on the results of the anomaly detection step. If anomaly detection failed, we fallback to copying the summary figure without anomaly to the base folder for easier access.
+    try:
+        fig, axes = plot_sectors_summary(
+            sectors=sectors,
+            points_by_sector=pts_by_sector,
+            img=img,
+            colors=sector_colors,
+            output_dir=None,  # We will save manually after
+            unit="px",
+            quiver_kwargs=config.plotting.quiver,
+            figsize=(20, 10),
+            dpi=150,
+            save_svg=False,
         )
 
-    if config.anomaly_detection.run_anomaly_detection:
-        anomaly_dir = (
-            output_base_dir / f"anomaly_{config.anomaly_detection.target_sector}"
-        )
-        anomaly_dir.mkdir(exist_ok=True)
-        anomaly_fig_path = (
-            output_dir
-            / f"anomaly_{config.anomaly_detection.target_sector}"
-            / f"{base_name}_sector{config.anomaly_detection.target_sector}_anomaly_mcmc_results.jpg"
-        )
-        if anomaly_fig_path.is_file():
-            shutil.copy(
-                anomaly_fig_path,
-                anomaly_dir
-                / f"{base_name}_sector{config.anomaly_detection.target_sector}_anomaly_mcmc_results.jpg",
+        # If anomaly detection was successful and we have a valid anomaly geometry, we add it to the plot
+        if (
+            anomaly_gdf is not None
+            and not anomaly_gdf.empty
+            and anomaly_gdf.is_valid.any()
+        ):
+            # get the map axis from the previous plot and plot the anomaly geometry on top with a distinct color and label
+            map_ax = axes["map"]
+            anom_geoms = anomaly_gdf[anomaly_gdf["sector"] == "anomaly"].union_all()
+            anom_geoms = gpd.GeoSeries(anom_geoms)
+
+            # Add the anomaly geometry to the map with a distinct color and label. Keep the facecolor transparent to only show the edge
+            anom_geoms.plot(
+                ax=map_ax,
+                facecolor="none",
+                edgecolor="#d3ff0d",
+                linewidth=2,
+                label="Anomaly",
             )
+
+        fig.savefig(summary_fig_path, dpi=150)
+        # plt.close(fig)
+
+    except Exception as e:
+        logger.error(
+            f"Failed to plot summary with anomaly: {e}. Fallback to copy figure without anomaly.",
+            exc_info=True,
+        )
+        if sector_figure_path.is_file():
+            shutil.copy(sector_figure_path, summary_fig_path)
         else:
-            logger.warning(
-                f"Anomaly detection figure not found at {anomaly_fig_path}. Skipping copy."
+            logger.error(
+                f"Summary figure not found at {sector_figure_path}. Skipping copy."
             )
 
-        # Concatenate the anomaly vector to the sector geodataframe for a final summary plot
-        try:
-            file = (
-                output_dir
-                / f"anomaly_{config.anomaly_detection.target_sector}"
-                / f"{base_name}_sector{config.anomaly_detection.target_sector}_anomaly_vector.geojson"
-            )
-            anomaly_gdf = gpd.GeoDataFrame.from_file(file)
-            anomaly_gdf = anomaly_gdf.loc[
-                anomaly_gdf["sector"]
-                == f"{config.anomaly_detection.target_sector}_anomaly"
-            ]
-            # rename the anomaly with Z to make it visually distinct in the plot
-            anomaly_gdf["sector"] = anomaly_gdf["sector"].str.replace(
-                f"{config.anomaly_detection.target_sector}_anomaly",
-                "Z",
-            )
-            sector_with_anomaly = gpd.GeoDataFrame(
-                pd.concat(
-                    [sectors, anomaly_gdf],
-                    ignore_index=True,
-                ),
-                crs=sectors.crs,
-            )
+        # anomaly_dir = (
+        #     output_base_dir / f"anomaly_{config.anomaly_detection.target_sector}"
+        # )
+        # anomaly_dir.mkdir(exist_ok=True)
+        # anomaly_fig_path = (
+        #     output_dir
+        #     / f"anomaly_{config.anomaly_detection.target_sector}"
+        #     / f"{base_name}_sector{config.anomaly_detection.target_sector}_anomaly_mcmc_results.jpg"
+        # )
+        # if anomaly_fig_path.is_file():
+        #     shutil.copy(
+        #         anomaly_fig_path,
+        #         anomaly_dir
+        #         / f"{base_name}_sector{config.anomaly_detection.target_sector}_anomaly_mcmc_results.jpg",
+        #     )
+        # else:
+        #     logger.warning(
+        #         f"Anomaly detection figure not found at {anomaly_fig_path}. Skipping copy."
+        #     )
 
-            # Add a specific color for the anomaly sector (Z)
-            sector_anomaly_colors = sector_colors.copy()
-            sector_anomaly_colors["Z"] = "#d3ff0d"
-            plot_sectors_summary(
-                sectors=sector_with_anomaly,
-                points_by_sector=pts_by_sector,
-                img=img,
-                colors=sector_anomaly_colors,
-                output_dir=anomaly_dir,
-                base_name=f"{base_name}_sector{config.anomaly_detection.target_sector}_anomaly",
-                unit="px",
-                quiver_kwargs=config.plotting.quiver,
-                figsize=(20, 10),
-                dpi=150,
-                save_svg=False,
-            )
-        except Exception as e:
-            logger.error(f"Failed to plot summary with anomaly: {e}", exc_info=True)
-    logger.info(
-        f"Final summary figure saved to {output_dir / f'{base_name}_kinematic_sectors_summary.jpg'}"
-    )
+        # # Concatenate the anomaly vector to the sector geodataframe for a final summary plot
+        # try:
+        #     file = (
+        #         output_dir
+        #         / f"anomaly_{config.anomaly_detection.target_sector}"
+        #         / f"{base_name}_sector{config.anomaly_detection.target_sector}_anomaly_vector.geojson"
+        #     )
+        #     anomaly_gdf = gpd.GeoDataFrame.from_file(file)
+        #     anomaly_gdf = anomaly_gdf.loc[
+        #         anomaly_gdf["sector"]
+        #         == f"{config.anomaly_detection.target_sector}_anomaly"
+        #     ]
+        #     # rename the anomaly with Z to make it visually distinct in the plot
+        #     anomaly_gdf["sector"] = anomaly_gdf["sector"].str.replace(
+        #         f"{config.anomaly_detection.target_sector}_anomaly",
+        #         "Z",
+        #     )
+        #     sector_with_anomaly = gpd.GeoDataFrame(
+        #         pd.concat(
+        #             [sectors, anomaly_gdf],
+        #             ignore_index=True,
+        #         ),
+        #         crs=sectors.crs,
+        #     )
+
+        #     # Add a specific color for the anomaly sector (Z)
+        #     sector_anomaly_colors = sector_colors.copy()
+        #     sector_anomaly_colors["Z"] = "#d3ff0d"
+        #     plot_sectors_summary(
+        #         sectors=sector_with_anomaly,
+        #         points_by_sector=pts_by_sector,
+        #         img=img,
+        #         colors=sector_anomaly_colors,
+        #         output_dir=anomaly_dir,
+        #         base_name=f"{base_name}_sector{config.anomaly_detection.target_sector}_anomaly",
+        #         unit="px",
+        #         quiver_kwargs=config.plotting.quiver,
+        #         figsize=(20, 10),
+        #         dpi=150,
+        #         save_svg=False,
+        #     )
+        # except Exception as e:
+        #     logger.error(f"Failed to plot summary with anomaly: {e}", exc_info=True)
 
     logger.info("Processing complete.")
     timer.print()
 
+    return True
 
-if __name__ == "__main__":
+
+def main():
     args = parse_arguments()
 
     # 1. Load Base Config
@@ -1140,7 +1105,7 @@ if __name__ == "__main__":
     if args.date:
         config.data.reference_date = args.date
     if args.output_dir:
-        config.data.output_dir = args.output_dir
+        config.data.base_output_dir = args.output_dir
 
     # 3. Apply Generic Dotlist Overrides
     if args.overrides:
@@ -1169,4 +1134,134 @@ if __name__ == "__main__":
     # This computes all interpolations (e.g. ${data.output_dir}) now.
     OmegaConf.resolve(config)
 
-    run_pipeline(config)
+    # Run the main pipeline with error handling to ensure that if something goes wrong, we log it and optionally clean up any partial outputs.
+    base_output_dir = Path(config.data.base_output_dir)
+    run_output_subdir = config.data.get("run_output_subdir", None)
+    if run_output_subdir:
+        output_dir = base_output_dir / run_output_subdir
+    else:
+        output_dir = base_output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.skip_existing and output_dir.exists():
+        logger.info(f"Skipping run: output directory {output_dir} already exists.")
+        return
+
+    # Force CPU for MCMC if specified in config to avoid potential GPU-related issues with JAX in some environments. This should be set before any JAX imports.
+    if config.mcmc.force_cpu:
+        os.environ["JAX_PLATFORMS"] = "cpu"
+
+    try:
+        result = run_pipeline(config)
+    except Exception as e:
+        logger.error(f"Processing failed: {e}")
+        if not args.keep_failed_output:
+            logger.info(f"Cleaning up output directory {output_dir} due to failure.")
+            shutil.rmtree(output_dir, ignore_errors=True)
+        raise
+
+    if result:
+        logger.info(f"Pipeline completed successfully. Outputs saved to {output_dir}")
+    else:
+        logger.error("Pipeline did not complete successfully. Check logs for details.")
+        if not args.keep_failed_output:
+            logger.info(
+                f"Cleaning up output directory {output_dir} due to incomplete results."
+            )
+            shutil.rmtree(output_dir, ignore_errors=True)
+
+
+def run_multiscale_mcmc_deprecated(
+    dic_df: pd.DataFrame,
+    prior_probs_array: np.ndarray,
+    sectors: Any,
+    config: DictConfig | ListConfig,
+):
+    """
+    DEPRECATED: Multiscale approach iterating over sigma values.
+    Kept for reference but not used in the active pipeline.
+    """
+
+    raise NotImplementedError(
+        "Multiscale MCMC clustering is currently deprecated and not maintained. This function is kept for reference but should not be used in the active pipeline. The old result dict was replaced with a ClusteringResult object that does not contain 'sigma' key anymore."
+    )
+
+    # results = []
+    # if config.multiscale.sigma_values is None:
+    #     return None
+
+    #     # Loop through smoothing scales
+    #     results = []
+    #     for sigma in config.multiscale.sigma_values:
+    #         logger.info(f"Processing with Gaussian smoothing sigma={sigma}...")
+
+    #         # Create scale-specific base name
+    #         scale_base_name = f"{mcmc_base_name}_sigma{sigma}"
+
+    #         # Apply Gaussian smoothing if needed (skipped for sigma=0)
+    #         df_run = apply_2d_gaussian_filter(dic_df, sigma=sigma)
+
+    #         # Preprocess features for clustering
+    #         data_array_scaled, scaler, velocities, transform_info = preprocess_features(
+    #             df_input=df_run,
+    #             variables_names=config.data.variables_names,
+    #             transform_velocity=config.mcmc.velocity_transform,
+    #             transform_params=config.mcmc.transform_params,
+    #         )
+    #         joblib.dump(scaler, output_dir / f"{scale_base_name}_scaler.joblib")
+
+    #         # Run MCMC clustering with the a gaussian mixture model
+    #         if sigma > 2:  # For larger sigma, tighten priors
+    #             mu_params = {"mu": 0, "sigma": 0.5}
+    #             sigma_params = {"sigma": 0.5}
+    #         else:
+    #             mu_params = config.mcmc.model_options.mu_params
+    #             sigma_params = config.mcmc.model_options.sigma_params
+    #         result = clusterize_gaussian_mixture(
+    #             data_array_scaled=data_array_scaled,
+    #             prior_probs=prior_probs_array,
+    #             sectors=sectors,
+    #             sample_args=config.mcmc.sample_options,
+    #             mu_params=mu_params,
+    #             sigma_params=sigma_params,
+    #             feature_weights=config.mcmc.feature_weights,
+    #             apply_mrf_regularization=config.mcmc.mrf_regularization,
+    #             mrf_kwargs=config.mcmc.mrf_kwargs,
+    #             second_pass=config.mcmc.second_pass,
+    #             second_pass_sample_args=config.mcmc.second_pass_sample_args,
+    #             random_seed=config.random_seed,
+    #         )
+
+    #         # --- Save sampling summary ---
+    #         save_sampling_summary(
+    #             convergence_flag=result["convergence_flag"],
+    #             idata=result["idata"],
+    #             output_dir=output_dir,
+    #             base_name=scale_base_name,
+    #         )
+
+    #         # Add scale information to result
+    #         # result["sigma"] = sigma
+
+    #         # Append to results list
+    #         results.append(result)
+
+    # # --- Save final clustering results ---
+    # cluster_aggregation_outs = {
+    #     "cluster_pred": cluster_pred,
+    #     "posterior_probs": posterior_probs,
+    #     "entropy": entropy,
+    #     "similarity_matrix": similarity_matrix,
+    #     "stability_score": stability_score,
+    #     "valid_scales": valid_scales,
+    # }
+    # joblib.dump(
+    #     cluster_aggregation_outs,
+    #     output_dir / f"{mcmc_base_name}_clustering_results_raw.joblib",
+    # )
+
+    # return results
+
+
+if __name__ == "__main__":
+    main()

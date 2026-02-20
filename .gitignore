@@ -16,8 +16,11 @@ plot*/
 output*/
 data*/
 nohup.out
-.log
-.logs/
+.log*
+.logs*/
+log*
+logs/
+log/
 progress*
 presentations/
 
