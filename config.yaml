@@ -6,20 +6,20 @@ data:
   # Data Source Configuration
   source: "file" # "database" or "file"
   file_path: null    # Path to input file (e.g. NetCDF) if source is "file"
-  search_dir: "/mnt/irpinas/planpincieux/ppcx_dic/data/${data.year}/correlation/day_dic_ensemble_netcdf/" # Directory to search for input files if source is "file". Can use glob patterns (e.g., "data/2017/*.nc") to specify multiple files.
+  search_dir: "/mnt/irpinas/planpincieux/data/${data.year}/correlation/day_dic_ensemble_netcdf/" # Directory to search for input files if source is "file". Can use glob patterns (e.g., "data/2017/*.nc") to specify multiple files.
   search_pattern: 'day_dic_(?P<slave>\d{4}-\d{2}-\d{2})_(?P<master>\d{4}-\d{2}-\d{2})_dt(?P<dt>\d+)_.*\.nc' # Regular expression pattern to extract slave date, master date, and time difference  from filenames when source is "file". The pattern should include named groups for the relevant metadata. For example:
   #   'day_dic_(?P<slave>\d{4}-\d{2}-\d{2})_(?P<master>\d{4}-\d{2}-\d{2})_dt(?P<dt>\d+)_.*\.nc'
   #   This pattern match filename like:
   #   "day_dic_2025-01-08_2025-01-01_dt7_ensemble2.nc".
-  image_dir: "/mnt/irpinas/planpincieux/ppcx_dic/data/${data.year}/coregistration/coregistered/"
+  image_dir: "/mnt/irpinas/planpincieux/data/${data.year}/coregistration/coregistered/"
 
   # Database query parameters. Used only if source is "database"
   camera_name: "PPCX_Tele" # Name of the camera ("PPCX_Tele", "PPCX_Wide").
   days_before_to_include: 0 # Number of days before the reference date to include in the analysis. 
   days_after_to_include: 0 # Number of days after the reference date to include in the analysis.
 
-  dt_min: 24  # Minimum time difference between images in hours. Used both for files and database sources. 70
-  dt_max: 120  # Maximum time difference between images in hours. Used both for files and database sources. 100
+  dt_min: 48  # Minimum time difference between images in hours. Used both for files and database sources.
+  dt_max: 96  # Maximum time difference between images in hours. Used both for files and database sources.
 
   # Priors and ROI
   sector_prior_path: "data/${data.year}*.zip" # Path to CVAT ZIP file containing sector prior polygons (and optionally ROI polygon)
@@ -41,7 +41,7 @@ preprocessing:
   filter_kwargs:
     min_velocity: 0.5  # Minimum velocity threshold (units depend on input data)
     filter_outliers: false
-    tails_percentile: 0.005
+    tails_percentile: 0.005 # Percentile for outlier filtering (e.g., 0.005 means removing the top and bottom 0.5% of velocity values as outliers)
     apply_2d_median: false
     median_window_size: 5
     median_threshold_factor: 3
@@ -49,7 +49,7 @@ preprocessing:
     gaussian_sigma: 1.0
     apply_lamma_filter: true
     lamma_method: "Neighbours"
-    lamma_k: 8
+    lamma_k: 16
 
 # MCMC parameters
 mcmc:
@@ -69,12 +69,26 @@ mcmc:
     chains: 4 # Number of parallel chains. With fewer chains, increase draws to compensate.
     cores: 4  # Number of CPU cores to use for parallel sampling (usually set to number of chains)
   force_cpu: false # Whether to force CPU sampling even if GPU is available (default: false, use GPU if available)
-  model_options:
+  model_options:   # Prior for the cluster MEANS (Z-scores) These can be set as scalar values (same for all clusters) or as per-cluster arrays to encode different expected velocity ranges for each sector. The latter can help guide the model towards more realistic solutions based on domain knowledge. For example, if we know that sector A is typically faster than B, which is faster than C and D, we can set higher mean priors for A and lower for D. The sigma values control how strongly the model adheres to these priors (lower sigma means stronger adherence).
+  # NOTE: these priors are on the standardized features (Z-scores), so they represent how many standard deviations away from the overall mean we expect each cluster's mean to be. For example, a mu of 2 means we expect that cluster to be centered around 2 standard deviations above the overall mean velocity.
+
+    # Scalar (same prior for all clusters) — works as before:
+    # mu_params:
+    #   mu: 0
+    #   sigma: 1
+    # sigma_params:
+    #   sigma: 1
+
+    # Per-cluster (A=fast, B=med, C=slow, D=slowest):
     mu_params:
-      mu: 0
-      sigma: 1
+      mu: [2, 1, -0.5, -1.0] 
+      sigma:  [1, 1, 0.5, 0.5] 
+
+    # Prior for the cluster WIDTHS (Standard Deviation of the cluster itself)
     sigma_params:
-      sigma: 1
+      # If you have domain knowledge about the expected variability within each sector, you can set different sigma values for each cluster. For example, if sector A is more homogeneous (less variable) than D, you can set a lower sigma for A and a higher one for D. This helps the model capture the expected internal variability of each sector more accurately.
+      sigma: [0.3, 0.5, 1, 1]
+
 
   # --- Markov Random Field (MRF) Regularization ---
   # Balances spatial smoothing (neighbors) against data fidelity (velocity/location).
@@ -150,7 +164,7 @@ plotting:
     vmax: 15
 
 anomaly_detection:
-  run_anomaly_detection: true
+  run_anomaly_detection: false # Whether to run the anomaly detection module (default: false)
   target_sector: "A" # Sector to analyze for anomalies (e.g., "A")
   prior_percentile_threshold: 95 # Percentile threshold for velocity-based priors (e.g., 90 means points above the 90th percentile of velocity are more likely to be anomalies)
   # variables_names: ["V", "u"] # TODO: This is hardcoded in the code, now we are using V and V_trans (direction)

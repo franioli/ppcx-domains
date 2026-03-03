@@ -1,38 +1,28 @@
-"""Batch launcher for ppcx_mcmc_clustering.py -- run many reference dates.
+"""Run `ppcx_identify_domains.py` over multiple dates (local runner).
 
-This script acts as a "job generator" and runner. 
-You can run it directly (using Python's ThreadPoolExecutor) or use --dry-run to generate 
-commands for external tools like GNU Parallel.
+This script executes `ppcx_identify_domains.py` for many reference dates by
+invoking it in subprocesses and managing concurrency with a
+`ThreadPoolExecutor`. It is intended for interactive or single-node runs where
+the launcher should manage parallelism. For large-scale batch processing and
+cluster submission, use `ppcx_prepare_job_file.py` to generate a job list and
+run it with GNU Parallel.
 
-Any additional arguments passed to this script (that are not recognized flags) 
-will be forwarded directly to the underlying script. 
+Any additional arguments passed to this script (that are not recognized flags)
+will be forwarded directly to the underlying clustering script.
 
 ------------------------------------------------------------------------
 EXAMPLES
 ------------------------------------------------------------------------
 
-1. DIRECT EXECUTION (Python handles parallelism)
-   Run a date range with config overrides:
-     python clusterize_batch.py --date-range 2020-06-01 2020-06-05 --jobs 4 data.dt_min=12
+1. Run a range of dates locally with parallel threads:
+    python ppcx_run_batch.py --date-range 2020-06-01 2020-06-05 --jobs 4
 
-2. MULTIPLE DATE RANGES
-     python clusterize_batch.py \\
-       --date-range 2016-06-01 2016-10-30 \\
-       --date-range 2017-06-01 2017-10-30
+2. Run a single date:
+    python ppcx_run_batch.py --dates 2020-07-01
 
-3. ROBUST BATCH EXECUTION (Recommended for production)
-   Use --dry-run to generate the list of commands, then pipe to GNU Parallel.
-
-     # Step 1: Generate command list
-     python clusterize_batch.py --date-range 2020-06-01 2020-08-01 --dry-run > jobs.txt
-
-     # Step 2: Run with GNU Parallel
-     parallel -j 4 --bar --joblog run.log --resume < jobs.txt
-
-4. GPU EXECUTION (Single Node)
-     export XLA_PYTHON_CLIENT_PREALLOCATE=false
-     export XLA_PYTHON_CLIENT_MEM_FRACTION=.45
-     parallel -j 2 --bar < jobs.txt
+3. Generate a job file with `ppcx_prepare_job_file.py` and run with GNU Parallel:
+    python ppcx_prepare_job_file.py --date-range 2020-06-01 2020-08-01 > jobs.txt
+    parallel -j 4 --bar --joblog run.log --resume < jobs.txt
 """
 
 import argparse
@@ -62,8 +52,8 @@ def parse_args():
     )
     parser.add_argument(
         "--script-path",
-        default="ppcx_mcmc_clustering.py",
-        help="Path to the clustering script to run (default: ppcx_mcmc_clustering.py).",
+        default="ppcx_identify_domains.py",
+        help="Path to the clustering script to run (default: ppcx_identify_domains.py).",
     )
 
     # --- Date input options (not mutually exclusive: ranges + explicit dates can coexist) ---
@@ -148,10 +138,11 @@ def _expand_date_range(start: str, end: str) -> list[str]:
 def _load_dates_from_file(path: Path) -> list[str]:
     dates = []
     with open(path) as fh:
-        for row in fh:
-            s = row.strip()
-            if s:
-                dates.append(s)
+        for r in fh:
+            s = r.strip()
+            if not s:
+                continue
+            dates.append(s)
     return dates
 
 
@@ -270,17 +261,6 @@ def run_subprocess_task(
         return False
 
 
-def _load_dates_from_file(path: Path):
-    dates = []
-    with open(path) as fh:
-        for r in fh:
-            s = r.strip()
-            if not s:
-                continue
-            dates.append(s)
-    return dates
-
-
 def _cleanup_partial_results(date: str):
     """Remove partial output directories for a failed date."""
     import shutil
@@ -314,8 +294,6 @@ def _cleanup_partial_results(date: str):
 
 
 if __name__ == "__main__":
-    import shlex
-
     # parse arguments, including extra args for the clustering script
     args, extra_args = parse_args()
 
@@ -333,12 +311,6 @@ if __name__ == "__main__":
         if extra_args:
             cmd.extend(extra_args)
         tasks.append((d, cmd))
-
-    # If dry-run, just print commands and exit (useful for GNU Parallel)
-    if args.dry_run:
-        for _, cmd in tasks:
-            print(shlex.join(cmd))
-        sys.exit(0)
 
     # === Execute tasks ===
     logger.info(f"Total dates to process: {len(dates)}")

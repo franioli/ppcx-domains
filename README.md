@@ -6,7 +6,7 @@ This repository contains scripts and utilities for batch and single-date cluster
 
 ## Clusterization Scripts Overview
 
-### 1. `ppcx_mcmc_clustering.py`
+### 1. `ppcx_identify_domains.py`
 
 - **Purpose:** Runs MCMC-based clustering for a single reference date.
 - **Inputs:** Reference date, config file (optional), and CLI overrides.
@@ -14,52 +14,55 @@ This repository contains scripts and utilities for batch and single-date cluster
 
 #### **Basic Usage (Single Date):**
 ```bash
-python ppcx_mcmc_clustering.py --date 2023-07-01 --config config.yaml
+python ppcx_identify_domains.py --date 2023-07-01 --config config.yaml
 ```
 You can override config parameters directly from the CLI:
 ```bash
-python ppcx_mcmc_clustering.py --date 2023-07-01 data.dt_min=12 mcmc.sample_options.draws=500
+python ppcx_identify_domains.py --date 2023-07-01 data.dt_min=12 mcmc.sample_options.draws=500
 ```
 
----
+## Batch Processing with a local runner (Not recommended for large processing):
 
-### 2. `clusterize_batch.py`
+If you want to run the clusterization for multiple dates on a single machine, you can use the local runner script `ppcx_run_batch.py`.
+This script uses a local runner that executes `ppcx_identify_domains.py` for multiple dates using a `ThreadPoolExecutor` to manage concurrency. 
 
-- **Purpose:** Batch launcher for running `ppcx_mcmc_clustering.py` over many dates, with parallelization and robust logging.
-- **Modes:**
-	- **Direct execution:** Python handles parallelism.
-	- **Dry-run:** Generates command lines for external tools (e.g., GNU Parallel).
-
-#### **Run a Range of Dates (Direct Execution):**
+Run a range of dates:
 ```bash
-python clusterize_batch.py --date-range 2023-06-01 2023-06-05 --jobs 4 data.dt_min=12
+python ppcx_run_batch.py --date-range 2023-06-01 2023-06-30
 ```
 
-#### **Run Multiple Date Ranges:**
+Run a range of dates with 4 parallel jobs and override the minimum time step:
 
 ```bash
-python clusterize_batch.py \
-	--date-range 2022-06-01 2022-10-30 \
-	--date-range 2023-06-01 2023-10-30
+python ppcx_run_batch.py --date-range 2023-06-01 2023-06-05 --jobs 4 data.dt_min=12
 ```
 
-#### **Dry-Run Mode (Recommended for Production):**
-Generate a list of commands for external batch tools:
+Run Multiple Date Ranges:
+
 ```bash
-python clusterize_batch.py --date-range 2023-06-01 2023-08-01 --dry-run > jobs.txt
+python ppcx_run_batch.py \
+		--date-range 2022-06-01 2022-10-30 \
+		--date-range 2023-06-01 2023-10-30
 ```
 
+## Batch Processing with GNU Parallel (Recommended for Production):
 
-## Batch Processing with GNU Parallel
+To process a large number of dates efficiently, especially on a remote server, it's recommended to generate a job file and use GNU Parallel or similar batch tools. 
+This approach allows for better resource management, monitoring, and the ability to resume failed jobs.
+
+To generate a job file, use the `ppcx_prepare_job_file.py` script, which creates a list of commands for each date in the specified range. 
+You can then feed this job file into GNU Parallel for execution.
+
+Generate a list of commands for external batch tools with the job generator:
 
 **Step 1: Generate the job list**
 ```bash
-python clusterize_batch.py --date-range 2023-06-01 2023-08-01 --dry-run > jobs.txt
+python ppcx_prepare_job_file.py --date-range 2023-06-01 2023-08-01 > jobs.job
 ```
 
 **Step 2: Run with GNU Parallel**
 ```bash
-parallel -j 4 --bar --joblog run.log --resume < jobs.txt
+parallel -j 4 --bar --joblog run.log --resume < jobs.job
 ```
 - `-j 4`: Number of parallel jobs (adjust to your CPU/GPU resources).
 - `--bar`: Shows a progress bar.
@@ -68,7 +71,7 @@ parallel -j 4 --bar --joblog run.log --resume < jobs.txt
 
 To keep jobs running after disconnecting from SSH, use:
 ```bash
-nohup parallel -j 4 --bar --joblog run.log --resume < jobs.txt > parallel.out 2>&1 &
+nohup parallel -j 4 --bar --joblog run.log --resume < jobs.job > parallel.out 2>&1 &
 ```
 ### Log Output: Inspecting and Retrying Failed Jobs
 
@@ -78,7 +81,7 @@ Each line in the joblog corresponds to a job and contains 9 columns:
 
 | Column | Name      | Description                                                                 |
 |--------|-----------|-----------------------------------------------------------------------------|
-| 1      | Seq       | Job number from jobs.txt (submission order)                                 |
+| 1      | Seq       | Job number from jobs.job (submission order)                                 |
 | 2      | Host      | Machine that ran the job (`:` means localhost)                              |
 | 3      | Starttime | Unix epoch timestamp when the job started                                   |
 | 4      | JobRuntime| Wall-clock seconds the job took to complete                                 |
@@ -90,17 +93,13 @@ Each line in the joblog corresponds to a job and contains 9 columns:
 
 Example log line:
 ```
-8    :     1771524402.556  4.042       0     0        1        0       python3 ppcx_mcmc_clustering.py --date 2015-06-08
+8    :     1771524402.556  4.042       0     0        1        0       python3 ppcx_identify_domains.py --date 2015-06-08
 ```
 
 Useful commands to analyze the log:
 - See all failed jobs with full details:
   ```bash
   awk 'NR>1 && $7 != 0' run.log
-  ```
--  Extract just the failed dates:
-  ```bash
-  awk 'NR>1 && $7 != 0' run.log | grep -oP '\-\-date \K[0-9-]+'
   ```
 - Show jobs killed by a signal (e.g., OOM killer):
   ```bash
@@ -123,7 +122,7 @@ Useful commands to analyze the log:
 GNU Parallel can automatically retry failed jobs using the `--retries` option. For example, to retry each failed job up to 3 times:
 
 ```bash
-parallel  -j 4 --bar --joblog run.log --resume-failed < jobs.txt
+parallel -j 4 --bar --joblog run.log --resume-failed < jobs.job
 ```
 
 This will only retry jobs that previously failed (non-zero exit code), making it easy to recover from transient errors or missing dependencies.
@@ -135,7 +134,7 @@ cc
 To keep the processing running on a remote server even after the client disconnects via ssh, use `nohup`:
 
 ```bash
-nohup parallel -j 8 --bar --joblog run.log --resume < jobs.txt > parallel.out 2>&1 &
+nohup parallel -j 8 --bar --joblog run.log --resume < jobs.job > parallel.out 2>&1 &
 ```
 
 This will run the job in the background and save all output to `parallel.out`, allowing you to safely disconnect from your session.

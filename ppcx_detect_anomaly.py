@@ -44,10 +44,12 @@ from ppcluster.sectors import (
     classify_points_by_polygons,
     clean_vector_sectors,
     compute_sector_stats,
+    vectorize_gridded_sectors,
+)
+from ppcluster.visualization import (
     get_sector_colors,
     plot_sectors,
     plot_sectors_summary,
-    vectorize_gridded_sectors,
 )
 
 logger = setup_logger(level=logging.INFO, name="ppcx")
@@ -116,7 +118,7 @@ def preprocess_dic_data(
         preproc_config: Dictionary of preprocessing parameters.
 
     Returns:
-        pd.DataFrame: The fully preprocessed and stacked DataFrame.
+        pd.DataFrame: The fully preprocessed and stacked DataFramdPl
     """
     processed = []
     for src_id, df_src in out.items():
@@ -972,7 +974,7 @@ def run_pipeline(config: DictConfig | ListConfig) -> bool:
     kinematic_sectors_dir.mkdir(exist_ok=True)
 
     sector_figure_path = output_dir / f"{base_name}_kinematic_sectors_summary.png"
-    summary_fig_path = kinematic_sectors_dir / f"{base_name}_bollettino.png"
+    summary_fig_path = kinematic_sectors_dir / f"{base_name}.png"
 
     # - Make the final bollettino figure with or without anomaly depending on the results of the anomaly detection step. If anomaly detection failed, we fallback to copying the summary figure without anomaly to the base folder for easier access.
     try:
@@ -1141,11 +1143,14 @@ def main():
         output_dir = base_output_dir / run_output_subdir
     else:
         output_dir = base_output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Check if output directory already exists and skip if --skip-existing is set. This prevents overwriting previous runs and allows for safe re-runs without manual cleanup.
     if args.skip_existing and output_dir.exists():
         logger.info(f"Skipping run: output directory {output_dir} already exists.")
         return
+
+    # Create output directory before running the pipeline
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # Force CPU for MCMC if specified in config to avoid potential GPU-related issues with JAX in some environments. This should be set before any JAX imports.
     if config.mcmc.force_cpu:

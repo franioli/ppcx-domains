@@ -23,6 +23,7 @@ logs/
 log/
 progress*
 presentations/
+*.job
 
 # SMB credentials - never commit these!
 smb_credentials.txt

@@ -226,6 +226,18 @@ def clusterize_gaussian_mixture(
     # Initializations
     priors = prior_probs.copy()
 
+    # Convert parameter values to plain numpy (handles OmegaConf ListConfig, plain lists, etc.)
+    def _to_numpy(params_dict, key):
+        if key not in params_dict:
+            return
+        val = params_dict[key]
+        if isinstance(val, (list, tuple)):
+            params_dict[key] = np.array(val, dtype=float)
+
+    _to_numpy(mu_params, "mu")
+    _to_numpy(mu_params, "sigma")
+    _to_numpy(sigma_params, "sigma")
+
     # Build model
     model = build_marginalized_mixture_model(
         data_array_scaled,

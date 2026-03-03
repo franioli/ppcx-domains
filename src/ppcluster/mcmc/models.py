@@ -81,6 +81,18 @@ def build_marginalized_mixture_model(
         # ------------------------------------------------------------------
         # 2. Priors for Cluster Parameters (Mu, Sigma)
         # ------------------------------------------------------------------
+        # mu_params["mu"] and mu_params["sigma"] can be:
+        #   - scalar (float/int): same prior for all clusters
+        #   - 1-D array of length K: per-cluster prior
+        # sigma_params["sigma"] follows the same convention.
+        #
+        # For mu_feat0 (shape (k,)): pass values as-is (scalar broadcasts, (k,) maps 1-to-1).
+        # For sigma (shape (k, n_features)): we need (k, n_features) or scalar.
+        #   If user gave a 1-D array of length K (per-cluster), reshape to (k, 1)
+        #   so it broadcasts over the feature axis.
+
+        mu_mu = mu_params["mu"]  # scalar or array(k,)
+        mu_sigma = mu_params["sigma"]  # scalar or array(k,)
 
         # -- Parameters for the FIRST feature (assumed to be Velocity 'V') --
         if enforce_ordered_means:
@@ -89,19 +101,20 @@ def build_marginalized_mixture_model(
             # We use an ordered transform on the first feature's means.
             mu_0 = pm.Normal(
                 "mu_feat0",
-                mu=mu_params["mu"],
-                sigma=mu_params["sigma"],
+                mu=mu_mu,
+                sigma=mu_sigma,
                 shape=(k,),
                 transform=pm.distributions.transforms.ordered,
                 # Initialization helper: spread means out to help constraint satisfaction
                 initval=np.linspace(mu_params["mu"] - 1, mu_params["mu"] + 1, k),
             )
+
         else:
             # Standard independent means for feature 0
             mu_0 = pm.Normal(
                 "mu_feat0",
-                mu=mu_params["mu"],
-                sigma=mu_params["sigma"],
+                mu=mu_mu,
+                sigma=mu_sigma,
                 shape=(k,),
             )
 
@@ -126,9 +139,16 @@ def build_marginalized_mixture_model(
 
         # -- Standard Deviations (HalfNormal) --
         # We assume diagonal covariance (features are independent given cluster)
-        sigma = pm.HalfNormal(
-            "sigma", sigma_params["sigma"], dims=("cluster", "feature")
-        )
+        # Prepare sigma prior: if 1-D array(k,), reshape to (k,1) for broadcasting
+        sig_val = sigma_params["sigma"]
+        if (
+            isinstance(sig_val, np.ndarray)
+            and sig_val.ndim == 1
+            and sig_val.shape[0] == k
+        ):
+            sig_val = sig_val.reshape(k, 1)
+
+        sigma = pm.HalfNormal("sigma", sig_val, dims=("cluster", "feature"))
 
         # ------------------------------------------------------------------
         # 3. Likelihood Construction (Marginalized)

@@ -10,7 +10,6 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 from omegaconf import DictConfig, ListConfig
-from PIL import Image
 from sqlalchemy import create_engine
 
 from ppcluster.cvat import (
@@ -83,15 +82,15 @@ def read_data_from_db(
     return out, dic_analyses, img
 
 
-def find_ensemble_file(
+def find_ensemble_files(
     search_dir: Path,
     reference_date: str,
     dt_hours_min: int,
     dt_hours_max: int,
     filename_pattern: str | None = None,
-) -> Path | None:
+) -> list[Path]:
     """
-    Find an ensemble NetCDF file in search_dir matching the reference date and dt range.
+    Find ensemble NetCDF files in search_dir matching the reference date and dt range.
 
     Args:
         search_dir: Directory to search in.
@@ -101,7 +100,7 @@ def find_ensemble_file(
         filename_pattern: Optional regex pattern. If None, uses default:
                           'day_dic_(?P<slave>\d{4}-\d{2}-\d{2})_(?P<master>\d{4}-\d{2}-\d{2})_dt(?P<dt>\d+)_.*\.nc'
     Returns:
-        Path to the selected NetCDF file, or None if no suitable file is found.
+        List[Path] of selected NetCDF files matching the criteria, sorted by dt and filename. If no files match, returns an empty list.
     """
     if not search_dir.exists():
         raise FileNotFoundError(f"Search directory does not exist: {search_dir}")
@@ -129,7 +128,6 @@ def find_ensemble_file(
     )
 
     candidates = []
-
     for file_path in search_dir.glob("*.nc"):
         match = regex.match(file_path.name)
         if not match:
@@ -161,9 +159,9 @@ def find_ensemble_file(
             f"No ensemble files found in {search_dir} matching reference date {reference_date} "
             f"and dt range {dt_days_min}-{dt_days_max} days."
         )
-        return None
+        return []
 
-    # Sort candidates by extracted dt (if present) and take the middle one when multiple exist
+    # Sort candidates by extracted dt (if present)
     file_dt_pairs = []
     for p in candidates:
         m = regex.match(p.name)
@@ -174,28 +172,20 @@ def find_ensemble_file(
                 dt_val = int(dt_str)
             except Exception:
                 dt_val = None
-        # treat missing dt as -1 so they appear first in sorted order
         file_dt_pairs.append((p, dt_val if dt_val is not None else -1))
 
     # sort by dt then filename for deterministic order
     file_dt_pairs.sort(key=lambda t: (t[1], t[0].name))
 
-    # If multiple candidates, select the one in the middle of the sorted list to avoid always picking the same one if many match
-    if len(file_dt_pairs) > 1:
-        logger.warning(
-            f"Multiple matching files found: {[p.name for p, _ in file_dt_pairs]}. "
-            "Selecting the middle file by dt order."
-        )
-    mid_idx = len(file_dt_pairs) // 2
-    selected_file = file_dt_pairs[mid_idx][0]
-    logger.info(f"Auto-selected file: {selected_file}")
+    selected_files = [p for p, _ in file_dt_pairs]
+    logger.info(f"Auto-selected files: {[p.name for p in selected_files]}")
 
-    return selected_file
+    return selected_files
 
 
 def read_data_from_pylamma_nc(
     nc_path: Path, base_image_dir: Path | None = None
-) -> tuple[dict[str, pd.DataFrame], pd.DataFrame, Any]:
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Read pylamma ensemble NetCDF and return data structures matching the DB reader.
 
@@ -204,7 +194,7 @@ def read_data_from_pylamma_nc(
         base_image_dir (Path | None): User-specified directory to look for images.
 
     Returns:
-        tuple: (dict of DIC dataframes, metadata dataframe, background image).
+        tuple: (DIC dataframe, metadata dataframe).
     """
 
     def _parse_datetime_with_midday_or_none(val: str | None) -> pd.Timestamp:
@@ -286,61 +276,67 @@ def read_data_from_pylamma_nc(
                 }
             ]
         )
-
-        # --- 3. Image Loading Logic ---
-        img = None
+        # --- 3. Image path validation (do not load image) ---
+        image_path_str = None
         try:
             master_list = ast.literal_eval(master_list_str)
-            if not isinstance(master_list, list) and len(master_list) > 0:
-                raise ValueError("master_list is not a list or is empty.")
-
+        except Exception:
+            master_list = []
+        if not isinstance(master_list, list) or len(master_list) == 0:
+            logger.warning(
+                f"No valid master_list found in NetCDF {nc_path.name}; image path will be unset."
+            )
+            image_path_str = None
+        else:
             mid_idx = len(master_list) // 2
             mid_filename = master_list[mid_idx]
-            img_path = None
 
             # Option A: User specified base_image_dir (Overrides NetCDF attribute)
             if base_image_dir:
-                base_image_dir = Path(base_image_dir)
-                candidate = base_image_dir / mid_filename
+                candidate = Path(base_image_dir) / mid_filename
                 if candidate.exists():
-                    img_path = candidate
+                    image_path_str = str(candidate.resolve())
                 else:
-                    logger.warning(
+                    logger.debug(
                         f"Image {mid_filename} not found in user-provided dir {base_image_dir}"
                     )
 
             # Option B: Fallback to 'image_dir' attribute from NetCDF
-            if not img_path and nc_image_dir_str:
+            if image_path_str is None and nc_image_dir_str:
                 nc_image_dir = Path(nc_image_dir_str)
 
-                # B1. Try as absolute path or regular relative path
+                # B1. Try as absolute or relative path
                 candidate = nc_image_dir / mid_filename
                 if candidate.exists():
-                    img_path = candidate
+                    image_path_str = str(candidate.resolve())
 
                 # B2. Try relative to the NetCDF file location
-                if not img_path:
+                if image_path_str is None:
                     candidate = (nc_path.parent / nc_image_dir / mid_filename).resolve()
                     if candidate.exists():
-                        img_path = candidate
+                        image_path_str = str(candidate)
 
-            # Load image if found
-            if img_path and img_path.exists():
-                try:
-                    img = Image.open(img_path)
-                    img.load()
-                except Exception as e:
-                    logger.warning(f"Failed to load image at {img_path}: {e}")
-                    img = None
-            else:
-                logger.warning("Background image could not be located.")
+            if image_path_str is None:
+                logger.warning(
+                    f"Background image {mid_filename} could not be located for NetCDF {nc_path.name}."
+                )
 
-        except Exception as e:
-            logger.warning(f"Error loading background image: {e}")
+        dic_analyses["image_path"] = (
+            image_path_str if image_path_str is not None else np.nan
+        )
 
         # --- 4. Data Processing ---
-        # Process DIC data into DataFrame with structure: x, y, u, v, V
+        # Process DIC data into DataFrame with structure: x, y, u, v, V, MAD
         df = ds.to_dataframe().reset_index()
+
+        # Check that all the required columns are present
+        required_cols = ["x", "y", "vx", "vy", "mad", "ensemble_size"]
+        if not all(col in df.columns for col in required_cols):
+            missing = [col for col in required_cols if col not in df.columns]
+            logger.warning(
+                f"NetCDF {nc_path.name} is missing required columns: {missing}. Found columns: {df.columns.tolist()}"
+            )
+            return pd.DataFrame(), dic_analyses
 
         # --- FIX: x and y need swapping based on coordinate system conventions
         # Pylamma/TICOI NetCDF saves typically with dims ('y', 'x').
@@ -349,23 +345,19 @@ def read_data_from_pylamma_nc(
             columns={"y_temp": "y"}
         )
 
+        # Rename vx, vy to u, v and calculate V
+        df = df.rename(columns={"vx": "u", "vy": "v"})
+
         if "mid_date" in df.columns:
             df = df.drop(columns=["mid_date"])
 
-        # Rename vx, vy to u, v and calculate V
-        df = df.rename(columns={"vx": "u", "vy": "v"})
-        if "u" in df.columns and "v" in df.columns:
-            df["V"] = np.sqrt(df["u"] ** 2 + df["v"] ** 2)
-            # Keep only required columns and drop NaNs
-            df = df[["x", "y", "u", "v", "V"]].dropna(subset=["V"])
-            out = {nc_path.name: df}
-        else:
-            logger.warning(
-                f"NetCDF {nc_path.name} missing 'vx'/'vy' or 'u'/'v' columns."
-            )
-            out = {}
+        df["V"] = np.sqrt(df["u"] ** 2 + df["v"] ** 2)
 
-    return out, dic_analyses, img
+        # Keep only required columns and drop NaNs
+        column_to_keep = ["x", "y", "u", "v", "V", "mad", "ensemble_size"]
+        df = df[column_to_keep].dropna(subset=["V"])
+
+    return df, dic_analyses
 
 
 def read_sectors_from_file(sector_prior_path: Path, sector_names: list[str]):

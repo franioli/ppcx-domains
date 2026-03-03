@@ -4,6 +4,9 @@ import re
 from pathlib import Path
 from typing import Any, Literal
 
+import matplotlib
+
+matplotlib.use("Agg")  # Use non-interactive backend for batch processing
 import geopandas as gpd
 import joblib
 import matplotlib.dates as mdates
@@ -18,14 +21,68 @@ from matplotlib.patches import Patch
 from tqdm import tqdm
 
 from ppcluster import load_config, setup_logger
-from ppcluster.sectors import plot_sectors
+from ppcluster.visualization import plot_sectors
 
 logger = setup_logger(logging.INFO, name="ppcx")
 
 
+# Temporary dictionary with day to discard per year (e.g. due to bad weather, data issues, etc.)
+# TODO: this should be replaced by a more systematic approach (e.g. a metadata file with flags for each date)
+DISCARDED_DAYS = {
+    "2015": [],
+    "2016": [
+        "2016-06-02",
+        "2016-06-14",
+        "2016-07-25",
+        "2016-09-14",
+        "2016-09-15",
+        "2016-09-20",
+        "2016-09-21",
+        "2016-10-01",
+        "2016-10-13",
+        "2016-10-14",
+        "2016-10-15",
+        "2016-10-16",
+        "2016-10-17",
+        "2016-10-18",
+        "2016-10-19",
+        "2016-10-20",
+    ],
+    "2017": [],
+    "2018": [
+        "2018-10-04",
+        "2018-10-05",
+        "2018-10-06",
+        "2018-10-07",
+    ],
+    "2019": [
+        "2019-08-08",
+        "2019-08-09",
+        "2019-08-10",
+        "2019-08-11",
+        "2019-10-02",
+        "2019-10-03",
+        "2019-10-04",
+        "2019-10-05",
+    ],
+    "2020": [
+        "2020-10-17",
+        "2020-10-18",
+    ],
+    "2021": [],
+    "2022": [],
+    "2023": [],
+    "2024_18mp": [
+        "2024-07-24",
+    ],
+    "2024_24mp": [],
+    "2025": [],
+}
+
+
 # ==== Default options for CLI parser ====
 DEFAULT_OUTPUT_SUBDIR = "kinematic_sectors_time_series"
-DEFAULT_DIR_PATTERN = r".*_\d{4}-\d{2}-\d{2}$"
+DEFAULT_DIR_PATTERN = r"\d{4}-\d{2}-\d{2}$"
 DEFAULT_RESULTS_PATTERN = "*results.joblib"
 DEFAULT_N_JOBS = 1
 DEFAULT_SECTORS = ["A", "B", "C"]
@@ -750,6 +807,10 @@ def create_time_series_plot(
     plt.tight_layout()
     fig.subplots_adjust(top=0.93)  # leave space for suptitle
 
+    # Add main title with the year
+    main_title = f"Time Series for {year_str}"
+    fig.suptitle(main_title, fontsize=16, y=0.97)
+
     fig.savefig(output_path, dpi=300)
     fig.savefig(output_path.with_suffix(".svg"), bbox_inches="tight")
     logger.info(f"Saved sector time series to {output_path}")
@@ -1254,14 +1315,30 @@ def main(args):
     logger.info(f"Found {len(folders)} result folders")
 
     logger.info("Loading results from all dates...")
+
+    day_to_discard = DISCARDED_DAYS.get(year, [])
     results_list = []
+    loaded = 0
+    skipped = 0
+    failed = 0
     for folder in folders:
+        # Skip date if the days is in the discarded day dictionary
+        date_str = folder.name.split("_")[-1]
+        if date_str in day_to_discard:
+            logger.info(f"Skipping discarded date {date_str} in year {year}")
+            skipped += 1
+            continue
+
         res = load_sector_results(folder, search_pattern=results_pattern)
         if not res:
+            failed += 1
             continue
         results_list.append(res)
+        loaded += 1
 
-    logger.info(f"Successfully loaded {len(results_list)} / {len(folders)} results")
+    logger.info(
+        f"Successfully loaded {loaded} results out of {len(folders)} folders (skipped: {skipped}, failed: {failed})"
+    )
 
     # Collect and prepare data
     df_sectors = collect_statistics(results_list)
