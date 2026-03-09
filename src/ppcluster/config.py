@@ -20,9 +20,26 @@ load_dotenv(find_dotenv(usecwd=True), override=False)
 
 @dataclass
 class DataConfig:
-    year: str | None = None
-    reference_date: str | None = None
-    source: str = "database"
+    # Main parameters
+    source: str = field(
+        default="file",
+        metadata={
+            "help": "Data source type. Can be 'file' for loading from files or 'database' for querying from a database."
+        },
+    )
+    reference_date: str | None = field(
+        default=None,
+        metadata={
+            "help": "Date to process (e.g., '2017-06-15'). Can be overwritten by the --date argument in the command line."
+        },
+    )
+    year: str | None = field(
+        default=None,
+        init=False,
+        metadata={
+            "help": "Year of interest. Automatically extracted from reference_date."
+        },
+    )
 
     # File source parameters
     file_path: str | None = None
@@ -35,7 +52,7 @@ class DataConfig:
     image_dir: str | None = None  # Directory where input images are stored
 
     # Query parameters for database source
-    camera_name: str | None = "PPCX_Tele"
+    camera_name: str | None = None
     days_before_to_include: int = 0
     days_after_to_include: int = 0
 
@@ -46,6 +63,7 @@ class DataConfig:
     # Prior and ROI paths (can be used for both file and database sources)
     sector_prior_path: str | None = None
     roi_path: str | None = None
+
     # Output directory
     base_output_dir: str = "outputs"
     run_output_subdir: str | None = None
@@ -68,20 +86,38 @@ class PreprocessingFilterConfig:
 
 @dataclass
 class PreprocessingConfig:
-    variables_names: list[str] = field(default_factory=lambda: ["V"])
+    # Variables to process, weights and transorm options
+    variables_names: list[str] = field(default_factory=list)
     feature_weights: list[float] | None = None
+    velocity_transform: str | None = None
+    transform_params: dict | None = None
+
+    # Subsampling options
     subsample_factor: int = 1
     subsample_method: str = "regular"
+
+    # Filtering options
     filter_kwargs: PreprocessingFilterConfig = field(
         default_factory=PreprocessingFilterConfig
     )
-    velocity_transform: str | None = None
-    transform_params: dict | None = None
+
+    # Mad filtering parameters (applicable to both sources) #TODO: Check position of these params, maybe in DataConfig?
+    min_global_mad_threshold: float | None = (
+        None  # Minimum global MAD (mean of the MAD on the DIC map) threshold. DIC maps with mean MAD below this threshold will be discarded. Set to None to disable global MAD filtering.
+    )
+
+    min_ensemble_size: int | None = (
+        None  # Minimum number of DIC maps (ensembles) required for a given date to be included in the analysis. Set to None to disable ensemble size filtering.
+    )
+    max_point_mad: float | None = (
+        None  # Maximum MAD threshold for filtering. Points with MAD above this value will be removed. Set to None to disable MAD filtering.
+    )
 
 
 @dataclass
 class PriorsConfig:
-    probability: dict | None = None
+    # dictionary of probability priors for each sector, e.g. {"A": 0.9, "B": 0.7, "C": 0.5, "D": 0.3}. Mandatory option
+    probability: dict = field(default_factory=dict)
     fade_method: str = "constant"
     fade_options: dict = field(default_factory=dict)
 

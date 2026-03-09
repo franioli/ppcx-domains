@@ -4,7 +4,7 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 from scipy import ndimage
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import QuantileTransformer
 
 from ppcluster.griddata import create_2d_grid_from_df
 from ppcluster.lamma_filter import vector_field_filter
@@ -407,34 +407,33 @@ def spatial_subsample(df, n_subsample=5, method="regular"):
 # === Feature preprocessing ===
 
 
-def preprocess_features(
+def transform_and_scale_features(
     df_input: pd.DataFrame,
-    variables_names: list[str] | None = None,
+    variables_names: list[str],
     transform_velocity: str = "none",
     transform_params: dict | None = None,
     feature_weights: np.ndarray | None = None,
-) -> tuple[np.ndarray, StandardScaler, np.ndarray, dict]:
+) -> tuple[np.ndarray, QuantileTransformer, np.ndarray, dict]:
     """
     Preprocess velocity and additional features for clustering.
 
     Args:
         df_input (pd.DataFrame): Input dataframe with columns 'x', 'y', 'V' (and optionally more features).
-        variables_names (list[str], optional): List of feature names to use. Default is ["V"].
+        variables_names (list[str]): List of feature names to use.
         transform_velocity (str, optional): Type of velocity transformation. Default is "none".
         transform_params (dict, optional): Parameters for velocity transformation. Default is None.
         feature_weights (np.ndarray, optional): Optional feature weights for features. Default is None.
 
     Returns:
         data_array_scaled (np.ndarray): Scaled feature array for clustering.
-        scaler (StandardScaler): Fitted scaler object.
+        scaler (RobustScaler): Fitted scaler object.
         velocities (np.ndarray): Transformed velocity array.
         transform_info (dict): Info about the velocity transformation.
     """
-    if variables_names is None:
-        variables_names = ["V"]
-
-    if "V" not in df_input.columns:
-        raise ValueError("Input dataframe must contain 'V' column for velocities.")
+    # Check that required columns are present
+    missing_cols = [col for col in variables_names if col not in df_input.columns]
+    if missing_cols:
+        raise ValueError(f"Missing columns in input dataframe: {missing_cols}")
 
     velocities, transform_info = apply_velocity_transform(
         velocities=df_input["V"].to_numpy(),
@@ -451,9 +450,12 @@ def preprocess_features(
     else:
         data_array = velocities.reshape(-1, 1)
 
-    scaler = StandardScaler()
-    scaler.fit(data_array)
-    data_array_scaled = scaler.transform(data_array)
+    # Use QuantileTransformer to force a Normal Distribution
+    # This maps outliers into the tails of a Normal dist instead of letting them stay at z=30
+    scaler = QuantileTransformer(
+        output_distribution="normal", n_quantiles=min(len(data_array), 1000)
+    )
+    data_array_scaled = scaler.fit_transform(data_array)
 
     # If feature weights provided, scale data accordingly
     if feature_weights is not None:

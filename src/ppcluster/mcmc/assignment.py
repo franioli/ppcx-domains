@@ -189,21 +189,20 @@ def get_model_parameters_from_idata(
 
     # Optionally inverse-transform
     if scaler is not None:
-        # Ensure the number of features matches with scaler: expects shape (n_samples, n_features)
-        n_features = mu_arr.shape[1]
-        if n_features != scaler.scale_.shape[0]:
-            logger.error(
-                f"Model parameters have {n_features} features, but scaler expects {scaler.scale_.shape[0]}."
-            )
-            return None, None
+        # Back-transform Mu (Location)
+        mu_orig = scaler.inverse_transform(mu_arr)
 
-        # Inverse-transform μ
-        mu_arr = scaler.inverse_transform(mu_arr)
+        # 2. Back-transform Sigma (Spread)
+        # For non-linear scalers (QuantileTransformer), sigma_arr * scale_ doesn't exist.
+        # We approximate physical sigma by transformed(mu + sigma) - transformed(mu)
+        if hasattr(scaler, "scale_"):
+            sigma_orig = sigma_arr * scaler.scale_
+        else:
+            # Approximation for non-linear scalers:
+            upper_bound = scaler.inverse_transform(mu_arr + sigma_arr)
+            sigma_orig = np.abs(upper_bound - mu_orig)
 
-        # Inverse-transform σ with feature scale (Robust/Standard scalers expose scale_)
-        scale_vec = getattr(scaler, "scale_", None)
-        if scale_vec is not None:
-            sigma_arr = sigma_arr * scale_vec
+        return mu_orig, sigma_orig
 
     return mu_arr, sigma_arr
 

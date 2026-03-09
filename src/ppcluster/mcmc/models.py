@@ -91,14 +91,41 @@ def build_marginalized_mixture_model(
         #   If user gave a 1-D array of length K (per-cluster), reshape to (k, 1)
         #   so it broadcasts over the feature axis.
 
-        mu_mu = mu_params["mu"]  # scalar or array(k,)
-        mu_sigma = mu_params["sigma"]  # scalar or array(k,)
+        mu_mu = mu_params["mu"].copy()  # scalar or array(k,)
+        mu_sigma = mu_params["sigma"].copy()  # scalar or array(k,)
+        sigma_val = sigma_params[
+            "sigma"
+        ].copy()  # scalar or array(k,) or array(k, n_features)
+
+        import omegaconf
+
+        if isinstance(mu_mu, omegaconf.listconfig.ListConfig):
+            mu_mu = np.array(mu_mu)
+        if isinstance(mu_sigma, omegaconf.listconfig.ListConfig):
+            mu_sigma = np.array(mu_sigma)
+        if isinstance(sigma_val, omegaconf.listconfig.ListConfig):
+            sigma_val = np.array(sigma_val)
 
         # -- Parameters for the FIRST feature (assumed to be Velocity 'V') --
         if enforce_ordered_means:
             # Enforce mu[0] < mu[1] < ... for feature 0.
             # This breaks symmetry and prevents label switching in anomaly detection.
             # We use an ordered transform on the first feature's means.
+
+            initval = None
+            if np.isscalar(mu_mu):
+                initval = np.linspace(mu_mu - 1, mu_mu + 1, k)
+            elif (
+                isinstance(mu_mu, np.ndarray)
+                and mu_mu.ndim == 1
+                and mu_mu.shape[0] == k
+            ) or (isinstance(mu_mu, list) and len(mu_mu) == k):
+                initval = np.sort(mu_mu)
+            else:
+                raise ValueError(
+                    "Invalid mu_params['mu'] for ordered means. Must be scalar or 1-D array/list of length K."
+                )
+
             mu_0 = pm.Normal(
                 "mu_feat0",
                 mu=mu_mu,
@@ -106,7 +133,7 @@ def build_marginalized_mixture_model(
                 shape=(k,),
                 transform=pm.distributions.transforms.ordered,
                 # Initialization helper: spread means out to help constraint satisfaction
-                initval=np.linspace(mu_params["mu"] - 1, mu_params["mu"] + 1, k),
+                initval=initval,
             )
 
         else:
@@ -140,15 +167,14 @@ def build_marginalized_mixture_model(
         # -- Standard Deviations (HalfNormal) --
         # We assume diagonal covariance (features are independent given cluster)
         # Prepare sigma prior: if 1-D array(k,), reshape to (k,1) for broadcasting
-        sig_val = sigma_params["sigma"]
         if (
-            isinstance(sig_val, np.ndarray)
-            and sig_val.ndim == 1
-            and sig_val.shape[0] == k
+            isinstance(sigma_val, np.ndarray)
+            and sigma_val.ndim == 1
+            and sigma_val.shape[0] == k
         ):
-            sig_val = sig_val.reshape(k, 1)
+            sigma_val = sigma_val.reshape(k, 1)
 
-        sigma = pm.HalfNormal("sigma", sig_val, dims=("cluster", "feature"))
+        sigma = pm.HalfNormal("sigma", sigma_val, dims=("cluster", "feature"))
 
         # ------------------------------------------------------------------
         # 3. Likelihood Construction (Marginalized)

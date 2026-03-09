@@ -147,5 +147,3 @@ if __name__ == "__main__":
     # If dry-run, just print commands and exit (useful for GNU Parallel)
     for _, cmd in tasks:
         print(shlex.join(cmd))
-
-    print(f"Generated {len(tasks)} tasks for dates: {', '.join(dates)}")

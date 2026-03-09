@@ -36,8 +36,8 @@ from ppcluster.mcmc.clustering import (
 from ppcluster.mcmc.priors import plot_spatial_priors
 from ppcluster.preprocessing import (
     apply_dic_filters,
-    preprocess_features,
     spatial_subsample,
+    transform_and_scale_features,
 )
 from ppcluster.sectors import (
     assign_sector_labels,
@@ -109,8 +109,6 @@ def preprocess_dic_data(
     out: dict[Any, pd.DataFrame],
     roi: Any,
     preproc_config: DictConfig | ListConfig,
-    max_mad: float
-    | None = None,  # *TODO: include this in the config and apply MAD filtering if specified
 ) -> pd.DataFrame:
     """
     Run spatial filtering, DIC filters, stacking, and subsampling on raw DIC data.
@@ -119,7 +117,6 @@ def preprocess_dic_data(
         out: Dictionary mapping source IDs to raw DIC DataFrames.
         roi: ROI polygon for spatial filtering.
         preproc_config: Dictionary of preprocessing parameters.
-        max_mad: Optional maximum MAD threshold for filtering. If None, no MAD filtering is applied.
 
     Returns:
         pd.DataFrame: The fully preprocessed and stacked DataFramdPl
@@ -132,12 +129,14 @@ def preprocess_dic_data(
 
         num_points = len(df_src)
 
-        # Apply MAD filtering if max_mad is specified
-        if max_mad is not None and "mad" in df_src.columns:
-            df_src = df_src[df_src["mad"] <= max_mad]
+        # Apply MAD filtering if max_point_mad is specified
+        max_point_mad = preproc_config.max_point_mad
+        if max_point_mad is not None and "mad" in df_src.columns:
+            df_src = df_src[df_src["mad"] <= max_point_mad]
             logger.info(
-                f"Source {src_id}: Applied MAD filtering with threshold {max_mad}. Points before: {num_points}, after: {len(df_src)}."
+                f"Source {src_id}: Applied point MAD filtering with threshold {max_point_mad}. Points before: {num_points}, after: {len(df_src)}."
             )
+
         # Apply other DIC filters if any
         df_src = apply_dic_filters(df_src, **preproc_config.filter_kwargs)
         logger.info(
@@ -182,12 +181,14 @@ def run_mcmc_clustering(
     logger.info("Running MCMC Clustering...")
 
     # 1. Preprocess Features
-    data_array_scaled, scaler, velocities, transform_info = preprocess_features(
-        df_input=dic_df,
-        variables_names=config.preprocessing.variables_names,
-        transform_velocity=config.preprocessing.velocity_transform,
-        transform_params=config.preprocessing.transform_params,
-        feature_weights=config.preprocessing.feature_weights,
+    data_array_scaled, scaler, velocities, transform_info = (
+        transform_and_scale_features(
+            df_input=dic_df,
+            variables_names=config.preprocessing.variables_names,
+            transform_velocity=config.preprocessing.velocity_transform,
+            transform_params=config.preprocessing.transform_params,
+            feature_weights=config.preprocessing.feature_weights,
+        )
     )
     joblib.dump(scaler, output_dir / f"{base_name}_mcmc_feature_scaler.joblib")
 
@@ -520,22 +521,44 @@ def run_pipeline(config: DictConfig | ListConfig) -> bool:
                 logger.warning(f"Failed to read {p}: {e}")
 
         # 2. Filter by quality
-        mean_mad_threshold = 2.0  # *TODO: hardcoded value!
-        min_ensemble_size = 2  # *TODO: hardcoded value!
+        mean_mad_threshold = config.preprocessing.min_global_mad_threshold
+        min_ensemble_size = config.preprocessing.min_ensemble_size
         valid_results = []
-
         for name, (df, meta) in candidates.items():
-            mean_mad = float(df["mad"].mean())
-            min_ens = (
-                int(df["ensemble_size"].min()) if "ensemble_size" in df.columns else 99
-            )
+            # Compute mean MAD only if column exists and a threshold is provided
+            if "mad" in df.columns:
+                mean_mad = float(df["mad"].mean())
+            else:
+                mean_mad = None
+                logger.warning(
+                    f"Source {name}: 'mad' column not available; skipping MAD-based filtering for this source."
+                )
+            # Compute min ensemble size only if column exists and a threshold is provided
+            if "ensemble_size" in df.columns:
+                min_ens = int(df["ensemble_size"].min())
+            else:
+                min_ens = None
+                logger.warning(
+                    f"Source {name}: 'ensemble_size' column not available; skipping ensemble-size-based filtering for this source."
+                )
 
-            if mean_mad > mean_mad_threshold:
+            # Apply MAD threshold check only when a threshold is configured and MAD is available
+            if (
+                mean_mad_threshold is not None
+                and mean_mad is not None
+                and mean_mad > mean_mad_threshold
+            ):
                 logger.warning(
                     f"Rejecting {name}: MAD {mean_mad:.2f} > {mean_mad_threshold}"
                 )
                 continue
-            if min_ens < min_ensemble_size:
+
+            # Apply ensemble size check only when a threshold is configured and ensemble info is available
+            if (
+                min_ensemble_size is not None
+                and min_ens is not None
+                and min_ens < min_ensemble_size
+            ):
                 logger.warning(
                     f"Rejecting {name}: Ensemble size {min_ens} < {min_ensemble_size}"
                 )
@@ -556,11 +579,21 @@ def run_pipeline(config: DictConfig | ListConfig) -> bool:
             logger.error("No DIC results passed quality filters.")
             return False
 
-        # 3. Select best candidate (lowest MAD, then largest ensemble, then largest dt)
-        valid_results.sort(key=lambda x: (x["mad"], -x["ens"], -x["dt"]))
-        best = valid_results[0]
+        # If some entries have MAD available prefer them; otherwise pick the first element.
+        with_mad = [v for v in valid_results if v["mad"] is not None]
+        if with_mad:
+            # Sort by MAD (ascending), then largest ensemble, then largest dt
+            with_mad.sort(key=lambda x: (x["mad"], -(x["ens"] or 0), -x["dt"]))
+            best = with_mad[0]
+        else:
+            logger.warning(
+                "MAD not available for any candidate. Selecting the first available result."
+            )
+            # keep original order: take first valid result
+            best = valid_results[0]
+
         logger.info(
-            f"Selected best DIC map: {best['name']} (MAD: {best['mad']:.2f}, DT: {best['dt']:.1f}h)"
+            f"Selected best DIC map: {best['name']} (MAD: {best['mad'] if best['mad'] is not None else 'N/A'}, DT: {best['dt']:.1f}h)"
         )
 
         out = {best["name"]: best["df"]}
@@ -612,7 +645,7 @@ def run_pipeline(config: DictConfig | ListConfig) -> bool:
     date_start = dic_analyses.iloc[0]["master_timestamp"].strftime("%Y-%m-%d")
     date_end = dic_analyses.iloc[0]["slave_timestamp"].strftime("%Y-%m-%d")
     dic_analyses.to_csv(
-        output_dir / f"{base_name}_master{date_start}_slave{date_end}_dic_analyses.csv",
+        output_dir / f"{base_name}_dic_analyses-master{date_start}_slave{date_end}.csv",
         index=False,
     )
 
@@ -622,7 +655,6 @@ def run_pipeline(config: DictConfig | ListConfig) -> bool:
         out=out,
         roi=roi,
         preproc_config=preproc_config,
-        max_mad=50,  # *TODO: hardcoded value, consider moving to config
     )
     dic_df.to_csv(output_dir / f"{base_name}_preprocessed_dic_data.csv", index=False)
 
@@ -766,8 +798,8 @@ def run_pipeline(config: DictConfig | ListConfig) -> bool:
         )
 
         # Save the figure inrun-specific output directory
-        fig.savefig(output_dir / f"{base_name}.png", dpi=150, bbox_inches="tight")
-        fig.savefig(output_dir / f"{base_name}.svg", dpi=150, bbox_inches="tight")
+        fig.savefig(output_dir / f"{base_name}.jpg", dpi=150, bbox_inches="tight")
+        fig.savefig(output_dir / f"{base_name}.svg", bbox_inches="tight")
 
         # Save it also in the common kinematic sectors summary folder
         kinematic_sectors_dir = output_base_dir / "kinematic_sectors"

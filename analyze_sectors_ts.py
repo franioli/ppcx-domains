@@ -126,7 +126,7 @@ def parse_args(argv=None):
         help="Enable creation of mosaic of daily sector plots (disabled by default).",
     )
     parser.add_argument(
-        "--n-jobs",
+        "--jobs",
         type=int,
         default=DEFAULT_N_JOBS,
         help=f"Number of parallel jobs for mosaic creation (default: {DEFAULT_N_JOBS})",
@@ -1292,7 +1292,7 @@ def main(args):
     dir_pattern = args.dir_pattern
     results_pattern = args.results_pattern
     make_mosaic = args.make_mosaic
-    n_jobs = args.n_jobs
+    n_jobs = args.jobs
     show_plots = args.show
 
     year = in_dir.name.split("_")[0]

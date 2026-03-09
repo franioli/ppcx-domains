@@ -73,6 +73,9 @@ To keep jobs running after disconnecting from SSH, use:
 ```bash
 nohup parallel -j 4 --bar --joblog run.log --resume < jobs.job > parallel.out 2>&1 &
 ```
+
+This will run the job in the background and save all output to `parallel.out`, allowing you to safely disconnect from your session.
+
 ### Log Output: Inspecting and Retrying Failed Jobs
 
 When running batch jobs with GNU Parallel, all job statuses are recorded in a tab-separated log file (e.g., `run.log`). This file is essential for monitoring progress and troubleshooting failures.
@@ -128,16 +131,27 @@ parallel -j 4 --bar --joblog run.log --resume-failed < jobs.job
 This will only retry jobs that previously failed (non-zero exit code), making it easy to recover from transient errors or missing dependencies.
 
 
-
 ### Processing Multiple Years in batch
-cc
-To keep the processing running on a remote server even after the client disconnects via ssh, use `nohup`:
+
+To run the processing for multiple years at once, you can loop through a list of years and append the generated commands to a single job file. Use `>>` to ensure each year is added to the file without overwriting the previous one.
 
 ```bash
-nohup parallel -j 8 --bar --joblog run.log --resume < jobs.job > parallel.out 2>&1 &
+# Define the years to process
+YEARS=("2015" "2016" "2017" "2018" "2019" "2020" "2021" "2022" "2023" "2025")
+
+# Clear the job file if it exists
+> jobs_all.job
+
+# Generate and append commands for each year
+for YEAR in "${YEARS[@]}"; do
+  python ppcx_prepare_job_file.py \
+    --date-range "${YEAR}-06-01" "${YEAR}-10-30" mcmc.force_cpu=true >> jobs_all.job
+done
 ```
 
-This will run the job in the background and save all output to `parallel.out`, allowing you to safely disconnect from your session.
+Then run the batch with GNU Parallel as described above.
+
+```
 
 ### Tips
 

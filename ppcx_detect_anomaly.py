@@ -1,34 +1,30 @@
 import argparse
 import logging
 import os
-import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import matplotlib
+from PIL import Image
 
 matplotlib.use("Agg")
-
 import geopandas as gpd
-import joblib
+import matplotlib
 import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
 from omegaconf import DictConfig, ListConfig, OmegaConf
-from smoothify import smoothify
 
-from ppcluster import Timer, load_config, mcmc, setup_logger
+from ppcluster import Timer, load_config, setup_logger
 from ppcluster.cvat import (
     filter_dataframe_by_polygons,
 )
 from ppcluster.data import (
-    find_ensemble_file,
-    load_sectors_and_roi,
-    read_data_from_db,
+    find_ensemble_files,
     read_data_from_pylamma_nc,
 )
-from ppcluster.griddata import create_2d_grid, plot_clustering_grid
+from ppcluster.griddata import create_2d_grid
 from ppcluster.mcmc.clustering import (
     clusterize_gaussian_mixture,
     save_sampling_summary,
@@ -36,24 +32,25 @@ from ppcluster.mcmc.clustering import (
 from ppcluster.mcmc.priors import plot_spatial_priors
 from ppcluster.preprocessing import (
     apply_dic_filters,
-    preprocess_features,
     spatial_subsample,
+    transform_and_scale_features,
 )
 from ppcluster.sectors import (
-    assign_sector_labels,
     classify_points_by_polygons,
-    clean_vector_sectors,
     compute_sector_stats,
     vectorize_gridded_sectors,
 )
 from ppcluster.visualization import (
-    get_sector_colors,
-    plot_sectors,
-    plot_sectors_summary,
+    plot_dic_vectors,
 )
+
+matplotlib.use("Agg")
+
+from smoothify import smoothify
 
 logger = setup_logger(level=logging.INFO, name="ppcx")
 
+CONFIG_PATH = "config_anomaly.yaml"  # Path to the config file. Can be overwritten by --config argument in CLI.
 HEADLESS = True  # set to True when running in non-GUI environment
 
 if HEADLESS:
@@ -62,38 +59,33 @@ if HEADLESS:
 
 def parse_arguments():
     p = argparse.ArgumentParser(
-        description="Run MCMC clustering with optional overrides."
+        description="Run Anomaly Detection on existing Domain Classification results."
     )
     p.add_argument(
         "--date",
         "-d",
-        help="Reference date (i.e., final date) to process. Override data.reference_date (YYYY-MM-DD). If not provided, uses config value.",
+        help="Reference date (YYYY-MM-DD). Overrides config.",
         default=None,
     )
     p.add_argument(
-        "--output_dir",
-        "-o",
-        help="Output directory. Override config value. If not provided, uses config value.",
+        "--sectors-file",
+        "-s",
+        help="Path to the sectors GeoJSON file (output of domain classification). If not provided, tries to find it automatically.",
         default=None,
     )
     p.add_argument(
         "--config",
         "-c",
         type=str,
+        default="config_anomaly.yaml",
+        help="Path to anomaly config file.",
+    )
+    p.add_argument(
+        "--output_dir",
+        "-o",
+        help="Output directory override.",
         default=None,
-        help="Path to an optional custom config.yaml file to load instead of the default.",
     )
-    p.add_argument(
-        "--keep-failed-output",
-        action="store_true",
-        help="Keep output directory if processing fails (for debugging). By default, output is deleted on failure.",
-    )
-    p.add_argument(
-        "--skip-existing",
-        action="store_true",
-        help="Skip processing if the run output directory already exists.",
-    )
-
     # Robust generic override mechanism using dotlist (e.g., data.dt_min=24)
     # This captures any leftover arguments in the format key=value
     p.add_argument(
@@ -104,267 +96,6 @@ def parse_arguments():
     return p.parse_args()
 
 
-def preprocess_dic_data(
-    out: dict[Any, pd.DataFrame],
-    roi: Any,
-    preproc_config: DictConfig | ListConfig,
-) -> pd.DataFrame:
-    """
-    Run spatial filtering, DIC filters, stacking, and subsampling on raw DIC data.
-
-    Args:
-        out: Dictionary mapping source IDs to raw DIC DataFrames.
-        roi: ROI polygon for spatial filtering.
-        preproc_config: Dictionary of preprocessing parameters.
-
-    Returns:
-        pd.DataFrame: The fully preprocessed and stacked DataFramdPl
-    """
-    processed = []
-    for src_id, df_src in out.items():
-        try:
-            # Filter only points inside the spatial priors sectors
-            if roi is not None:
-                df_src = filter_dataframe_by_polygons(df_src, polygon=roi)
-
-            # Apply other DIC filters if any
-            df_src = apply_dic_filters(df_src, **preproc_config.filter_kwargs)
-
-            # Append processed dataframe to the list
-            processed.append(df_src)
-        except Exception as exc:
-            logger.warning(f"Filtering failed for {src_id}: {exc}")
-    if not processed:
-        raise RuntimeError("No dataframes left after filtering.")
-
-    # Stack all processed dataframes
-    dic_df = pd.concat(processed, ignore_index=True)
-    logger.info(f"Data shape after filtering and stacking: {dic_df.shape}")
-
-    # Apply subsampling
-    if preproc_config.subsample_factor > 1:
-        dic_df = spatial_subsample(
-            dic_df,
-            n_subsample=preproc_config.subsample_factor,
-            method=preproc_config.subsample_method,
-        )
-        logger.info(f"Data shape after subsampling: {dic_df.shape}")
-
-    return dic_df
-
-
-def run_mcmc_clustering(
-    dic_df: pd.DataFrame,
-    prior_probs_array: np.ndarray,
-    sectors: Any,
-    config: DictConfig | ListConfig,
-    img: Any,
-    output_dir: Path,
-    base_name: str,
-) -> tuple[Any, Any]:
-    """
-    Runs the single-pass MCMC clustering pipeline.
-    Preprocesses features, sets up parameters, and runs the GMM.
-    """
-    logger.info("Running MCMC Clustering...")
-
-    # 1. Preprocess Features
-    data_array_scaled, scaler, velocities, transform_info = preprocess_features(
-        df_input=dic_df,
-        variables_names=config.preprocessing.variables_names,
-        transform_velocity=config.preprocessing.velocity_transform,
-        transform_params=config.preprocessing.transform_params,
-        feature_weights=config.preprocessing.feature_weights,
-    )
-    joblib.dump(scaler, output_dir / f"{base_name}_mcmc_feature_scaler.joblib")
-
-    # TODO: move here other spatial prior preprocessing steps now in the main function
-
-    # 2. Plot Priors if spatial
-    fig, axes = mcmc.plot_spatial_priors(dic_df, prior_probs_array, img=img)
-    fig.savefig(
-        output_dir / f"{base_name}_mcmc_spatial_priors.jpg",
-        dpi=150,
-        bbox_inches="tight",
-    )
-    plt.close(fig)
-
-    # 3. Run Clustering
-    result = clusterize_gaussian_mixture(
-        data_array_scaled=data_array_scaled,
-        prior_probs=prior_probs_array,
-        sectors=sectors,
-        sample_args=config.mcmc.sample_options,
-        mu_params=config.mcmc.model_options.mu_params,
-        sigma_params=config.mcmc.model_options.sigma_params,
-        apply_mrf_regularization=config.mcmc.mrf_regularization,
-        x_pos=dic_df["x"].to_numpy(),
-        y_pos=dic_df["y"].to_numpy(),
-        mrf_kwargs=config.mcmc.mrf_kwargs,
-        second_pass=config.mcmc.second_pass,
-        second_pass_sample_args=config.mcmc.second_pass_sample_args,
-        force_cpu=config.mcmc.force_cpu,
-        random_seed=config.random_seed,
-    )
-
-    # 4. Save sampling summary
-    save_sampling_summary(
-        convergence_flag=result.convergence_flag,
-        idata=result.idata,
-        output_dir=output_dir,
-        base_name=f"{base_name}_mcmc",
-        make_plots=True,
-        df_input=dic_df,
-        cluster_pred=result.cluster_pred,
-        posterior_probs=result.posterior_probs,
-        scaler=scaler,
-        img=img,
-    )
-
-    # Plot spatial priors before and after MRF regularization to visualize the effect of the MRF on the spatial distribution of cluster probabilities.
-    # TODO: move this plotting logic inside the save_sampling_summary function
-    fig, _ = plot_spatial_priors(
-        df=dic_df,
-        prior_probs=prior_probs_array,
-        img=img,
-    )
-    fig.savefig(
-        output_dir / f"{base_name}_spatial_priors_beforeMRF.jpg",
-        dpi=150,
-        bbox_inches="tight",
-    )
-    fig, _ = plot_spatial_priors(
-        df=dic_df,
-        prior_probs=result.idata.constant_data.prior_w.data,
-        img=img,
-    )
-    fig.savefig(
-        output_dir / f"{base_name}_spatial_priors_afterMRF.jpg",
-        dpi=150,
-        bbox_inches="tight",
-    )
-
-    return result, scaler
-
-
-def process_clustering_results(
-    df_points: pd.DataFrame,
-    cluster_labels: np.ndarray,
-    output_dir: Path,
-    base_name: str,
-    config: DictConfig | ListConfig,
-    img: Any = None,
-) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
-    """
-    Vectorize clusters, clean geometries, assign labels, compute stats, and save results.
-    Reusable for both main pipeline and refinement steps.
-
-    Args:
-        df_points: Original points DataFrame with x, y, and velocity columns.
-        cluster_labels: The predicted cluster labels for each point.
-        output_dir: Directory to save outputs.
-        base_name: Base name for output files.
-        config: The full configuration object for parameters.
-        img: The original image for plotting (optional).
-
-    Returns:
-        gpd.GeoDataFrame: The final sectors GeoDataFrame with statistics.
-        gpd.GeoDataFrame: The classified points GeoDataFrame with sector labels.
-    """
-    # 1. Create grid from points
-    x = df_points["x"].to_numpy()
-    y = df_points["y"].to_numpy()
-    X, Y, kin_cluster_grid = create_2d_grid(x=x, y=y, labels=cluster_labels)
-    raster_res = abs(float(X[0, 1] - X[0, 0]) if X.shape[1] > 1 else 1.0)
-
-    # 2. Vectorize & Smooth
-    logger.info(f"Vectorizing grid clusters ({base_name})...")
-    sectors = vectorize_gridded_sectors(kin_cluster_grid, X, Y)
-
-    # Save raw sectors for debugging
-    sectors.to_file(output_dir / f"{base_name}_sectors_raw.geojson", driver="GeoJSON")
-
-    # 3. Clean Vectors
-    vect_config = config.postprocessing.vectorization
-    sectors = clean_vector_sectors(
-        sectors,
-        df_points,
-        min_area_px2=vect_config.min_area_px2,
-        isolation_buffer=vect_config.isolation_buffer,
-        velocity_merge_threshold=vect_config.velocity_merge_threshold,
-        target_number_of_sectors=vect_config.target_number_of_sectors,
-        fill_holes_area=vect_config.fill_holes_area,
-        smooth_geometries=vect_config.smooth_geometries,
-        smooth_method=vect_config.smooth_method,
-        smooth_iterations=vect_config.smooth_iterations,
-        raster_res=2 * raster_res,
-    )
-
-    # 4. Assign Labels
-    # Use config method, or fallback/override if provided
-    # For refinement, we might want simple labels, but reusing the logic is fine
-    sectors = assign_sector_labels(
-        sectors,
-        order_by=config.postprocessing.sector_assignment.method,
-        ascending=config.postprocessing.sector_assignment.ascending,
-    )
-
-    # Drop non-essential columns
-    sectors = (
-        sectors[["geometry", "sector"]].sort_values(by="sector").reset_index(drop=True)
-    )
-
-    # 5. Classify Original Points & Compute Stats
-    pts_by_sector = classify_points_by_polygons(
-        sectors, df_points, x_col="x", y_col="y"
-    )
-    pts_by_sector.to_file(
-        output_dir / f"{base_name}_points_by_sector.geojson",
-        driver="GeoJSON",
-    )
-
-    sectors["area_px2"] = sectors.geometry.area
-    sectors = compute_sector_stats(
-        sectors, pts_by_sector, value_col="V", group_col="sector"
-    )
-    sectors.to_file(output_dir / f"{base_name}_sectors_final.geojson", driver="GeoJSON")
-
-    stats_path = output_dir / f"{base_name}_sector_stats.csv"
-    sectors.drop(columns=[sectors.geometry.name], errors="ignore").to_csv(
-        stats_path, index=False, float_format="%.3f"
-    )
-
-    # 6. Plotting
-    if img is not None:
-        sector_colors = get_sector_colors(
-            sectors["sector"].tolist(),
-            colormap=config.plotting.default_discrete_cmap,
-        )
-
-        # Plot raw vs vectorized comparison
-        fig, (ax_raw, ax_vec) = plt.subplots(1, 2, figsize=(14, 7))
-        plot_clustering_grid(
-            ax=ax_raw,
-            img=img,
-            cluster_grid=kin_cluster_grid,
-            X=X,
-            Y=Y,
-            title="Raw Clusters",
-            alpha=0.6,
-        )
-        plot_sectors(
-            ax=ax_vec,
-            sectors=sectors,
-            img=img,
-            sector_colors=sector_colors,
-            title="Vectorized Sectors",
-        )
-        fig.savefig(output_dir / f"{base_name}_raw_vs_vec.jpg", dpi=150)
-        plt.close(fig)
-
-    return sectors, pts_by_sector
-
-
 def run_anomaly_detection(
     dic_df: pd.DataFrame,
     sectors_gdf: gpd.GeoDataFrame,
@@ -373,6 +104,7 @@ def run_anomaly_detection(
     output_dir: Path,
     img: Any,
     base_name: str,
+    sector_buffer: float = 50.0,
 ) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
     """
     Perform a second-pass clustering on a specific sector (e.g., Sector A)
@@ -386,6 +118,7 @@ def run_anomaly_detection(
         output_dir: Directory to save outputs.
         img: The original image for plotting.
         base_name: Base name for output files.
+        sector_buffer: Buffer distance in pixels to apply around the target sector for point selection.
 
     Returns:
         gpd.GeoDataFrame: The refined geometries for the target sector with anomaly sub-sectors.
@@ -397,7 +130,7 @@ def run_anomaly_detection(
     output_dir.mkdir(exist_ok=True)
     anomaly_base_name = f"{base_name}_sector{target_sector}_anomaly"
 
-    # 1. Filter data for the target sector
+    # 1. Filter data for the target sector (Add buffer to include boundary points)
     # We use the already classified points or geometric filtering
     sector_row = sectors_gdf[sectors_gdf["sector"] == target_sector]
     if sector_row.empty:
@@ -407,11 +140,10 @@ def run_anomaly_detection(
 
     # Create a buffer to include frontier points that might have been smoothed out
     # 64px is standard grid spacing, so 100px ensures we capture immediate neighbors
-    buffer_dist = 100.0
     logger.info(
-        f"Applying {buffer_dist}px buffer to Sector {target_sector} for anomaly search."
+        f"Applying {sector_buffer}px buffer to Sector {target_sector} for anomaly search."
     )
-    sector_poly_buffered = sector_poly.buffer(buffer_dist)
+    sector_poly_buffered = sector_poly.buffer(sector_buffer)
 
     df_sub = filter_dataframe_by_polygons(dic_df, polygon=sector_poly_buffered)
     if len(df_sub) < 50:  # Arbitrary minimum points
@@ -419,21 +151,23 @@ def run_anomaly_detection(
             f"Not enough points in Sector {target_sector} ({len(df_sub)}) for refinement."
         )
         return sectors_gdf, dic_df
+
     logger.info(f"Refining Sector {target_sector} with {len(df_sub)} points...")
 
-    # 1. Compute Median Flow Direction of the Background (Base)
+    # 2. Compute velocity components along and across the dominant flow direction to use as features for anomaly detection.
+
+    # Compute Median Flow Direction of the Background (Base)
     # Use the median of u and v to find the dominant flow vector
     u_med = df_sub["u"].median()
     v_med = df_sub["v"].median()
     flow_angle = np.arctan2(v_med, u_med)
 
-    # 2. Rotate velocities to align with flow
+    # Rotate velocities to align with flow
     # Rotation matrix logic:
     # V_long = u * cos(a) + v * sin(a)
     # V_trans = -u * sin(a) + v * cos(a)
     cos_a = np.cos(flow_angle)
     sin_a = np.sin(flow_angle)
-
     df_sub["V_long"] = df_sub["u"] * cos_a + df_sub["v"] * sin_a
     df_sub["V_trans"] = -df_sub["u"] * sin_a + df_sub["v"] * cos_a
 
@@ -444,7 +178,7 @@ def run_anomaly_detection(
     # [V, V_trans] is often best: V separates by speed, V_trans separates by direction.
     refine_features = ["V"]  # TODO: We can experiment with adding "V_trans"
 
-    # 2. Assign Velocity-Based Priors (Unsupervised initialization)
+    # 3. Setup Anomalous/Background Priors based on Velocity Percentiles
     # We assume 2 classes: 0=Background, 1=Fast/Anomaly
     v_data = df_sub["V"].to_numpy()
     percentile = anomaly_config.prior_percentile_threshold
@@ -456,20 +190,44 @@ def run_anomaly_detection(
     # Initialize priors: High V points get high probability for Class 1
     for i, v in enumerate(v_data):
         if v > threshold:
-            prior_probs[i] = [0.2, 0.8]
+            prior_probs[i] = [0.3, 0.7]
         else:
-            prior_probs[i] = [0.8, 0.2]
+            prior_probs[i] = [0.7, 0.3]
 
-    # 3. Preprocess Features
-    # Recalculate scaler specifically for this subset
-    data_array, scaler, _, _ = preprocess_features(
+    # 4. Scale Features
+    data_array, scaler, _, _ = transform_and_scale_features(
         df_input=df_sub,
         variables_names=refine_features,
-        # We might want strict raw velocity here, or re-use transforms
-        transform_velocity="none",
+        transform_velocity="none",  # We might want strict raw velocity here
     )
 
-    # 4. Run Clustering (constrained to this sector)
+    # --- Debugging Plot: Scaled vs Original Distributions ---
+    n_feats = data_array.shape[1]
+    fig, axes = plt.subplots(n_feats, 1, figsize=(10, 4 * n_feats), squeeze=False)
+    for i, var_name in enumerate(config.preprocessing.variables_names):
+        ax = axes[i, 0]
+        scaled_data = data_array[:, i]
+
+        # Plot distribution on primary axis (Scaled)
+        ax.hist(scaled_data, bins=50, color="skyblue", edgecolor="black", alpha=0.7)
+        ax.set_xlabel(f"{var_name} (Scaled / Z-score)")
+        ax.set_ylabel("Frequency")
+        ax.grid(True, linestyle="--", alpha=0.6)
+
+        # Add secondary axis for original values
+        ax2 = ax.twiny()
+        # Scale the secondary axis limits by inverting the primary limits
+        ax2.set_xlim(
+            scaler.inverse_transform(
+                np.array([ax.get_xlim()]).T.repeat(n_feats, axis=1)
+            )[:, i]
+        )
+        ax2.set_xlabel(f"{var_name} (Original Units)")
+    plt.tight_layout()
+    fig.savefig(output_dir / f"{base_name}_mcmc_feature_distributions.jpg", dpi=150)
+    plt.close(fig)
+
+    # 5. Run MCMC Clustering
     # We construct a dummy sectors dict for the function signature,
     # though spatially they are all in the same "Sector A" envelope.
     # The GMM will separate them based on Feature (Velocity) + Spatial cohesion (MRF).
@@ -490,7 +248,7 @@ def run_anomaly_detection(
         force_cpu=config.mcmc.force_cpu,
     )
 
-    # 5. Save Sampling Summary (Trace plots, etc.)
+    # 6. Save Diagnostics
     save_sampling_summary(
         convergence_flag=result.convergence_flag,
         idata=result.idata,
@@ -531,12 +289,11 @@ def run_anomaly_detection(
     except Exception as e:
         logger.warning(f"Failed to plot spatial priors for anomaly detection: {e}")
 
-    # === MANUAL POST-PROCESSING FOR ANOMALY IDENTIFICATION ===
+    # 7. Post-Processing: Vectorization
 
-    # Map back 0/1 to specific labels
-    labels = ["base", "anomaly"]
-    sub_labels = [labels[p] for p in result.cluster_pred]
-    df_sub["sector"] = sub_labels
+    # Map classes: 0 -> base, 1 -> anomaly
+    labels_map = ["base", "anomaly"]
+    df_sub["sector"] = [labels_map[p] for p in result.cluster_pred]
 
     # Save Sub-sector GeoJSON (points)
     df_sub.to_csv(output_dir / f"{anomaly_base_name}_points.csv", index=False)
@@ -545,44 +302,39 @@ def run_anomaly_detection(
     # We are specifically interested in the 'Anomaly' cluster
     anomaly_df = df_sub[df_sub["sector"] == "anomaly"]
     base_df = df_sub[df_sub["sector"] == "base"]
-
     logger.info(f"Refinement Stats: Base={len(base_df)}, Anomaly={len(anomaly_df)}")
 
-    # Process Anomaly Cluster
-    if len(anomaly_df) < 10:  # Minimum threshold to consider it a real cluster
-        logger.warning(
-            f"Anomaly cluster too small ({len(anomaly_df)} points). Ignored."
-        )
-        anomaly_gdf = gpd.GeoDataFrame(geometry=[])
-
-        return anomaly_gdf, df_sub
+    if len(anomaly_df) < 10:
+        logger.info("Anomaly cluster too small or non-existent.")
+        return gpd.GeoDataFrame(), df_sub
 
     logger.info(f"Vectorizing anomaly cluster with {len(anomaly_df)} points...")
+
+    # Vectorize points to polygon
     x_a = anomaly_df["x"].to_numpy()
     y_a = anomaly_df["y"].to_numpy()
-
-    # Create a localized grid for just the anomaly points
-    # reusing grid creation logic but locally
     X_sub, Y_sub, label_grid_sub = create_2d_grid(
-        x=x_a,
-        y=y_a,
-        labels=np.ones(len(x_a), dtype=int) * 1,  # All are class 1 (Anomaly)
+        x=x_a, y=y_a, labels=np.ones(len(x_a))
     )
-
-    # Vectorize the anomaly cluster grid.
     anomaly_gdf = vectorize_gridded_sectors(label_grid_sub, X_sub, Y_sub)
 
     # Check validity and non-emptiness
-    if anomaly_gdf.empty and anomaly_gdf.is_valid.any():
+    if anomaly_gdf.empty or not anomaly_gdf.is_valid.all():
         logger.warning(
             "Anomaly geometry is empty or invalid after vectorization. Skipping smoothing and refinement."
         )
         anomaly_gdf = gpd.GeoDataFrame(geometry=[])
-
         return anomaly_gdf, df_sub
 
     # Explode MultiPolygons into individual Polygon rows
     anomaly_gdf = anomaly_gdf.explode(index_parts=False, ignore_index=True)
+
+    # Remove small anomalies that are likely noise (e.g., smaller than 4 points)
+    pixel_area_threshold = (
+        abs(X_sub[0, 1] - X_sub[0, 0]) * abs(Y_sub[1, 0] - Y_sub[0, 0])
+    ) * 4
+    anomaly_gdf["area"] = anomaly_gdf.area
+    anomaly_gdf = anomaly_gdf[anomaly_gdf["area"] >= pixel_area_threshold].copy()
 
     # Smooth the anomaly geometry slightly to make it more visually coherent, but keep it tight
     logger.info("Smoothing anomaly geometry...")
@@ -635,20 +387,31 @@ def run_anomaly_detection(
         index=False,
     )
 
-    # 4. Plotting
+    if img is not None:
+        plot_anomaly_map(
+            gdf_refined, anomaly_df, img, target_sector, output_dir, anomaly_base_name
+        )
+
+    logger.info(f"Anomaly detection completed. Results in {output_dir}")
+
+    return gdf_refined, anomaly_pots
+
+
+def plot_anomaly_map(gdf, points, img, sector_name, out_dir, base_name):
+    """Helper to plot the result."""
     if img is not None:
         fig, ax = plt.subplots(figsize=(10, 10))
         ax.imshow(img, cmap="gray")
 
         # Plot Base
-        base_row = gdf_refined[gdf_refined["sector"] == "base"]
+        base_row = gdf[gdf["sector"] == "base"]
         if not base_row.empty:
             base_row.plot(
                 ax=ax, facecolor="blue", alpha=0.3, edgecolor="blue", label="Base"
             )
 
         # Plot Anomaly (Highlighted)
-        anom_row = gdf_refined[gdf_refined["sector"] == "anomaly"]
+        anom_row = gdf[gdf["sector"] == "anomaly"]
         if not anom_row.empty:
             anom_row.plot(
                 ax=ax,
@@ -667,19 +430,329 @@ def run_anomaly_detection(
                 )
 
         # scatter points on top for detail
-        ax.scatter(anomaly_df["x"], anomaly_df["y"], c="yellow", s=1, alpha=0.5)
+        ax.scatter(points["x"], points["y"], c="yellow", s=1, alpha=0.5)
 
-        plt.title(f"Sector {target_sector} Refinement: Anomaly Detection")
+        plt.title(f"Sector {sector_name} Refinement: Anomaly Detection")
         plt.legend()
-        fig.savefig(output_dir / f"{anomaly_base_name}_refinement_map.jpg", dpi=150)
+        fig.savefig(out_dir / f"{base_name}_anomaly_map.jpg", dpi=150)
         plt.close(fig)
 
-    logger.info(f"Refinement complete. Results in {output_dir}")
 
-    return gdf_refined, anomaly_pots
+def find_sectors_file(config, provided_path=None):
+    """Locates the domain classification GeoJSON output."""
+    # 1. Check CLI argument
+    if provided_path and Path(provided_path).exists():
+        return Path(provided_path)
+
+    # 2. Check Config
+    if (
+        "input_sectors_path" in config.anomaly_detection
+        and config.anomaly_detection.input_sectors_path
+    ):
+        path = Path(config.anomaly_detection.input_sectors_path)
+        if path.exists():
+            return path
+
+    # 3. Automatic Discovery based on directory structure
+    # Expected: {base_output_dir}/kinematic_sectors_geojson/{date}_sectors_polygon.geojson
+    base_dir = Path(config.data.base_output_dir)
+    ref_date = config.data.reference_date
+
+    # Common standard paths
+    candidates = [
+        base_dir / "kinematic_sectors_geojson" / f"{ref_date}_sectors_polygon.geojson",
+        base_dir
+        / ref_date
+        / "kinematic_sectors_geojson"
+        / f"{ref_date}_sectors_polygon.geojson",
+        base_dir / "kinematic_sectors" / f"{ref_date}_sectors_polygon.geojson",
+    ]
+
+    for c in candidates:
+        if c.exists():
+            return c
+
+    raise FileNotFoundError(
+        f"Could not find sectors file for {ref_date}. Tried: {candidates}"
+    )
 
 
-def run_pipeline(config: DictConfig | ListConfig) -> bool:
+def load_best_dic_map(
+    ref_date_dt: datetime,
+    file_path: str | None,
+    search_dir: Path,
+    search_pattern: str,
+    dt_min: int,
+    dt_max: int,
+    base_image_dir: Path | None = None,
+    min_global_mad_threshold: float | None = None,
+    min_ensemble_size: int | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, Image.Image | None]:
+    """
+    Locate, read and select the best DIC NetCDF file for a given reference date.
+
+    Args:
+        ref_date_dt: reference date as datetime (used to search day-before maps).
+        file_path: explicit file path to a single NetCDF file (if provided, search is skipped).
+        search_dir: directory to search for candidate NetCDF files.
+        search_pattern: filename glob/pattern used by find_ensemble_files.
+        dt_min, dt_max: accepted temporal difference limits passed to find_ensemble_files.
+        base_image_dir: optional directory containing background images (used to load an image if metadata lacks one).
+        min_global_mad_threshold: optional MAD threshold to reject noisy maps (None disables this check).
+        min_ensemble_size: optional minimum ensemble size to accept a map (None disables this check).
+
+    Returns:
+        tuple of (dic_df, dic_analyses_meta, image_or_none)
+
+    Raises:
+        FileNotFoundError: if no candidate files are found.
+        RuntimeError: if no candidate passes the optional quality filters.
+    """
+    # discover candidate files
+    if file_path and Path(file_path).is_file():
+        nc_paths = [Path(file_path)]
+    else:
+        date_day_before = (ref_date_dt - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        nc_paths = find_ensemble_files(
+            search_dir, date_day_before, dt_min, dt_max, search_pattern
+        )
+
+    if not nc_paths:
+        raise FileNotFoundError(
+            "No DIC files found for the specified date and criteria."
+        )
+
+    # read candidates
+    candidates: dict[str, tuple[pd.DataFrame, pd.DataFrame]] = {}
+    for p in nc_paths:
+        try:
+            df, meta = read_data_from_pylamma_nc(p, base_image_dir=base_image_dir)
+            if not df.empty:
+                candidates[p.stem] = (df, meta)
+        except Exception as exc:
+            logger.warning(f"Failed to read {p}: {exc}")
+
+    if not candidates:
+        raise FileNotFoundError("No readable DIC candidates found.")
+
+    # evaluate and filter candidates (skip checks when thresholds are None)
+    valid: list[dict] = []
+    for name, (df, meta) in candidates.items():
+        mean_mad = float(df["mad"].mean()) if "mad" in df.columns else None
+        if mean_mad is None:
+            logger.warning(
+                f"Source {name}: 'mad' column not available; skipping MAD-based filtering."
+            )
+
+        min_ens = (
+            int(df["ensemble_size"].min()) if "ensemble_size" in df.columns else None
+        )
+        if min_ens is None:
+            logger.warning(
+                f"Source {name}: 'ensemble_size' column not available; skipping ensemble-size-based filtering."
+            )
+
+        if (
+            (min_global_mad_threshold is not None)
+            and (mean_mad is not None)
+            and (mean_mad > min_global_mad_threshold)
+        ):
+            logger.warning(
+                f"Rejecting {name}: MAD {mean_mad:.2f} > {min_global_mad_threshold}"
+            )
+            continue
+
+        if (
+            (min_ensemble_size is not None)
+            and (min_ens is not None)
+            and (min_ens < min_ensemble_size)
+        ):
+            logger.warning(
+                f"Rejecting {name}: Ensemble size {min_ens} < {min_ensemble_size}"
+            )
+            continue
+
+        valid.append(
+            {
+                "name": name,
+                "df": df,
+                "meta": meta,
+                "mad": mean_mad,
+                "ens": min_ens,
+                "dt": meta.iloc[0]["dt_hours"],
+            }
+        )
+
+    if not valid:
+        raise RuntimeError("No DIC candidates passed quality filters.")
+
+    # prefer entries with MAD available (lowest MAD), otherwise keep first valid
+    with_mad = [v for v in valid if v["mad"] is not None]
+    if with_mad:
+        with_mad.sort(key=lambda x: (x["mad"], -(x["ens"] or 0), -x["dt"]))
+        best = with_mad[0]
+    else:
+        logger.warning(
+            "MAD not available for any valid candidate. Selecting the first valid candidate."
+        )
+        best = valid[0]
+
+    dic_df = best["df"]
+    dic_meta = best["meta"]
+
+    # try to load an associated image (prefer metadata path, fallback to base_image_dir)
+    img: Image.Image | None = None
+    img_path = dic_meta.iloc[0].get("image_path")
+    if img_path and not pd.isna(img_path):
+        try:
+            img = Image.open(img_path)
+        except Exception as exc:
+            logger.warning(f"Could not load image from metadata {img_path}: {exc}")
+
+    if img is None and base_image_dir is not None:
+        try:
+            ref_date_str = ref_date_dt.strftime("%Y_%m_%d")
+            img_candidates = sorted(Path(base_image_dir).glob(f"*{ref_date_str}*.jpg"))
+            if img_candidates:
+                img = Image.open(img_candidates[len(img_candidates) // 2])
+                logger.info(
+                    f"Loaded background image from {img_candidates[len(img_candidates) // 2]}"
+                )
+        except Exception as exc:
+            logger.warning(f"Could not locate/load fallback image: {exc}")
+
+    return dic_df, dic_meta, img
+
+
+def load_dic_from_nc_file(
+    ref_date_dt: datetime,
+    file_path: str | None,
+    search_dir: Path,
+    search_pattern: str,
+    dt_min: int,
+    dt_max: int,
+    min_global_mad_threshold: float | None = None,
+    min_ensemble_size: int | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Locate, read and select the best DIC NetCDF file for a given reference date.
+
+    Args:
+        ref_date_dt: reference date as datetime (used to search day-before maps).
+        file_path: explicit file path to a single NetCDF file (if provided, search is skipped).
+        search_dir: directory to search for candidate NetCDF files.
+        search_pattern: filename glob/pattern used by find_ensemble_files.
+        dt_min, dt_max: accepted temporal difference limits passed to find_ensemble_files.
+        min_global_mad_threshold: optional MAD threshold to reject noisy maps (None disables this check).
+        min_ensemble_size: optional minimum ensemble size to accept a map (None disables this check).
+
+    Returns:
+        tuple of (dic_df, dic_analyses_meta)
+
+    Raises:
+        FileNotFoundError: if no candidate files are found.
+        RuntimeError: if no candidate passes the optional quality filters.
+    """
+    # discover candidate files
+    if file_path and Path(file_path).is_file():
+        nc_paths = [Path(file_path)]
+    else:
+        date_day_before = (ref_date_dt - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        nc_paths = find_ensemble_files(
+            search_dir, date_day_before, dt_min, dt_max, search_pattern
+        )
+
+    if not nc_paths:
+        raise FileNotFoundError(
+            "No DIC files found for the specified date and criteria."
+        )
+
+    # read candidates
+    candidates: dict[str, tuple[pd.DataFrame, pd.DataFrame]] = {}
+    for p in nc_paths:
+        try:
+            df, meta = read_data_from_pylamma_nc(p)
+            if not df.empty:
+                candidates[p.stem] = (df, meta)
+        except Exception as exc:
+            logger.warning(f"Failed to read {p}: {exc}")
+
+    if not candidates:
+        raise FileNotFoundError("No readable DIC candidates found.")
+
+    # evaluate and filter candidates (skip checks when thresholds are None)
+    valid: list[dict] = []
+    for name, (df, meta) in candidates.items():
+        mean_mad = float(df["mad"].mean()) if "mad" in df.columns else None
+        if mean_mad is None:
+            logger.warning(
+                f"Source {name}: 'mad' column not available; skipping MAD-based filtering."
+            )
+
+        min_ens = (
+            int(df["ensemble_size"].min()) if "ensemble_size" in df.columns else None
+        )
+        if min_ens is None:
+            logger.warning(
+                f"Source {name}: 'ensemble_size' column not available; skipping ensemble-size-based filtering."
+            )
+
+        if (
+            (min_global_mad_threshold is not None)
+            and (mean_mad is not None)
+            and (mean_mad > min_global_mad_threshold)
+        ):
+            logger.warning(
+                f"Rejecting {name}: MAD {mean_mad:.2f} > {min_global_mad_threshold}"
+            )
+            continue
+
+        if (
+            (min_ensemble_size is not None)
+            and (min_ens is not None)
+            and (min_ens < min_ensemble_size)
+        ):
+            logger.warning(
+                f"Rejecting {name}: Ensemble size {min_ens} < {min_ensemble_size}"
+            )
+            continue
+
+        valid.append(
+            {
+                "name": name,
+                "df": df,
+                "meta": meta,
+                "mad": mean_mad,
+                "ens": min_ens,
+                "dt": meta.iloc[0]["dt_hours"],
+            }
+        )
+
+    if not valid:
+        raise RuntimeError("No DIC candidates passed quality filters.")
+
+    # prefer entries with MAD available (lowest MAD), otherwise keep first valid
+    with_mad = [v for v in valid if v["mad"] is not None]
+    if with_mad:
+        with_mad.sort(key=lambda x: (x["mad"], -(x["ens"] or 0), -x["dt"]))
+        best = with_mad[0]
+    else:
+        logger.warning(
+            "MAD not available for any valid candidate. Selecting the first valid candidate."
+        )
+        best = valid[0]
+
+    dic_df = best["df"]
+    dic_meta = best["meta"]
+
+    return dic_df, dic_meta
+
+
+def run_anomaly_pipeline(
+    config: DictConfig | ListConfig,
+    sectors_file_path: Path | str,
+    buffer: float = 100.0,
+) -> bool:
     """
     Main execution pipeline taking a fully merged configuration object.
     """
@@ -689,408 +762,277 @@ def run_pipeline(config: DictConfig | ListConfig) -> bool:
     if not isinstance(config, DictConfig | ListConfig):
         raise ValueError("config must be an OmegaConf DictConfig or ListConfig object.")
 
-    reference_date = config.data.reference_date
-    if not reference_date:
+    ref_date = config.data.reference_date
+    if not ref_date:
         raise ValueError("reference_date must be provided via CLI or config.")
-    reference_date_dt = datetime.strptime(reference_date, "%Y-%m-%d")
+    ref_date_dt = datetime.strptime(ref_date, "%Y-%m-%d")
 
-    # Log some key configuration values for better traceability
-    logger.info(f"Processing reference date: {reference_date}")
-    logger.info(f"\tData source: {config.data.get('source', 'database')}")
-    logger.info(f"\tCamera name: {config.data.get('camera_name', 'N/A')}")
-    logger.info(
-        f"\tDt range DIC data selection: {config.data.get('dt_min')} - {config.data.get('dt_max')} hours"
-    )
-    logger.info(
-        f"\tDate range for data selection: {config.data.get('days_before_to_include', 0)} days before to {config.data.get('days_after_to_include', 0)} days after reference date"
-    )
-    logger.info(f"\tSpatial priors: {list(config.mcmc.priors.probability.keys())}")
-    logger.info(f"Spatial prior file: {config.data.sector_prior_path}")
-    logger.info(
-        f"\tInput features for clustering: {config.preprocessing.variables_names}"
-    )
+    target_sector = config.anomaly_detection.target_sector
 
-    # Output base directory (output will be saved in a subfolder with camera name and date)
+    # Determine output directory for anomaly detection results.
     output_base_dir = Path(config.data.base_output_dir)
-    if config.data.run_output_subdir:
-        output_dir = output_base_dir / config.data.run_output_subdir
+    run_output_subdir = config.data.get("run_output_subdir")
+    if run_output_subdir:
+        output_dir = output_base_dir / run_output_subdir
     else:
         output_dir = output_base_dir
+    output_dir = output_dir / f"anomaly_{target_sector}"  # Dedicated subfolder
     output_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Anomaly detection outputs will be saved to: {output_dir}")
 
     # Define base names for outputs
-    base_name = f"{reference_date}"
+    base_name = f"{ref_date}"
 
     # Save a copy of the used config in the output dir with omegaconfig dump
     config_path = output_dir / f"{base_name}_config.yaml"
     OmegaConf.save(config, config_path)
 
-    # === LOAD DATA ===
-    # Read sectors for spatial priors and ROI
-    # sectors is now dict[str, shapely.Polygon]
-    sector_names = list(config.mcmc.priors.probability.keys())
-    sectors, roi = load_sectors_and_roi(
-        sector_prior_path=config.data.sector_prior_path,
-        sector_names=sector_names,
-        roi_path=config.data.roi_path,
-    )
+    # 1. Load Sectors
+    sectors_path = find_sectors_file(config, sectors_file_path)
+    logger.info(f"Loading sectors from: {sectors_path}")
+    sectors_gdf = gpd.read_file(sectors_path)
 
-    # Load dic data and image
-    data_source = config.data.get("source", "database")
-    if data_source == "file":
-        logger.info("Reading data from local file.")
+    # 2. Extract ROI (Target Sector) for optimizing data loading
+    if target_sector not in sectors_gdf["sector"].values:
+        logger.error(f"Sector {target_sector} not present in loaded file.")
+        return False
 
-        # Determine the actual file path
-        file_path = config.data.get("file_path")
-        if file_path and Path(file_path).is_file():
-            nc_path = Path(file_path)
-        else:
-            # Auto-discovery mode
-            search_dir = Path(config.data.get("search_dir", "."))
-            if file_path and Path(file_path).is_dir():
-                search_dir = Path(file_path)
-            pattern = config.data.get("search_pattern")
-            nc_path = find_ensemble_file(
-                search_dir=search_dir,
-                reference_date=reference_date,
-                dt_hours_min=config.data.dt_min,
-                dt_hours_max=config.data.dt_max,
-                filename_pattern=pattern,
-            )
+    target_poly = sectors_gdf[
+        sectors_gdf["sector"] == target_sector
+    ].geometry.union_all()
+    # Use a safe buffer to ensure we load enough data for the anomaly detection context (MRF needs neighbors)
+    roi_poly = target_poly.buffer(buffer)
 
-        if nc_path is None:
-            logger.error(f"No file found for reference date {reference_date}.")
-            return False
+    # 3. Load DIC Data (Partial Load using ROI)
+    # Using existing data loading logic
+    source = config.data.get("source", "database")
+    img = None  # Initialize img variable to None; it will be set if an image is successfully loaded later.
 
-        try:
-            # Pass image_dir from config if available
-            base_img_dir = config.data.get("image_dir")
-            base_img_dir = Path(base_img_dir) if base_img_dir else None
-            out, dic_analyses, img = read_data_from_pylamma_nc(
-                nc_path, base_image_dir=base_img_dir
-            )
-
-        except Exception as e:
-            raise ValueError(
-                f"Failed to read or parse selected file {nc_path}: {e}"
-            ) from e
-
-    elif data_source == "database":
-        logger.info("Reading data from database.")
-
-        # Date range for data selection
-        days_before_to_include = config.data.get("days_before_to_include", 0)
-        ref_date_start = reference_date_dt - pd.Timedelta(days=days_before_to_include)
-        days_after_to_include = config.data.get("days_after_to_include", 0)
-        ref_date_end = reference_date_dt + pd.Timedelta(days=days_after_to_include)
-
-        # Load data from database with the specified date range
-        out, dic_analyses, img = read_data_from_db(
-            config, reference_date, ref_date_start, ref_date_end
+    if source == "database ":
+        raise NotImplementedError(
+            "Currently only file-based loading is implemented for anomaly detection."
         )
 
-    else:
-        raise ValueError(f"Unknown data source: {data_source}")
+    # TODO: Use the refractored function instead of this code here.
 
-    if out is None or dic_analyses is None:
-        logger.error("No valid data loaded. Aborting.")
+    file_path = config.data.get("file_path")
+    if file_path and Path(file_path).is_file():
+        nc_paths = [Path(file_path)]
+    else:  # Auto-discover mode
+        search_dir = Path(config.data.get("search_dir"))
+        pattern = config.data.get("search_pattern")
+
+        # NOTE: We use the day before the reference date to search for the DIC map of the day before with dt=1 day (i-1, i-2)
+        date_day_before = (ref_date_dt - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        logger.info(
+            f"Using {config.data.reference_date} for DIC loading (searching for maps from the day before)."
+        )
+        nc_paths = find_ensemble_files(
+            search_dir,
+            date_day_before,
+            config.data.dt_min,
+            config.data.dt_max,
+            pattern,
+        )
+        logger.info(f"Found {len(nc_paths)} candidate DIC files for loading.")
+
+    if not nc_paths:
+        logger.error("No DIC files found for the specified date and criteria.")
         return False
+
+    # 1. Read all candidates
+    base_img_dir = Path(config.data.image_dir) if config.data.get("image_dir") else None
+    candidates = {}
+    for p in nc_paths:
+        try:
+            df, meta = read_data_from_pylamma_nc(p, base_image_dir=base_img_dir)
+            if not df.empty:
+                candidates[p.stem] = (df, meta)
+        except Exception as e:
+            logger.warning(f"Failed to read {p}: {e}")
+
+    # Filter DIC maps by quality
+    mean_mad_threshold = config.preprocessing.min_global_mad_threshold
+    min_ensemble_size = config.preprocessing.min_ensemble_size
+    valid_results = []
+    for name, (df, meta) in candidates.items():
+        # Compute mean MAD only if column exists and a threshold is provided
+        if "mad" in df.columns:
+            mean_mad = float(df["mad"].mean())
+        else:
+            mean_mad = None
+            logger.warning(
+                f"Source {name}: 'mad' column not available; skipping MAD-based filtering for this source."
+            )
+        # Compute min ensemble size only if column exists and a threshold is provided
+        if "ensemble_size" in df.columns:
+            min_ens = int(df["ensemble_size"].min())
+        else:
+            min_ens = None
+            logger.warning(
+                f"Source {name}: 'ensemble_size' column not available; skipping ensemble-size-based filtering for this source."
+            )
+
+        # Apply MAD threshold check only when a threshold is configured and MAD is available
+        if (
+            mean_mad_threshold is not None
+            and mean_mad is not None
+            and mean_mad > mean_mad_threshold
+        ):
+            logger.warning(
+                f"Rejecting {name}: MAD {mean_mad:.2f} > {mean_mad_threshold}"
+            )
+            continue
+
+        # Apply ensemble size check only when a threshold is configured and ensemble info is available
+        if (
+            min_ensemble_size is not None
+            and min_ens is not None
+            and min_ens < min_ensemble_size
+        ):
+            logger.warning(
+                f"Rejecting {name}: Ensemble size {min_ens} < {min_ensemble_size}"
+            )
+            continue
+
+        valid_results.append(
+            {
+                "name": name,
+                "df": df,
+                "meta": meta,
+                "mad": mean_mad,
+                "ens": min_ens,
+                "dt": meta.iloc[0]["dt_hours"],
+            }
+        )
+
+    if not valid_results:
+        logger.error("No DIC results passed quality filters.")
+        return False
+
+    # If some entries have MAD available prefer them; otherwise pick the first element.
+    with_mad = [v for v in valid_results if v["mad"] is not None]
+    if with_mad:
+        # Sort by MAD (ascending), then largest ensemble, then largest dt
+        with_mad.sort(key=lambda x: (x["mad"], -(x["ens"] or 0), -x["dt"]))
+        best = with_mad[0]
+    else:
+        logger.warning(
+            "MAD not available for any candidate. Selecting the first available result."
+        )
+        # keep original order: take first valid result
+        best = valid_results[0]
+
+    logger.info(
+        f"Selected best DIC map: {best['name']} (MAD: {best['mad'] if best['mad'] is not None else 'N/A'}, DT: {best['dt']:.1f}h)"
+    )
+
+    # Extract the DIC dataframe and metadata from the selected best result for further processing
+    dic_df = best["df"]
+    dic_analyses = best["meta"]
+
+    # 5. Try to load the background image from the selected metadata
+    img_path = dic_analyses.iloc[0].get("image_path")
+    if img_path and not pd.isna(img_path):
+        try:
+            img = Image.open(img_path)
+        except Exception as e:
+            logger.warning(f"Could not load image {img_path}: {e}")
+
+    # If the image is still None, try to find it in the base image directory using the reference date and camera name
+    if img is None:
+        ref_date_str = ref_date_dt.strftime("%Y_%m_%d")
+        img_candidates = sorted(base_img_dir.glob(f"*{ref_date_str}*.jpg"))
+
+        # Take middle one if multiple candidates found
+        if img_candidates:
+            img_path = img_candidates[len(img_candidates) // 2]
+            try:
+                img = Image.open(img_path)
+                logger.info(f"Loaded background image from {img_path}")
+            except Exception as e:
+                logger.warning(f"Could not load image {img_path}: {e}")
 
     date_start = dic_analyses.iloc[0]["master_timestamp"].strftime("%Y-%m-%d")
     date_end = dic_analyses.iloc[0]["slave_timestamp"].strftime("%Y-%m-%d")
     dic_analyses.to_csv(
-        output_dir / f"{base_name}_master{date_start}_slave{date_end}_dic_analyses.csv",
+        output_dir / f"{base_name}_dic_analyses-master{date_start}_slave{date_end}.csv",
         index=False,
     )
 
-    # Apply filter for each df in the dictionary and then stack them
-    preproc_config = config.preprocessing
-    dic_df = preprocess_dic_data(
-        out=out,
-        roi=roi,
-        preproc_config=preproc_config,
-    )
+    num_points = len(dic_df)
+
+    # Filter only points inside the spatial priors sectors
+    if roi_poly is not None:
+        dic_df = filter_dataframe_by_polygons(dic_df, polygon=roi_poly)
+
+    # Apply MAD filtering if max_point_mad is specified
+    max_point_mad = config.preprocessing.max_point_mad
+    if max_point_mad is not None and "mad" in dic_df.columns:
+        dic_df = dic_df[dic_df["mad"] <= max_point_mad]
+        logger.info(
+            f"Applied point MAD filtering with threshold {max_point_mad}. Points before: {num_points}, after: {len(dic_df)}."
+        )
+
+    # Apply other DIC filters if any
+    dic_df = apply_dic_filters(dic_df, **config.preprocessing.filter_kwargs)
+    if dic_df.empty:
+        raise RuntimeError("No dataframes left after filtering.")
+
+    # Apply subsampling
+    if config.preprocessing.subsample_factor > 1:
+        dic_df = spatial_subsample(
+            dic_df,
+            n_subsample=config.preprocessing.subsample_factor,
+            method=config.preprocessing.subsample_method,
+        )
+        logger.info(f"Data shape after subsampling: {dic_df.shape}")
+
     dic_df.to_csv(output_dir / f"{base_name}_preprocessed_dic_data.csv", index=False)
 
-    timer.update("data_loading_and_preprocessing")
-
-    # ===  MCMC CLUSTERING   === #
-    # --- Assign Priors (Spatial or Velocity-based) ---
-    # DETECT REFINEMENT OVERRIDE # TODO: find a better way to do this
-    # If "Base" or "Fast" (or any specific custom key) is present,
-    # we assume the user wants to exclusively use these and ignore A, B, C, D.
-    custom_keys = [k for k in config.mcmc.priors.probability if k in ["Base", "Fast"]]
-    if custom_keys:
-        logger.info(
-            f"Custom sector keys detected {custom_keys}. Using these exclusively."
-        )
-        # Create a new clean dictionary with ONLY the custom keys
-        filtered_probs = {}
-        for k in custom_keys:
-            filtered_probs[k] = config.mcmc.priors.probability[k]
-
-        # Overwrite the config object's dictionary with the filtered one
-        config.mcmc.priors.probability = filtered_probs
-
-    # TODO: implement also the possibility to use other types of priors (e.g. velocity-based) without spatial sectors, but for now we require spatial priors if any priors are specified.
-    use_spatial_priors = True
-    if use_spatial_priors:
-        try:
-            logger.info("Using SPATIAL priors from polygons.")
-            prior_probs_array = mcmc.assign_spatial_priors(
-                x=dic_df["x"].to_numpy(),
-                y=dic_df["y"].to_numpy(),
-                polygons=sectors,
-                prior_probs=config.mcmc.priors.probability,
-                fade_method=config.mcmc.priors.fade_method,
-                fade_options=config.mcmc.priors.fade_options,
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "Error in spatial priors assignment. Check the sector geometries and prior probabilities configuration."
-            ) from exc
-    else:
-        # Default: uniform priors across sectors (not used. fail if spatial priors requested)
-        # if not config.mcmc.priors.probability:
-        #     n_sectors = len(sectors)
-        #     uniform_prob = 1.0 / n_sectors
-        #     config.mcmc.priors.probability = {
-        #         name: [uniform_prob] * n_sectors for name in sectors
-        #     }
-        raise NotImplementedError(
-            "Velocity-based priors without spatial sectors is not implemented."
-        )
-
-    # Perform MCMC clustering
-    result, scaler = run_mcmc_clustering(
-        dic_df=dic_df,
-        prior_probs_array=prior_probs_array,
-        sectors=sectors,
-        config=config,
-        img=img,
-        output_dir=output_dir,
-        base_name=base_name,
-    )
-    timer.update("mcmc_clustering")
-
-    # ===  POST-PROCESSING AND CLEANING OF FINAL CLUSTERING  === #
-
-    # Use the shared function for the main data
-    logger.info("Processing main clustering results...")
-    sectors, pts_by_sector = process_clustering_results(
-        df_points=dic_df,  # The original full dataframe
-        cluster_labels=result.cluster_pred,
-        output_dir=output_dir,
-        base_name=base_name,
-        config=config,
-        img=img,
-    )
-
-    # Make a summary plot of the final sectors with points colored by velocity
-    sector_colors = get_sector_colors(
-        sectors["sector"].tolist(),
-        colormap=config.plotting.default_discrete_cmap,
-    )
-    plot_sectors_summary(
-        sectors=sectors,
-        points_by_sector=pts_by_sector,
-        img=img,
-        colors=sector_colors,
-        output_dir=output_dir,
-        base_name=base_name,
-        unit="px",
-        quiver_kwargs=config.plotting.quiver,
-        figsize=(20, 10),
-        dpi=150,
-        save_svg=True,
-    )
-
-    # Save Pythonized bundle with all dataframes and arrays
-    logger.info("Saving sector results...")
-    bundle = {
-        "reference_date": reference_date,
-        "date_start": date_start,
-        "date_end": date_end,
-        "dic_dataframe": dic_df,
-        "posterior_probs": result.posterior_probs,
-        "cluster_pred": result.cluster_pred,
-        "uncertainty": result.entropy,
-        "sectors": sectors,
-        "pts_by_sector": pts_by_sector,
-    }
-    joblib.dump(bundle, output_dir / f"{base_name}_results.joblib")
-
-    # Save geojson with sector geometries and stats in a common base folder
-    sector_vector_dir = output_base_dir / "kinematic_sectors_geojson"
-    sector_vector_dir.mkdir(exist_ok=True)
-    sectors.to_file(
-        sector_vector_dir / f"{base_name}_sectors_polygon.geojson",
-        driver="GeoJSON",
-    )
-    pts_by_sector.to_file(
-        sector_vector_dir / f"{base_name}_sectors_points.geojson",
-        driver="GeoJSON",
-    )
-
-    timer.update("post-processing")
-
-    # === OPTIONAL: SECTOR REFINEMENT (e.g. Sector A sub-clustering) ===
-    anomaly_gdf = None  # Initialize anomaly_gdf to None
-    if config.anomaly_detection.run_anomaly_detection:
-        logger.info("Running Anomaly Detection...")
-        target_sector = config.anomaly_detection.target_sector
-        anomaly_dir = output_dir / f"anomaly_{target_sector}"
-
-        try:
-            anomaly_gdf, anomaly_pts = run_anomaly_detection(
-                dic_df=dic_df,  # Pass full data, we filter inside
-                sectors_gdf=sectors,  # Pass the generated sectors from step 1
-                target_sector=target_sector,
-                config=config,
-                output_dir=anomaly_dir,
-                img=img,
-                base_name=base_name,
-            )
-
-            # Save anomaly geometry and points to geojson in a common folder for all days
-            anomaly_vector_dir = output_base_dir / "anomaly_A_geojson"
-            anomaly_vector_dir.mkdir(exist_ok=True)
-            anomaly_gdf.to_file(
-                anomaly_vector_dir / f"{base_name}_anomaly_A_polygon.geojson",
-                driver="GeoJSON",
-            )
-            anomaly_pts.to_file(
-                anomaly_vector_dir / f"{base_name}_anomaly_A_points.geojson",
-                driver="GeoJSON",
-            )
-        except Exception as e:
-            logger.error(f"Anomaly detection failed: {e}", exc_info=True)
-
-    timer.update("anomaly_detection")
-
-    # Make a final summary figure comparing all results ("Bollettino style")
-    # TODO: make a unified summary figure and remove hardcoded copying
-    kinematic_sectors_dir = output_base_dir / "kinematic_sectors"
-    kinematic_sectors_dir.mkdir(exist_ok=True)
-
-    sector_figure_path = output_dir / f"{base_name}_kinematic_sectors_summary.png"
-    summary_fig_path = kinematic_sectors_dir / f"{base_name}.png"
-
-    # - Make the final bollettino figure with or without anomaly depending on the results of the anomaly detection step. If anomaly detection failed, we fallback to copying the summary figure without anomaly to the base folder for easier access.
+    # Plot the preprocessed DIC data for visual inspection
     try:
-        fig, axes = plot_sectors_summary(
-            sectors=sectors,
-            points_by_sector=pts_by_sector,
-            img=img,
-            colors=sector_colors,
-            output_dir=None,  # We will save manually after
-            unit="px",
-            quiver_kwargs=config.plotting.quiver,
-            figsize=(20, 10),
-            dpi=150,
-            save_svg=False,
+        dic_plot_result = plot_dic_vectors(
+            x=dic_df["x"].to_numpy(),
+            y=dic_df["y"].to_numpy(),
+            u=dic_df["u"].to_numpy(),
+            v=dic_df["v"].to_numpy(),
+            magnitudes=dic_df["V"].to_numpy(),
+            background_image=img,
+            cmap_name="OrRd",
+            figsize=(10, 8),
+            title=f"{date_start} - {date_end}",
         )
-
-        # If anomaly detection was successful and we have a valid anomaly geometry, we add it to the plot
-        if (
-            anomaly_gdf is not None
-            and not anomaly_gdf.empty
-            and anomaly_gdf.is_valid.any()
-        ):
-            # get the map axis from the previous plot and plot the anomaly geometry on top with a distinct color and label
-            map_ax = axes["map"]
-            anom_geoms = anomaly_gdf[anomaly_gdf["sector"] == "anomaly"].union_all()
-            anom_geoms = gpd.GeoSeries(anom_geoms)
-
-            # Add the anomaly geometry to the map with a distinct color and label. Keep the facecolor transparent to only show the edge
-            anom_geoms.plot(
-                ax=map_ax,
-                facecolor="none",
-                edgecolor="#d3ff0d",
-                linewidth=2,
-                label="Anomaly",
-            )
-
-        fig.savefig(summary_fig_path, dpi=150)
-        # plt.close(fig)
-
+        fig, _, _ = dic_plot_result
+        fig.savefig(output_dir / f"{base_name}_preprocessed_dic_vectors.jpg", dpi=150)
+        plt.close(fig)
     except Exception as e:
-        logger.error(
-            f"Failed to plot summary with anomaly: {e}. Fallback to copy figure without anomaly.",
-            exc_info=True,
-        )
-        if sector_figure_path.is_file():
-            shutil.copy(sector_figure_path, summary_fig_path)
-        else:
-            logger.error(
-                f"Summary figure not found at {sector_figure_path}. Skipping copy."
-            )
+        logger.warning(f"Failed to plot preprocessed DIC vectors: {e}")
 
-        # anomaly_dir = (
-        #     output_base_dir / f"anomaly_{config.anomaly_detection.target_sector}"
-        # )
-        # anomaly_dir.mkdir(exist_ok=True)
-        # anomaly_fig_path = (
-        #     output_dir
-        #     / f"anomaly_{config.anomaly_detection.target_sector}"
-        #     / f"{base_name}_sector{config.anomaly_detection.target_sector}_anomaly_mcmc_results.jpg"
-        # )
-        # if anomaly_fig_path.is_file():
-        #     shutil.copy(
-        #         anomaly_fig_path,
-        #         anomaly_dir
-        #         / f"{base_name}_sector{config.anomaly_detection.target_sector}_anomaly_mcmc_results.jpg",
-        #     )
-        # else:
-        #     logger.warning(
-        #         f"Anomaly detection figure not found at {anomaly_fig_path}. Skipping copy."
-        #     )
+    # 5. Run Anomaly Detection
+    anomaly_gdf, anomaly_pts = run_anomaly_detection(
+        dic_df=dic_df,
+        sectors_gdf=sectors_gdf,
+        target_sector=target_sector,
+        config=config,
+        output_dir=output_dir,
+        img=img,
+        base_name=ref_date,
+    )
 
-        # # Concatenate the anomaly vector to the sector geodataframe for a final summary plot
-        # try:
-        #     file = (
-        #         output_dir
-        #         / f"anomaly_{config.anomaly_detection.target_sector}"
-        #         / f"{base_name}_sector{config.anomaly_detection.target_sector}_anomaly_vector.geojson"
-        #     )
-        #     anomaly_gdf = gpd.GeoDataFrame.from_file(file)
-        #     anomaly_gdf = anomaly_gdf.loc[
-        #         anomaly_gdf["sector"]
-        #         == f"{config.anomaly_detection.target_sector}_anomaly"
-        #     ]
-        #     # rename the anomaly with Z to make it visually distinct in the plot
-        #     anomaly_gdf["sector"] = anomaly_gdf["sector"].str.replace(
-        #         f"{config.anomaly_detection.target_sector}_anomaly",
-        #         "Z",
-        #     )
-        #     sector_with_anomaly = gpd.GeoDataFrame(
-        #         pd.concat(
-        #             [sectors, anomaly_gdf],
-        #             ignore_index=True,
-        #         ),
-        #         crs=sectors.crs,
-        #     )
+    # Save anomaly polygons and points in the common anomaly folder for easier access
+    anomaly_dir = output_base_dir / "anomaly_A_geojson"
+    anomaly_dir.mkdir(parents=True, exist_ok=True)
+    anomaly_gdf.to_file(
+        anomaly_dir / f"{base_name}_anomaly_A_polygons.geojson",
+        driver="GeoJSON",
+    )
+    anomaly_pts.to_file(
+        anomaly_dir / f"{base_name}_anomaly_A_points.geojson",
+        driver="GeoJSON",
+    )
 
-        #     # Add a specific color for the anomaly sector (Z)
-        #     sector_anomaly_colors = sector_colors.copy()
-        #     sector_anomaly_colors["Z"] = "#d3ff0d"
-        #     plot_sectors_summary(
-        #         sectors=sector_with_anomaly,
-        #         points_by_sector=pts_by_sector,
-        #         img=img,
-        #         colors=sector_anomaly_colors,
-        #         output_dir=anomaly_dir,
-        #         base_name=f"{base_name}_sector{config.anomaly_detection.target_sector}_anomaly",
-        #         unit="px",
-        #         quiver_kwargs=config.plotting.quiver,
-        #         figsize=(20, 10),
-        #         dpi=150,
-        #         save_svg=False,
-        #     )
-        # except Exception as e:
-        #     logger.error(f"Failed to plot summary with anomaly: {e}", exc_info=True)
-
-    logger.info("Processing complete.")
+    logger.info("Anomaly detection pipeline completed successfully.")
     timer.print()
 
     return True
@@ -1103,169 +1045,33 @@ def main():
     config_path = args.config if args.config else None
     config = load_config(config_path)
 
-    # 2. Apply Specific CLI Flags (Highest Priority for these shortcuts)
+    # CLI Overrides
     if args.date:
         config.data.reference_date = args.date
     if args.output_dir:
         config.data.base_output_dir = args.output_dir
-
-    # 3. Apply Generic Dotlist Overrides
     if args.overrides:
-        # OmegaConf can natively merge list of dot-string arguments
-        # e.g. ["data.dt_min=10", "mcmc.regularization=False"]
-        cli_conf = OmegaConf.from_dotlist(args.overrides)
-        config = OmegaConf.merge(config, cli_conf)
+        config = OmegaConf.merge(config, OmegaConf.from_dotlist(args.overrides))
 
     # 4. Dynamic update 'year' based on 'reference_date'
     # This must happen before resolution so that paths using ${data.year} are correct
     if not config.data.reference_date:
         raise ValueError("reference_date must be provided via CLI or config.")
-    try:
-        ref_dt = datetime.strptime(config.data.reference_date, "%Y-%m-%d")
-        config.data.year = str(ref_dt.year)
-        logger.debug(
-            f"CLI: Updating 'data.year' to {config.data.year} based on reference date."
-        )
-    except ValueError:
-        logger.error(
-            f"Could not parse year from reference_date: {config.data.reference_date}"
-        )
-        config.data.year = "unknown"
+    ref_dt = datetime.strptime(config.data.reference_date, "%Y-%m-%d")
+    config.data.year = str(ref_dt.year)
 
     # 5. Resolve Configuration
-    # This computes all interpolations (e.g. ${data.output_dir}) now.
     OmegaConf.resolve(config)
-
-    # Run the main pipeline with error handling to ensure that if something goes wrong, we log it and optionally clean up any partial outputs.
-    base_output_dir = Path(config.data.base_output_dir)
-    run_output_subdir = config.data.get("run_output_subdir", None)
-    if run_output_subdir:
-        output_dir = base_output_dir / run_output_subdir
-    else:
-        output_dir = base_output_dir
-
-    # Check if output directory already exists and skip if --skip-existing is set. This prevents overwriting previous runs and allows for safe re-runs without manual cleanup.
-    if args.skip_existing and output_dir.exists():
-        logger.info(f"Skipping run: output directory {output_dir} already exists.")
-        return
-
-    # Create output directory before running the pipeline
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     # Force CPU for MCMC if specified in config to avoid potential GPU-related issues with JAX in some environments. This should be set before any JAX imports.
     if config.mcmc.force_cpu:
         os.environ["JAX_PLATFORMS"] = "cpu"
 
     try:
-        result = run_pipeline(config)
+        run_anomaly_pipeline(config, sectors_file_path=args.sectors_file)
     except Exception as e:
-        logger.error(f"Processing failed: {e}")
-        if not args.keep_failed_output:
-            logger.info(f"Cleaning up output directory {output_dir} due to failure.")
-            shutil.rmtree(output_dir, ignore_errors=True)
+        logger.error(f"Anomaly Pipeline Failed: {e}", exc_info=True)
         raise
-
-    if result:
-        logger.info(f"Pipeline completed successfully. Outputs saved to {output_dir}")
-    else:
-        logger.error("Pipeline did not complete successfully. Check logs for details.")
-        if not args.keep_failed_output:
-            logger.info(
-                f"Cleaning up output directory {output_dir} due to incomplete results."
-            )
-            shutil.rmtree(output_dir, ignore_errors=True)
-
-
-def run_multiscale_mcmc_deprecated(
-    dic_df: pd.DataFrame,
-    prior_probs_array: np.ndarray,
-    sectors: Any,
-    config: DictConfig | ListConfig,
-):
-    """
-    DEPRECATED: Multiscale approach iterating over sigma values.
-    Kept for reference but not used in the active pipeline.
-    """
-
-    raise NotImplementedError(
-        "Multiscale MCMC clustering is currently deprecated and not maintained. This function is kept for reference but should not be used in the active pipeline. The old result dict was replaced with a ClusteringResult object that does not contain 'sigma' key anymore."
-    )
-
-    # results = []
-    # if config.multiscale.sigma_values is None:
-    #     return None
-
-    #     # Loop through smoothing scales
-    #     results = []
-    #     for sigma in config.multiscale.sigma_values:
-    #         logger.info(f"Processing with Gaussian smoothing sigma={sigma}...")
-
-    #         # Create scale-specific base name
-    #         scale_base_name = f"{mcmc_base_name}_sigma{sigma}"
-
-    #         # Apply Gaussian smoothing if needed (skipped for sigma=0)
-    #         df_run = apply_2d_gaussian_filter(dic_df, sigma=sigma)
-
-    #         # Preprocess features for clustering
-    #         data_array_scaled, scaler, velocities, transform_info = preprocess_features(
-    #             df_input=df_run,
-    #             variables_names=config.data.variables_names,
-    #             transform_velocity=config.mcmc.velocity_transform,
-    #             transform_params=config.mcmc.transform_params,
-    #         )
-    #         joblib.dump(scaler, output_dir / f"{scale_base_name}_scaler.joblib")
-
-    #         # Run MCMC clustering with the a gaussian mixture model
-    #         if sigma > 2:  # For larger sigma, tighten priors
-    #             mu_params = {"mu": 0, "sigma": 0.5}
-    #             sigma_params = {"sigma": 0.5}
-    #         else:
-    #             mu_params = config.mcmc.model_options.mu_params
-    #             sigma_params = config.mcmc.model_options.sigma_params
-    #         result = clusterize_gaussian_mixture(
-    #             data_array_scaled=data_array_scaled,
-    #             prior_probs=prior_probs_array,
-    #             sectors=sectors,
-    #             sample_args=config.mcmc.sample_options,
-    #             mu_params=mu_params,
-    #             sigma_params=sigma_params,
-    #             feature_weights=config.mcmc.feature_weights,
-    #             apply_mrf_regularization=config.mcmc.mrf_regularization,
-    #             mrf_kwargs=config.mcmc.mrf_kwargs,
-    #             second_pass=config.mcmc.second_pass,
-    #             second_pass_sample_args=config.mcmc.second_pass_sample_args,
-    #             random_seed=config.random_seed,
-    #         )
-
-    #         # --- Save sampling summary ---
-    #         save_sampling_summary(
-    #             convergence_flag=result["convergence_flag"],
-    #             idata=result["idata"],
-    #             output_dir=output_dir,
-    #             base_name=scale_base_name,
-    #         )
-
-    #         # Add scale information to result
-    #         # result["sigma"] = sigma
-
-    #         # Append to results list
-    #         results.append(result)
-
-    # # --- Save final clustering results ---
-    # cluster_aggregation_outs = {
-    #     "cluster_pred": cluster_pred,
-    #     "posterior_probs": posterior_probs,
-    #     "entropy": entropy,
-    #     "similarity_matrix": similarity_matrix,
-    #     "stability_score": stability_score,
-    #     "valid_scales": valid_scales,
-    # }
-    # joblib.dump(
-    #     cluster_aggregation_outs,
-    #     output_dir / f"{mcmc_base_name}_clustering_results_raw.joblib",
-    # )
-
-    # return results
 
 
 if __name__ == "__main__":
