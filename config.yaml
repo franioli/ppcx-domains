@@ -186,7 +186,6 @@ plotting:
     vmax: 15
 
 anomaly_detection:
-  run_anomaly_detection: false # Whether to run the anomaly detection module (default: false)
   target_sector: "A" # Sector to analyze for anomalies (e.g., "A")
   prior_percentile_threshold: 95 # Percentile threshold for velocity-based priors (e.g., 90 means points above the 90th percentile of velocity are more likely to be anomalies)
   # variables_names: ["V", "u"] # TODO: This is hardcoded in the code, now we are using V and V_trans (direction)

@@ -35,10 +35,12 @@ preprocessing:
   min_ensemble_size: 2  # Minimum number of DIC maps (ensembles) required for a given date to be included in the analysis. Set to None to disable ensemble size filtering.
   max_point_mad: 3 # Maximum MAD threshold for filtering. Points with MAD above this value will be removed. Set to None to disable MAD filtering.
   filter_kwargs:
-    min_velocity: 1  # Minimum velocity threshold (units depend on input data)
+    min_velocity: 1.5  # Minimum velocity threshold (units depend on input data)
 
 anomaly_detection:
   target_sector: "A" # Sector to analyze for anomalies (e.g., "A")
+  sector_buffer: 100.0 # Buffer distance in meters to expand sector polygons for data selection. This can help include points near the sector boundaries that may be relevant for anomaly detection.
+
   variables_names: ["V_long", "V_trans"] # or ["V_long", "V_trans"] ["V"] 
   # feature_weights: [0.8, 0.2]  # e.g., [1.0] # Weights for each feature in variables_names. Used only if multiple features are used.
 
@@ -47,7 +49,6 @@ anomaly_detection:
   prior_anomaly_probability_limits: [0.1, 0.9] # Bounds for p(anomaly).
   # The actual p(anomaly) for each point will be assigned based on the chosen method(s) and will lie within these bounds. These values do not have to sum to 1 with p(not anomaly) as the probability of not being an anomaly will be 1 - p(anomaly).
 
-  sector_buffer: 100.0 # Buffer distance in meters to expand sector polygons for data selection. This can help include points near the sector boundaries that may be relevant for anomaly detection.
 
   # MCMC sampling parameters for anomaly detection.
   model_options:

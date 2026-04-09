@@ -569,26 +569,27 @@ def detect_anomaly(
         anomaly_gdf = gpd.GeoDataFrame(geometry=[])
         return anomaly_gdf, dic_df
 
-    # Remove small anomalies that are likely noise (e.g., smaller than 5 points)
+    # Remove small anomalies that are likely noise (e.g., smaller than 5 points) and fill small holes (e.g., smaller than 3 points) to clean up the geometry. # TODO: MAKE THIS CONFIGURABLE
     n_points_threshold = 5
-    n_points_holes_to_fill = 2
+    n_points_holes_to_fill = 3
+    keep_n_largest = 1
     grid_res = abs(float(X_sub[0, 1] - X_sub[0, 0]) if X_sub.shape[1] > 1 else 1.0)
 
     # Explode MultiPolygons into individual Polygon rows
     anomaly_gdf = anomaly_gdf.explode(index_parts=False, ignore_index=True)
 
-    # Filter Small Sectors # TODO: MAKE THIS OPTIONAL
+    # Filter Small Sectors
     anomaly_gdf = filter_small_sectors(
         anomaly_gdf, min_area_px2=grid_res**2 * n_points_threshold
     )
 
     anomaly_gdf = smoothify(
         anomaly_gdf,
-        segment_length=grid_res,  # Use the local grid resolution as a reference for smoothing
-        smooth_iterations=2,  # Light smoothing to preserve details
+        segment_length=grid_res,
+        smooth_iterations=1,
         merge_collection=True,  # Merge adjacent polygons to avoid fragmentation
         merge_multipolygons=False,  # Don't merge separate MultiPolygons to preserve distinct anomalies if they exist
-        num_cores=1,  # Avoid parallelism to prevent overhead
+        num_cores=1,
     )
 
     # Fill small holes in the anomaly geometry
@@ -602,7 +603,9 @@ def detect_anomaly(
     # Keep only the largest contiguous geometry if multiple remain (optional, can be disabled if we want to keep multiple anomalies)  # TODO: MAKE THIS OPTIONAL
     if len(anomaly_gdf) > 1:
         anomaly_gdf["area"] = anomaly_gdf.area
-        anomaly_gdf = anomaly_gdf.sort_values("area", ascending=False).head(1).copy()
+        anomaly_gdf = (
+            anomaly_gdf.sort_values("area", ascending=False).head(keep_n_largest).copy()
+        )
         logger.info(
             "Multiple anomaly geometries detected after filtering. Keeping only the largest one."
         )

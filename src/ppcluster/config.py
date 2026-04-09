@@ -206,8 +206,10 @@ class SectorAssignmentConfig:
 
 @dataclass
 class AnomalyDetectionConfig:
-    run_anomaly_detection: bool = False
     target_sector: str = "A"
+    sector_buffer: float | None = (
+        100.0  # Buffer distance in meters to expand sector polygons for data selection. This can help include points near the sector boundaries that may be relevant for anomaly detection.
+    )
 
     prior_assignment_method: str = "velocity+y_coord"  # Method to assign priors for anomaly probability. Options: "velocity", "y_coord", "kmeans", or combinations like "velocity+y_coord". This will influence the initial p(anomaly) for each point in the MCMC sampling.
     prior_anomaly_probability_limits: list[float] = field(
@@ -216,10 +218,6 @@ class AnomalyDetectionConfig:
 
     variables_names: list[str] = field(default_factory=lambda: ["V"])
     feature_weights: list[float] | None = None
-
-    sector_buffer: float | None = (
-        100.0  # Buffer distance in meters to expand sector polygons for data selection. This can help include points near the sector boundaries that may be relevant for anomaly detection.
-    )
 
     # MCMC options
     model_options: GaussianMixtureModelConfig = field(
