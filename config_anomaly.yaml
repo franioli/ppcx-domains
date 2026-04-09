@@ -29,170 +29,52 @@ data:
   sector_prior_path: "data/${data.year}*.zip" # Path to CVAT ZIP file containing sector prior polygons (and optionally ROI polygon)
   # roi_path: "data/roi.xml" # Path to CVAT XML file containing ROI polygon (optional, if not already included in sector_prior_path)
 
-
-
 # Data preprocessing parameters
 preprocessing:
-  variables_names: ["V"] # The feature vector used for clustering (Velocity)
-  feature_weights: null  # e.g., [1.0] # Weights for each feature in variables_names. Used only if multiple features are used.
-  velocity_transform: null  # # Use if velocity distribution is heavily skewed (non-Gaussian) ["power" | "exponential" | "sigmoid" | null]
-  transform_params: null # e.g., {"midpoint_percentile": 70, "steepness": 2.0}
-  subsample_factor: 1 # 2 means keep every 2nd point, 1 means no subsampling
-  subsample_method: "regular"  # or 'random'
   min_global_mad_threshold: 2.0  # Minimum global MAD (mean of the MAD on the DIC map) threshold. DIC maps with mean MAD below this threshold will be discarded. Set to None to disable global MAD filtering. 
   min_ensemble_size: 2  # Minimum number of DIC maps (ensembles) required for a given date to be included in the analysis. Set to None to disable ensemble size filtering.
-  max_point_mad: 6 # Maximum MAD threshold for filtering. Points with MAD above this value will be removed. Set to None to disable MAD filtering.
+  max_point_mad: 3 # Maximum MAD threshold for filtering. Points with MAD above this value will be removed. Set to None to disable MAD filtering.
   filter_kwargs:
-    min_velocity: 0.5  # Minimum velocity threshold (units depend on input data)
-    filter_outliers: false
-    tails_percentile: 0.005 # Percentile for outlier filtering (e.g., 0.005 means removing the top and bottom 0.5% of velocity values as outliers)
-    apply_2d_median: false
-    median_window_size: 5
-    median_threshold_factor: 3
-    apply_2d_gaussian: false
-    gaussian_sigma: 1.0
-    apply_lamma_filter: false
-    lamma_method: "Neighbours"
-    lamma_k: 16
-
+    min_velocity: 1  # Minimum velocity threshold (units depend on input data)
 
 anomaly_detection:
   target_sector: "A" # Sector to analyze for anomalies (e.g., "A")
-  prior_percentile_threshold: 90 # Percentile threshold for velocity-based priors (e.g., 90 means points above the 90th percentile of velocity are more likely to be anomalies)
-  # variables_names: ["V", "u"] # TODO: This is hardcoded in the code, now we are using V and V_trans (direction)
+  variables_names: ["V_long", "V_trans"] # or ["V_long", "V_trans"] ["V"] 
+  # feature_weights: [0.8, 0.2]  # e.g., [1.0] # Weights for each feature in variables_names. Used only if multiple features are used.
+
+  prior_assignment_method: "velocity+y_coord" # Method to assign priors for anomaly probability. Options: "velocity", "y_coord", "kmeans", or combinations like "velocity+y_coord". This will influence the initial p(anomaly) for each point in the MCMC sampling.
+
+  prior_anomaly_probability_limits: [0.1, 0.9] # Bounds for p(anomaly).
+  # The actual p(anomaly) for each point will be assigned based on the chosen method(s) and will lie within these bounds. These values do not have to sum to 1 with p(not anomaly) as the probability of not being an anomaly will be 1 - p(anomaly).
+
+  sector_buffer: 100.0 # Buffer distance in meters to expand sector polygons for data selection. This can help include points near the sector boundaries that may be relevant for anomaly detection.
+
+  # MCMC sampling parameters for anomaly detection.
   model_options:
     mu_params:
       mu: [0, 2]
-      sigma: [2, 2]
+      sigma: [0.5, 1]
     sigma_params:
-      sigma: [0.3, 1.0]
+      sigma: [1, 1]
 
   sample_options:
-    target_accept: 0.95
-    draws: 4000
+    target_accept: 0.99
+    draws: 3000
     tune: 2000
-
-  mrf_options: # MRF settings specific for anomaly detection (can be more aggressive to capture small anomalous features)
-    n_neighbors: 8
-    length_scale: 20
-    beta: 1
-    n_iter: 10
-
-# MCMC parameters
-mcmc:
-  priors:  # Prior probability for each sector
-    probability:
-      A: [1.0, 0.0, 0.0, 0.0]
-      B: [0.1, 0.7, 0.2, 0.0]
-      C: [0.0, 0.2, 0.8, 0.0]
-      D: [0.0, 0.0, 0.3, 0.7]
-    fade_method: "exponential"  # "constant" | "idw" | "linear" | "exponential"
-    fade_options: # The options are passed to the selected method. Check the mcmc.assign_spatial_priors() function for details.
-      decay_rate: 0.001 # Higher values lead to faster decay
-  sample_options:
-    target_accept: 0.90 # Higher (0.9+) reduces divergent transitions but slows sampling
-    draws: 2000 # Increase (>2000) if posterior distributions are rough/unconverged
-    tune: 1000 # Number of tuning steps (discarded samples)
-    chains: 4 # Number of parallel chains. With fewer chains, increase draws to compensate.
-    cores: 4  # Number of CPU cores to use for parallel sampling (usually set to number of chains)
-  force_cpu: false # Whether to force CPU sampling even if GPU is available (default: false, use GPU if available)
-
-
-  # --- PROBABILISTIC MODEL PRIOR CONFIGURATION ---
-  # These parameters define our "Prior Belief" about the velocity distributions
-  # of each cluster before looking at the specific data of a given day.
-  # These can be set as scalar values (same for all clusters) or as per-cluster arrays to encode different expected velocity ranges for each sector. 
-
-  # COORDINATE SYSTEM: All values refer to the output of the QuantileTransformer. Since the transformer maps data to a Normal distribution:
-  #   0.0  = Median Velocity of the whole glacier (50th percentile)
-  #   1.0  = High Velocity (~84th percentile)
-  #   2.0  = Extreme Velocity (~97.7th percentile)
-  #  -1.0  = Low Velocity (~16th percentile)
-
-  model_options: 
-    # 1. mu_params: Priors for the LOCATIONS (Means) of the clusters.
-    #    This defines "where" on the velocity scale we expect A, B, C, and D to be.
-    mu_params:
-      # mu: The expected center for each cluster. 
-      # [2, 1, -0.5, -1.0] means: 
-      #  - A (Tongue): Focused only on the very fastest points (>97%).
-      #  - B (Transition): Centered on faster-than-average points.
-      #  - C/D (Upper): Centered on slower-than-average points.
-      mu: [2, 1, -0.5, -1.0] 
-
-      # sigma: Our confidence in the 'mu' guesses above. 
-      # - Lower values (e.g., 0.1-0.3) force the clusters to stay near the set means.
-      # - Higher values (e.g., 1.0-2.0) allow the data to "pull" the means far from their priors if the observation is very different from our expectation.
-      sigma: [0.5, 0.5, 0.5, 0.5] 
-
-    # 2. sigma_params: Priors for the WIDTHS (Internal Variability) of the clusters.
-    #    This defines how "spread out" or "compact" each domain's velocity field is.
-    sigma_params:
-      # sigma: The expected standard deviation within each specific cluster.
-      # - Small (0.1 - 0.4): The cluster is very homogeneous (nearly constant velocity). Use this for Sector A to capture a specific "plug" of fast ice.
-      # - Large (0.8 - 1.2): The cluster is very heterogeneous (wide range of velocities). Use this for upper sectors where flow is complex or stagnant.
-      # [0.5, 0.5, 1.0, 1.0] means A and B are physically distinct "units", while C and D are broader, more variable background regions.
-      sigma: [0.3, 0.5, 1.0, 1.0]
-
-
-
-  # --- Markov Random Field (MRF) Regularization ---
-  # Balances spatial smoothing (neighbors) against data fidelity (velocity/location).
-  mrf_regularization: true
-  mrf_kwargs:
-    # Graph Density: Controls connectivity.
-    # - High (16+): Smoother results, effective for sparse/noisy data.
-    # - Low (4-6): Local influence only, better for small sharp features.
-    n_neighbors: 16
-
-    # Spatial Decay: How influence drops with physical distance.
-    # - Increase: Distant neighbors bridge gaps (good for sparse data).
-    # - Decrease: Only immediate vicinity exerts influence.
-    length_scale: 200
-
-    # Interaction Strength (The Main Knob):
-    # - High (3.0 - 5.0) -> Prioritize Smoothing. 
-    #   Forces points to match neighbors. Removes "salt-and-pepper" noise, cleaner chunks.
-    # - Low (0.5 - 1.0) -> Prioritize Fidelity.
-    #   Respects raw velocity/location data. Preserves sharp transitions but leaves noise.
-    beta: 3
-
-    # Number of Iterations for MRF prior weight updates:
-    # - Low (5-10): Local smoothing, preserves small features.
-    # - High (>20): Global info propagation, very smooth results.
-    n_iter: 10
-
-  # Second pass sampling speed choices:
-  # - "short": short sampling + warm-start (recommended default):
-  # - "skip": fastest, rely only on MRF priors, no re-sampling
-  second_pass: "short"  # "skip" | "short" | "full"
-  second_pass_sample_args:
-    draws: 800
-    tune: 200
     chains: 4
-    cores: 4
-    target_accept: 0.9
 
-# Post-processing parameters
-postprocessing:
-  vectorization:
-    min_area_px2: 100000.0
-    isolation_buffer: 30.0
-    velocity_merge_threshold: 1
-    force_minimum_sectors: true
-    target_number_of_sectors: 4
-    fill_holes_area: 80000.0
-    smooth_geometries: true
-    smooth_method: "smoothify"
-    smooth_iterations: 1
-  sector_assignment:
-    method: "y_centroid"  # Sorts resulting clusters by elevation to ensure consistent labeling (A, B, C...)
-    ascending: false      # False if sector A is at the bottom (lowest Y), True otherwise (the y axis is inverted in image coordinates (0 at top))
-    # sector_colors:
-    #   A: "#b3140b"      # Red
-    #   B: "#ee9c21"      # Orange
-    #   C: "#f1ee30"      # Yellow
-    #   D: "#5fb61c"      # Green
+  # mrf_options: # MRF settings specific for anomaly detection (can be more aggressive to capture small anomalous features)
+  #   n_neighbors: 6
+  #   length_scale: 10
+  #   beta: 5.0
+  #   n_iter: 10
+  
+  # second_pass_sample_args:
+  #   draws: 1000
+  #   tune: 500
+  #   chains: 4
+
+  force_cpu: True # Whether to force CPU sampling even if GPU is available
 
 plotting:
   default_discrete_cmap: "tab10"  # Colormap for discrete sector colors when not specified
@@ -201,18 +83,3 @@ plotting:
     cmap: "OrRd"
     vmin: 0
     vmax: 15
-
-
-# Database configuration
-database:
-  host: 150.145.51.193
-  port: 5434
-  name: planpincieux
-  user: postgres
-
-# API configuration
-api:
-  host: "150.145.51.193"
-  port: 8080
-  image_view: "images"
-

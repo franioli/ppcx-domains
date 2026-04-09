@@ -3,6 +3,7 @@ from typing import Any
 
 import arviz as az
 import numpy as np
+import omegaconf
 import pymc as pm
 from pymc import math as pm_math
 from scipy.sparse import csr_matrix
@@ -97,8 +98,6 @@ def build_marginalized_mixture_model(
             "sigma"
         ].copy()  # scalar or array(k,) or array(k, n_features)
 
-        import omegaconf
-
         if isinstance(mu_mu, omegaconf.listconfig.ListConfig):
             mu_mu = np.array(mu_mu)
         if isinstance(mu_sigma, omegaconf.listconfig.ListConfig):
@@ -148,10 +147,23 @@ def build_marginalized_mixture_model(
         # -- Handle remaining features (if any) --
         if n_features > 1:
             # Features 1..N are always independent (no ordering constraint)
+            # mu_mu / mu_sigma may be shape (k,) (per-cluster scalars). PyMC
+            # broadcasts a (k,) array as (1, k), which is incompatible with
+            # shape=(k, n_features-1). Reshape to (k, 1) so it broadcasts correctly.
+            mu_mu_rest = (
+                mu_mu.reshape(k, 1)
+                if isinstance(mu_mu, np.ndarray) and mu_mu.shape == (k,)
+                else mu_mu
+            )
+            mu_sigma_rest = (
+                mu_sigma.reshape(k, 1)
+                if isinstance(mu_sigma, np.ndarray) and mu_sigma.shape == (k,)
+                else mu_sigma
+            )
             mu_rest = pm.Normal(
                 "mu_rest",
-                mu=mu_params["mu"],
-                sigma=mu_params["sigma"],
+                mu=mu_mu_rest,
+                sigma=mu_sigma_rest,
                 shape=(k, n_features - 1),
             )
             # Concatenate to form full mean matrix: (k, 1) + (k, n-1) -> (k, n)

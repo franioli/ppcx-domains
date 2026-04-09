@@ -208,8 +208,20 @@ class SectorAssignmentConfig:
 class AnomalyDetectionConfig:
     run_anomaly_detection: bool = False
     target_sector: str = "A"
-    prior_percentile_threshold: float = 90
+
+    prior_assignment_method: str = "velocity+y_coord"  # Method to assign priors for anomaly probability. Options: "velocity", "y_coord", "kmeans", or combinations like "velocity+y_coord". This will influence the initial p(anomaly) for each point in the MCMC sampling.
+    prior_anomaly_probability_limits: list[float] = field(
+        default_factory=lambda: [0.2, 0.8]
+    )
+
     variables_names: list[str] = field(default_factory=lambda: ["V"])
+    feature_weights: list[float] | None = None
+
+    sector_buffer: float | None = (
+        100.0  # Buffer distance in meters to expand sector polygons for data selection. This can help include points near the sector boundaries that may be relevant for anomaly detection.
+    )
+
+    # MCMC options
     model_options: GaussianMixtureModelConfig = field(
         default_factory=lambda: GaussianMixtureModelConfig(
             mu_params={"mu": 0, "sigma": 2},
@@ -218,7 +230,7 @@ class AnomalyDetectionConfig:
     )
     sample_options: McmcSampleOptions = field(
         default_factory=lambda: McmcSampleOptions(
-            draws=1000, tune=500, target_accept=0.9
+            draws=4000, tune=3000, target_accept=0.99
         )
     )
     mrf_options: MrfOptions = field(
@@ -226,6 +238,13 @@ class AnomalyDetectionConfig:
             n_neighbors=8, length_scale=50, beta=3.0, n_iter=5
         )
     )
+    second_pass_sample_args: McmcSampleOptions = field(
+        default_factory=lambda: McmcSampleOptions(
+            draws=1000, tune=500, target_accept=0.9, chains=4
+        )
+    )
+
+    force_cpu: bool = False
 
 
 @dataclass
@@ -258,6 +277,18 @@ class ApiConfig:
     host: str = "${oc.env:APP_HOST,localhost}"
     port: str = "${oc.env:APP_PORT,8080}"
     image_view: str = "${oc.env:GET_IMAGE_VIEW,images}"
+
+
+@dataclass
+class GlobalConfig:
+    """Global configuration for the entire pipeline, including all sections and computed variables."""
+
+    # Currently not used, just a placeholder in case we want to add global-level parameters or computed variables in the future.
+
+    force_cpu: bool = False  # Global flag to force CPU usage for MCMC sampling (specific parameters should be moved here)
+    random_seed: int | None = (
+        None  # Global random seed for reproducibility (should be moved here and used across all components that require randomness)
+    )
 
 
 @dataclass

@@ -811,10 +811,7 @@ def run_pipeline(config: DictConfig | ListConfig) -> bool:
         plt.close(fig)
 
     except Exception as e:
-        logger.error(
-            f"Failed to plot summary with anomaly: {e}. Fallback to copy figure without anomaly.",
-            exc_info=True,
-        )
+        logger.error(f"Failed to plot summary: {e}", exc_info=True)
 
     logger.info("Processing complete.")
     timer.print()

@@ -4,7 +4,8 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 from scipy import ndimage
-from sklearn.preprocessing import QuantileTransformer
+from sklearn.base import BaseEstimator
+from sklearn.preprocessing import QuantileTransformer, RobustScaler, StandardScaler
 
 from ppcluster.griddata import create_2d_grid_from_df
 from ppcluster.lamma_filter import vector_field_filter
@@ -413,7 +414,9 @@ def transform_and_scale_features(
     transform_velocity: str = "none",
     transform_params: dict | None = None,
     feature_weights: np.ndarray | None = None,
-) -> tuple[np.ndarray, QuantileTransformer, np.ndarray, dict]:
+    scaler_type: str = "quantile",
+    scaler_params: dict | None = None,
+) -> tuple[np.ndarray, BaseEstimator, np.ndarray, dict]:
     """
     Preprocess velocity and additional features for clustering.
 
@@ -425,8 +428,8 @@ def transform_and_scale_features(
         feature_weights (np.ndarray, optional): Optional feature weights for features. Default is None.
 
     Returns:
-        data_array_scaled (np.ndarray): Scaled feature array for clustering.
-        scaler (RobustScaler): Fitted scaler object.
+        data_scaled (np.ndarray): Scaled feature array for clustering.
+        scaler (BaseEstimator): Fitted scaler object.
         velocities (np.ndarray): Transformed velocity array.
         transform_info (dict): Info about the velocity transformation.
     """
@@ -435,39 +438,52 @@ def transform_and_scale_features(
     if missing_cols:
         raise ValueError(f"Missing columns in input dataframe: {missing_cols}")
 
-    velocities, transform_info = apply_velocity_transform(
-        velocities=df_input["V"].to_numpy(),
+    data = df_input[variables_names].to_numpy()
+    data_transf, transform_info = apply_velocity_transform(
+        velocities=data,
         velocity_transform=transform_velocity,
         velocity_params=transform_params,
     )
 
-    if len(variables_names) > 1:
-        additional_vars = variables_names.copy()
-        if "V" in additional_vars:
-            additional_vars.remove("V")
-        additional_data = df_input[additional_vars].to_numpy()
-        data_array = np.column_stack((velocities, additional_data))
-    else:
-        data_array = velocities.reshape(-1, 1)
+    # if len(variables_names) > 1:
+    #     additional_vars = variables_names.copy()
+    #     if "V" in additional_vars:
+    #         additional_vars.remove("V")
+    #     additional_data = df_input[additional_vars].to_numpy()
+    #     data_array = np.column_stack((velocities, additional_data))
+    # else:
+    #     data_array = velocities.reshape(-1, 1)
 
-    # Use QuantileTransformer to force a Normal Distribution
-    # This maps outliers into the tails of a Normal dist instead of letting them stay at z=30
-    scaler = QuantileTransformer(
-        output_distribution="normal", n_quantiles=min(len(data_array), 1000)
-    )
-    data_array_scaled = scaler.fit_transform(data_array)
+    # Build scaler based on scaler_type
+    params = scaler_params or {}
+    if scaler_type == "quantile":
+        # Use QuantileTransformer to force a Normal Distribution
+        # This maps outliers into the tails of a Normal dist instead of letting them stay at z=30
+        params.setdefault("output_distribution", "normal")
+        params.setdefault("n_quantiles", min(len(data_transf), 1000))
+        scaler = QuantileTransformer(**params)
+    elif scaler_type == "standard":
+        scaler = StandardScaler(**params)
+    elif scaler_type == "robust":
+        scaler = RobustScaler(**params)
+    else:
+        raise ValueError(
+            f"Unknown scaler_type '{scaler_type}'. Choose from: 'quantile', 'standard', 'robust'."
+        )
+    logger.info(f"Scaling features with {scaler_type} scaler (params={params})")
+    data_scaled = scaler.fit_transform(data_transf)
 
     # If feature weights provided, scale data accordingly
     if feature_weights is not None:
-        n_features = data_array_scaled.shape[1]
+        n_features = data_scaled.shape[1]
         if len(feature_weights) != n_features:
             raise ValueError(
                 f"Feature weights length {len(feature_weights)} does not match number of features {n_features}."
             )
         feature_weights = np.array(feature_weights)
-        data_array_scaled = data_array_scaled * feature_weights[np.newaxis, :]
+        data_scaled = data_scaled * feature_weights[np.newaxis, :]
 
-    return data_array_scaled, scaler, velocities, transform_info
+    return data_scaled, scaler, data_transf, transform_info
 
 
 def apply_velocity_transform(

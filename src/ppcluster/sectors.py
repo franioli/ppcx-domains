@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import rasterio.features
 from affine import Affine
+from scipy.ndimage import generic_filter
 from shapely import MultiPolygon
 from shapely.geometry import Polygon, shape
 from smoothify import smoothify
@@ -19,6 +20,7 @@ def vectorize_gridded_sectors(
     cluster_grid: np.ndarray,
     X: np.ndarray,
     Y: np.ndarray,
+    salt_pepper_noise_removal: bool = False,
 ) -> gpd.GeoDataFrame:
     """
     Vectorize a grid of cluster IDs into a GeoDataFrame using smoothify.
@@ -26,10 +28,12 @@ def vectorize_gridded_sectors(
     Args:
         cluster_grid: 2D array of IDs (int or float).
         X, Y: 2D meshgrids of coordinates.
+        salt_pepper_noise_removal: Whether to apply a majority filter to remove isolated noise before vectorization.
 
     Returns:
         GeoDataFrame with columns ['cluster_id', 'geometry', 'label']
     """
+
     # 1. Setup Transform
     dx = float(X[0, 1] - X[0, 0]) if X.shape[1] > 1 else 1.0  # pixel size in x
     dy = float(Y[1, 0] - Y[0, 0]) if Y.shape[0] > 1 else 1.0  # pixel size in y
@@ -39,11 +43,27 @@ def vectorize_gridded_sectors(
     y_origin = Y[0, 0] - (dy / 2.0)
     transform = Affine(dx, 0.0, x_origin, 0.0, dy, y_origin)
 
-    # 2. Vectorize using Rasterio
+    # 2. Create mask for valid data (non-NaN and non-negative)
     mask = ~np.isnan(cluster_grid) & (cluster_grid >= 0)
     # Ensure int32 for rasterio
     grid_int = cluster_grid.astype(np.int32)
 
+    # 3. Optional Salt-Pepper Noise Removal
+    if salt_pepper_noise_removal:
+        # Run a basic salt-pepper noise removal before vectorization to clean up isolated points that can create small spurious polygons. This is a critical step to ensure that the vectorization produces meaningful geometries rather than fragmented noise. We use a simple majority filter in a 3x3 window, which can be adjusted based on the expected density of points and the grid resolution.
+
+        def majority_filter(arr):
+            valid = arr[np.isfinite(arr)]
+            if len(valid) == 0:
+                return 0
+            valid_int = valid.astype(int)
+            offset = valid_int.min()
+            counts = np.bincount(valid_int - offset)
+            return int(np.argmax(counts)) + offset
+
+        cluster_grid = generic_filter(cluster_grid, majority_filter, size=3)
+
+    # 4. Vectorize using Rasterio
     try:
         shapes_gen = rasterio.features.shapes(grid_int, mask=mask, transform=transform)
         records = [
