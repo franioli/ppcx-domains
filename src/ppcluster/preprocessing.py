@@ -1,4 +1,5 @@
 import logging
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
@@ -416,6 +417,9 @@ def transform_and_scale_features(
     feature_weights: np.ndarray | None = None,
     scaler_type: str = "quantile",
     scaler_params: dict | None = None,
+    make_plots: bool = False,
+    output_dir: str | Path | None = None,
+    base_name: str = "features",
 ) -> tuple[np.ndarray, BaseEstimator, np.ndarray, dict]:
     """
     Preprocess velocity and additional features for clustering.
@@ -482,6 +486,41 @@ def transform_and_scale_features(
             )
         feature_weights = np.array(feature_weights)
         data_scaled = data_scaled * feature_weights[np.newaxis, :]
+
+    if make_plots:
+        import matplotlib.pyplot as plt
+
+        output_dir = Path(output_dir) if output_dir else Path.cwd()
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # --- Debugging Plot: Scaled vs Original Distributions ---
+        n_feats = data_scaled.shape[1]
+        fig, axes = plt.subplots(n_feats, 1, figsize=(10, 4 * n_feats), squeeze=False)
+
+        for i, var_name in enumerate(variables_names):
+            ax = axes[i, 0]
+            scaled_data = data_scaled[:, i]
+            orig_data = scaler.inverse_transform(data_scaled)[:, i]
+
+            # Plot distribution on primary axis (Scaled)
+            ax.hist(scaled_data, bins=50, color="skyblue", edgecolor="black", alpha=0.7)
+            ax.set_xlabel(f"{var_name} (Scaled / Z-score)")
+            ax.set_ylabel("Frequency")
+            ax.grid(True, linestyle="--", alpha=0.6)
+
+            # Add secondary axis for original values
+            ax2 = ax.twiny()
+            # Scale the secondary axis limits by inverting the primary limits
+            ax2.set_xlim(
+                scaler.inverse_transform(
+                    np.array([ax.get_xlim()]).T.repeat(n_feats, axis=1)
+                )[:, i]
+            )
+            ax2.set_xlabel(f"{var_name} (Original Units)")
+
+        plt.tight_layout()
+        fig.savefig(output_dir / f"{base_name}_mcmc_feature_distributions.jpg", dpi=150)
+        plt.close(fig)
 
     return data_scaled, scaler, data_transf, transform_info
 

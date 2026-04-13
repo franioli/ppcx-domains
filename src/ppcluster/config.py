@@ -33,16 +33,12 @@ class DataConfig:
             "help": "Date to process (e.g., '2017-06-15'). Can be overwritten by the --date argument in the command line."
         },
     )
-    year: str | None = field(
-        default=None,
-        init=False,
-        metadata={
-            "help": "Year of interest. Automatically extracted from reference_date."
-        },
-    )
 
     # File source parameters
     file_path: str | None = None
+    subset_name: str | None = (
+        None  # Subset name (e.g., "2025" or a custom string e.g., "2024_18mp") used to construct file paths and output directories.   By default the year extracted from reference_date is used as subset_name, but it can be overwritten by setting this parameter.
+    )
     search_dir: str | None = (
         None  # Directory to search for files when source is "file". Should be used in conjunction with search_pattern.
     )
@@ -102,7 +98,7 @@ class PreprocessingConfig:
     )
 
     # Mad filtering parameters (applicable to both sources) #TODO: Check position of these params, maybe in DataConfig?
-    min_global_mad_threshold: float | None = (
+    mean_global_mad_threshold: float | None = (
         None  # Minimum global MAD (mean of the MAD on the DIC map) threshold. DIC maps with mean MAD below this threshold will be discarded. Set to None to disable global MAD filtering.
     )
 

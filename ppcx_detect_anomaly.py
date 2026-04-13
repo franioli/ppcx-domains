@@ -1,3 +1,57 @@
+"""Detect kinematic anomalies within an existing classified domain (sector).
+
+This script performs a second-pass MCMC clustering on a specific sector
+(e.g., Sector A) identified by the domain-classification pipeline
+(``ppcx_identify_domains.py``). It separates anomalous high-velocity
+sub-regions from the background flow and outputs vectorized anomaly polygons
+with velocity statistics.
+
+Configuration is loaded from ``config_anomaly.yaml`` by default. Any value
+can be overridden at the command line using OmegaConf dot-list syntax
+(e.g. ``data.dt_min=24``).
+
+------------------------------------------------------------------------
+USAGE
+------------------------------------------------------------------------
+
+    python ppcx_detect_anomaly.py [OPTIONS] [OVERRIDES ...]
+
+OPTIONS
+    -d, --date DATE          Reference date to process (YYYY-MM-DD).
+    -s, --sectors-file PATH  Path to the sectors GeoJSON from domain
+                             classification. Auto-discovered if omitted.
+    -o, --output_dir DIR     Override the output directory from config.
+    -c, --config PATH        Path to a custom config_anomaly.yaml file.
+
+OVERRIDES
+    Any number of dot-list key=value pairs forwarded to OmegaConf, e.g.:
+        data.dt_min=24
+        mcmc.sample_options.draws=500
+        data.subset_name="2024_24mp"
+        anomaly_detection.force_cpu=true
+
+------------------------------------------------------------------------
+EXAMPLES
+------------------------------------------------------------------------
+
+1. Run anomaly detection for a single date (sectors file auto-discovered):
+    python ppcx_detect_anomaly.py --date 2024-06-06
+
+2. Provide the sectors file explicitly:
+    python ppcx_detect_anomaly.py --date 2024-06-06 \\
+        --sectors-file output/2024-06-06_sectors_polygon.geojson
+
+3. Use a custom config file with overrides:
+    python ppcx_detect_anomaly.py --date 2024-06-06 \\
+        --config config_anomaly.yaml data.subset_name="2024_18mp"
+
+4. Generate and run a batch job file for a date range:
+    python ppcx_prepare_job_file.py ppcx_detect_anomaly.py \\
+        --date-range 2024-06-01 2024-10-30 --output jobs_anomaly.txt \\
+        data.subset_name="2024_24mp" anomaly_detection.force_cpu=true
+    parallel -j 4 --bar --joblog run.log --resume < jobs_anomaly.txt
+"""
+
 import argparse
 import logging
 import os
@@ -44,6 +98,7 @@ from ppcluster.visualization import (
 logger = setup_logger(level=logging.INFO, name="ppcx")
 
 CONFIG_PATH = "config_anomaly.yaml"  # Path to the config file. Can be overwritten by --config argument in CLI.
+
 HEADLESS = True  # set to True when running in non-GUI environment
 
 if HEADLESS:
@@ -70,8 +125,8 @@ def parse_arguments():
         "--config",
         "-c",
         type=str,
-        default="config_anomaly.yaml",
-        help="Path to anomaly config file.",
+        default=CONFIG_PATH,
+        help=f"Path to anomaly config file. Default: {CONFIG_PATH}",
     )
     p.add_argument(
         "--output_dir",
@@ -167,7 +222,7 @@ def run_anomaly_pipeline(
             dt_min=config.data.dt_min,
             dt_max=config.data.dt_max,
             base_image_dir=base_img_dir,
-            min_global_mad_threshold=config.preprocessing.min_global_mad_threshold,
+            mean_global_mad_threshold=config.preprocessing.mean_global_mad_threshold,
             min_ensemble_size=config.preprocessing.min_ensemble_size,
         )
     except (FileNotFoundError, RuntimeError) as e:
@@ -710,7 +765,7 @@ def load_best_dic_map(
     dt_min: int,
     dt_max: int,
     base_image_dir: Path | None = None,
-    min_global_mad_threshold: float | None = None,
+    mean_global_mad_threshold: float | None = None,
     min_ensemble_size: int | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, Image.Image | None]:
     """
@@ -723,7 +778,7 @@ def load_best_dic_map(
         search_pattern: filename glob/pattern used by find_ensemble_files.
         dt_min, dt_max: accepted temporal difference limits passed to find_ensemble_files.
         base_image_dir: optional directory containing background images (used to load an image if metadata lacks one).
-        min_global_mad_threshold: optional MAD threshold to reject noisy maps (None disables this check).
+        mean_global_mad_threshold: optional MAD threshold to reject noisy maps (None disables this check).
         min_ensemble_size: optional minimum ensemble size to accept a map (None disables this check).
 
     Returns:
@@ -778,12 +833,12 @@ def load_best_dic_map(
             )
 
         if (
-            (min_global_mad_threshold is not None)
+            (mean_global_mad_threshold is not None)
             and (mean_mad is not None)
-            and (mean_mad > min_global_mad_threshold)
+            and (mean_mad > mean_global_mad_threshold)
         ):
             logger.warning(
-                f"Rejecting {name}: MAD {mean_mad:.2f} > {min_global_mad_threshold}"
+                f"Rejecting {name}: MAD {mean_mad:.2f} > {mean_global_mad_threshold}"
             )
             continue
 
@@ -856,7 +911,7 @@ def load_dic_from_nc_file(
     search_pattern: str,
     dt_min: int,
     dt_max: int,
-    min_global_mad_threshold: float | None = None,
+    mean_global_mad_threshold: float | None = None,
     min_ensemble_size: int | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
@@ -868,7 +923,7 @@ def load_dic_from_nc_file(
         search_dir: directory to search for candidate NetCDF files.
         search_pattern: filename glob/pattern used by find_ensemble_files.
         dt_min, dt_max: accepted temporal difference limits passed to find_ensemble_files.
-        min_global_mad_threshold: optional MAD threshold to reject noisy maps (None disables this check).
+        mean_global_mad_threshold: optional MAD threshold to reject noisy maps (None disables this check).
         min_ensemble_size: optional minimum ensemble size to accept a map (None disables this check).
 
     Returns:
@@ -923,12 +978,12 @@ def load_dic_from_nc_file(
             )
 
         if (
-            (min_global_mad_threshold is not None)
+            (mean_global_mad_threshold is not None)
             and (mean_mad is not None)
-            and (mean_mad > min_global_mad_threshold)
+            and (mean_mad > mean_global_mad_threshold)
         ):
             logger.warning(
-                f"Rejecting {name}: MAD {mean_mad:.2f} > {min_global_mad_threshold}"
+                f"Rejecting {name}: MAD {mean_mad:.2f} > {mean_global_mad_threshold}"
             )
             continue
 
@@ -1059,7 +1114,7 @@ def plot_anomaly_with_velocity(
 if __name__ == "__main__":
     args = parse_arguments()
 
-    # 1. Load Base Config
+    # Load Base Config
     config_path = args.config if args.config else None
     config = load_config(config_path)
 
@@ -1071,20 +1126,28 @@ if __name__ == "__main__":
     if args.overrides:
         config = OmegaConf.merge(config, OmegaConf.from_dotlist(args.overrides))
 
-    # 4. Dynamic update 'year' based on 'reference_date'
-    # This must happen before resolution so that paths using ${data.year} are correct
-    if not config.data.reference_date:
-        raise ValueError("reference_date must be provided via CLI or config.")
-    ref_dt = datetime.strptime(config.data.reference_date, "%Y-%m-%d")
-    config.data.year = str(ref_dt.year)
+    # If subset_name is not provided, use the year of the reference date as default subset name for outputs. This helps to organize outputs by year when processing multiple dates.
+    if not config.data.get("subset_name"):
+        try:
+            ref_date_dt = datetime.strptime(config.data.reference_date, "%Y-%m-%d")
+            config.data.subset_name = str(ref_date_dt.year)
+            logger.debug(
+                f"subset_name not provided. Using year {config.data.subset_name} as default subset name for outputs."
+            )
+        except Exception as e:
+            config.data.subset_name = "unknown"
+            logger.warning(
+                f"Could not parse reference date for subset naming: {e}. subset_name will remain unset."
+            )
 
-    # 5. Resolve Configuration
+    # Resolve Configuration
     OmegaConf.resolve(config)
 
     # Force CPU for MCMC if specified in config to avoid potential GPU-related issues with JAX in some environments. This should be set before any JAX imports.
     if config.anomaly_detection.force_cpu:
         os.environ["JAX_PLATFORMS"] = "cpu"
 
+    # Run the Anomaly Detection Pipeline
     try:
         run_anomaly_pipeline(sectors_file_path=args.sectors_file, config=config)
     except Exception as e:

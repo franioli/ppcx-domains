@@ -1,3 +1,56 @@
+"""Run MCMC-based kinematic domain identification on DIC displacement data.
+
+This script runs MCMC Gaussian-mixture clustering to identify kinematic domains 
+from DIC displacement maps and saves vectorized sector polygons with 
+velocity statistics.
+
+Configuration is loaded from ``config.yaml`` by default. Any value can be
+overridden at the command line using OmegaConf dot-list syntax
+(e.g. ``data.dt_min=24``).
+
+------------------------------------------------------------------------
+USAGE
+------------------------------------------------------------------------
+
+    python ppcx_identify_domains.py [OPTIONS] [OVERRIDES ...]
+
+OPTIONS
+    -d, --date DATE          Reference (end) date to process (YYYY-MM-DD).
+    -o, --output_dir DIR     Override the output directory from config.
+    -c, --config PATH        Path to a custom config.yaml file.
+        --skip-existing      Skip if the output directory already exists.
+        --keep-failed-output Keep partial output on failure (for debugging).
+
+OVERRIDES
+    Any number of dot-list key=value pairs forwarded to OmegaConf, e.g.:
+        data.dt_min=24
+        mcmc.sample_options.draws=500
+        data.subset_name="2024_24mp"
+        mcmc.force_cpu=true
+
+------------------------------------------------------------------------
+EXAMPLES
+------------------------------------------------------------------------
+
+1. Process a single date with defaults from config.yaml:
+    python ppcx_identify_domains.py --date 2024-06-06
+
+2. Process a date with config overrides:
+    python ppcx_identify_domains.py --date 2024-06-06 \\
+        data.subset_name="2024_18mp" mcmc.force_cpu=true
+
+3. Use a custom config file:
+    python ppcx_identify_domains.py --date 2024-06-06 --config my_config.yaml
+
+4. Skip dates that have already been processed:
+    python ppcx_identify_domains.py --date 2024-06-06 --skip-existing
+
+5. Generate and run a batch job file for a date range (see ppcx_prepare_job_file.py):
+    python ppcx_prepare_job_file.py ppcx_identify_domains.py \\
+        --date-range 2024-06-01 2024-10-30 --output jobs.txt
+    parallel -j 4 --bar --joblog run.log --resume < jobs.txt
+"""
+
 import argparse
 import logging
 import os
@@ -6,17 +59,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import matplotlib
-from PIL import Image
-
-matplotlib.use("Agg")
-
 import geopandas as gpd
 import joblib
 import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
 from omegaconf import DictConfig, ListConfig, OmegaConf
+from PIL import Image
 
 from ppcluster import Timer, load_config, mcmc, setup_logger
 from ppcluster.cvat import (
@@ -28,12 +77,16 @@ from ppcluster.data import (
     read_data_from_db,
     read_data_from_pylamma_nc,
 )
-from ppcluster.griddata import create_2d_grid, plot_clustering_grid
+from ppcluster.griddata import (
+    apply_morphological_operations,
+    close_small_holes,
+    create_2d_grid,
+    plot_clustering_grid,
+    remove_small_grid_components,
+)
 from ppcluster.mcmc.clustering import (
     clusterize_gaussian_mixture,
-    save_sampling_summary,
 )
-from ppcluster.mcmc.priors import plot_spatial_priors
 from ppcluster.preprocessing import (
     apply_dic_filters,
     spatial_subsample,
@@ -54,6 +107,8 @@ from ppcluster.visualization import (
 )
 
 logger = setup_logger(level=logging.INFO, name="ppcx")
+
+CONFIG_PATH = "config.yaml"  # Path to the config file. Can be overwritten by --config argument in CLI.
 
 HEADLESS = True  # set to True when running in non-GUI environment
 
@@ -81,8 +136,8 @@ def parse_arguments():
         "--config",
         "-c",
         type=str,
-        default=None,
-        help="Path to an optional custom config.yaml file to load instead of the default.",
+        default=CONFIG_PATH,
+        help=f"Path to anomaly config file. Default: {CONFIG_PATH}",
     )
     p.add_argument(
         "--keep-failed-output",
@@ -165,143 +220,6 @@ def preprocess_dic_data(
     return dic_df
 
 
-def run_mcmc_clustering(
-    dic_df: pd.DataFrame,
-    prior_probs_array: np.ndarray,
-    sectors: Any,
-    config: DictConfig | ListConfig,
-    img: Any,
-    output_dir: Path,
-    base_name: str,
-) -> tuple[Any, Any]:
-    """
-    Runs the single-pass MCMC clustering pipeline.
-    Preprocesses features, sets up parameters, and runs the GMM.
-    """
-    logger.info("Running MCMC Clustering...")
-
-    # 1. Preprocess Features
-    data_array_scaled, scaler, velocities, transform_info = (
-        transform_and_scale_features(
-            df_input=dic_df,
-            variables_names=config.preprocessing.variables_names,
-            transform_velocity=config.preprocessing.velocity_transform,
-            transform_params=config.preprocessing.transform_params,
-            feature_weights=config.preprocessing.feature_weights,
-        )
-    )
-    joblib.dump(scaler, output_dir / f"{base_name}_mcmc_feature_scaler.joblib")
-
-    # Save the scaled array as text file for debugging and inspection
-    np.savetxt(
-        output_dir / f"{base_name}_mcmc_scaled_features.csv",
-        data_array_scaled,
-        delimiter=",",
-        header=",".join(config.preprocessing.variables_names),
-        comments="",
-    )
-
-    # --- Debugging Plot: Scaled vs Original Distributions ---
-    n_feats = data_array_scaled.shape[1]
-    fig, axes = plt.subplots(n_feats, 1, figsize=(10, 4 * n_feats), squeeze=False)
-
-    for i, var_name in enumerate(config.preprocessing.variables_names):
-        ax = axes[i, 0]
-        scaled_data = data_array_scaled[:, i]
-        orig_data = scaler.inverse_transform(data_array_scaled)[:, i]
-
-        # Plot distribution on primary axis (Scaled)
-        ax.hist(scaled_data, bins=50, color="skyblue", edgecolor="black", alpha=0.7)
-        ax.set_xlabel(f"{var_name} (Scaled / Z-score)")
-        ax.set_ylabel("Frequency")
-        ax.grid(True, linestyle="--", alpha=0.6)
-
-        # Add secondary axis for original values
-        ax2 = ax.twiny()
-        # Scale the secondary axis limits by inverting the primary limits
-        ax2.set_xlim(
-            scaler.inverse_transform(
-                np.array([ax.get_xlim()]).T.repeat(n_feats, axis=1)
-            )[:, i]
-        )
-        ax2.set_xlabel(f"{var_name} (Original Units)")
-
-    plt.tight_layout()
-    fig.savefig(output_dir / f"{base_name}_mcmc_feature_distributions.jpg", dpi=150)
-    plt.close(fig)
-
-    # TODO: move here other spatial prior preprocessing steps now in the main function
-    # 2. Plot Priors if spatial
-    fig, axes = mcmc.plot_spatial_priors(dic_df, prior_probs_array, img=img)
-    fig.savefig(
-        output_dir / f"{base_name}_mcmc_spatial_priors.jpg",
-        dpi=150,
-        bbox_inches="tight",
-    )
-    plt.close(fig)
-
-    # 3. Run Clustering
-    result = clusterize_gaussian_mixture(
-        data_array_scaled=data_array_scaled,
-        prior_probs=prior_probs_array,
-        sectors=sectors,
-        sample_args=config.mcmc.sample_options,
-        mu_params=OmegaConf.to_container(
-            config.mcmc.model_options.mu_params, resolve=True
-        ),
-        sigma_params=OmegaConf.to_container(
-            config.mcmc.model_options.sigma_params, resolve=True
-        ),
-        apply_mrf_regularization=config.mcmc.mrf_regularization,
-        x_pos=dic_df["x"].to_numpy(),
-        y_pos=dic_df["y"].to_numpy(),
-        mrf_kwargs=config.mcmc.mrf_kwargs,
-        second_pass=config.mcmc.second_pass,
-        second_pass_sample_args=config.mcmc.second_pass_sample_args,
-        force_cpu=config.mcmc.force_cpu,
-        random_seed=config.random_seed,
-    )
-
-    # 4. Save sampling summary
-    save_sampling_summary(
-        convergence_flag=result.convergence_flag,
-        idata=result.idata,
-        output_dir=output_dir,
-        base_name=f"{base_name}_mcmc",
-        make_plots=True,
-        df_input=dic_df,
-        cluster_pred=result.cluster_pred,
-        posterior_probs=result.posterior_probs,
-        scaler=scaler,
-        img=img,
-    )
-
-    # Plot spatial priors before and after MRF regularization to visualize the effect of the MRF on the spatial distribution of cluster probabilities.
-    # TODO: move this plotting logic inside the save_sampling_summary function
-    fig, _ = plot_spatial_priors(
-        df=dic_df,
-        prior_probs=prior_probs_array,
-        img=img,
-    )
-    fig.savefig(
-        output_dir / f"{base_name}_spatial_priors_beforeMRF.jpg",
-        dpi=150,
-        bbox_inches="tight",
-    )
-    fig, _ = plot_spatial_priors(
-        df=dic_df,
-        prior_probs=result.idata.constant_data.prior_w.data,
-        img=img,
-    )
-    fig.savefig(
-        output_dir / f"{base_name}_spatial_priors_afterMRF.jpg",
-        dpi=150,
-        bbox_inches="tight",
-    )
-
-    return result, scaler
-
-
 def process_clustering_results(
     df_points: pd.DataFrame,
     cluster_labels: np.ndarray,
@@ -326,15 +244,35 @@ def process_clustering_results(
         gpd.GeoDataFrame: The final sectors GeoDataFrame with statistics.
         gpd.GeoDataFrame: The classified points GeoDataFrame with sector labels.
     """
+
     # 1. Create grid from points
     x = df_points["x"].to_numpy()
     y = df_points["y"].to_numpy()
-    X, Y, kin_cluster_grid = create_2d_grid(x=x, y=y, labels=cluster_labels)
+    X, Y, cluster_grid = create_2d_grid(x=x, y=y, labels=cluster_labels)
     raster_res = abs(float(X[0, 1] - X[0, 0]) if X.shape[1] > 1 else 1.0)
+
+    # TODO: hard-coded parameters for now, can be made configurable
+    # Remove very small components and merge to nearest neighbor
+    cluster_grid_raw = cluster_grid.copy()
+    cluster_grid = remove_small_grid_components(
+        label_grid=cluster_grid,
+        min_size=20,
+        connectivity=8,
+        merge_strategy="merge",  # merge small components to nearest neighbor
+    )
+    # Apply a few iterations of erosion + dilation to the cluster grid to remove small noisy clusters before vectorization (
+    cluster_grid = apply_morphological_operations(
+        cluster_grid=cluster_grid,
+        erosion_iterations=1,
+        dilation_iterations=2,
+        min_cluster_size=20,
+        connectivity=8,
+    )
+    cluster_grid = close_small_holes(cluster_grid, max_hole_size=20)
 
     # 2. Vectorize & Smooth
     logger.info(f"Vectorizing grid clusters ({base_name})...")
-    sectors = vectorize_gridded_sectors(kin_cluster_grid, X, Y)
+    sectors = vectorize_gridded_sectors(cluster_grid, X, Y)
 
     # Save raw sectors for debugging
     sectors.to_file(output_dir / f"{base_name}_sectors_raw.geojson", driver="GeoJSON")
@@ -356,8 +294,6 @@ def process_clustering_results(
     )
 
     # 4. Assign Labels
-    # Use config method, or fallback/override if provided
-    # For refinement, we might want simple labels, but reusing the logic is fine
     sectors = assign_sector_labels(
         sectors,
         order_by=config.postprocessing.sector_assignment.method,
@@ -389,26 +325,34 @@ def process_clustering_results(
         stats_path, index=False, float_format="%.3f"
     )
 
-    # 6. Plotting
+    # 6. Plot raw vs vectorized clusters
     if img is not None:
         sector_colors = get_sector_colors(
             sectors["sector"].tolist(),
             colormap=config.plotting.default_discrete_cmap,
         )
 
-        # Plot raw vs vectorized comparison
-        fig, (ax_raw, ax_vec) = plt.subplots(1, 2, figsize=(14, 7))
+        fig, axes = plt.subplots(1, 3, figsize=(14, 7))
         plot_clustering_grid(
-            ax=ax_raw,
+            ax=axes[0],
             img=img,
-            cluster_grid=kin_cluster_grid,
+            cluster_grid=cluster_grid_raw,
             X=X,
             Y=Y,
             title="Raw Clusters",
             alpha=0.6,
         )
+        plot_clustering_grid(
+            ax=axes[1],
+            img=img,
+            cluster_grid=cluster_grid,
+            X=X,
+            Y=Y,
+            title="Processed Grid Clusters",
+            alpha=0.6,
+        )
         plot_sectors(
-            ax=ax_vec,
+            ax=axes[2],
             sectors=sectors,
             img=img,
             sector_colors=sector_colors,
@@ -521,7 +465,7 @@ def run_pipeline(config: DictConfig | ListConfig) -> bool:
                 logger.warning(f"Failed to read {p}: {e}")
 
         # 2. Filter by quality
-        mean_mad_threshold = config.preprocessing.min_global_mad_threshold
+        mean_mad_threshold = config.preprocessing.mean_global_mad_threshold
         min_ensemble_size = config.preprocessing.min_ensemble_size
         valid_results = []
         for name, (df, meta) in candidates.items():
@@ -678,62 +622,67 @@ def run_pipeline(config: DictConfig | ListConfig) -> bool:
     timer.update("data_loading_and_preprocessing")
 
     # ===  MCMC CLUSTERING   === #
-    # --- Assign Priors (Spatial or Velocity-based) ---
-    # DETECT REFINEMENT OVERRIDE # TODO: find a better way to do this
-    # If "Base" or "Fast" (or any specific custom key) is present,
-    # we assume the user wants to exclusively use these and ignore A, B, C, D.
-    custom_keys = [k for k in config.mcmc.priors.probability if k in ["Base", "Fast"]]
-    if custom_keys:
-        logger.info(
-            f"Custom sector keys detected {custom_keys}. Using these exclusively."
-        )
-        # Create a new clean dictionary with ONLY the custom keys
-        filtered_probs = {}
-        for k in custom_keys:
-            filtered_probs[k] = config.mcmc.priors.probability[k]
-
-        # Overwrite the config object's dictionary with the filtered one
-        config.mcmc.priors.probability = filtered_probs
-
-    # TODO: implement also the possibility to use other types of priors (e.g. velocity-based) without spatial sectors, but for now we require spatial priors if any priors are specified.
-    use_spatial_priors = True
-    if use_spatial_priors:
-        try:
-            logger.info("Using SPATIAL priors from polygons.")
-            prior_probs_array = mcmc.assign_spatial_priors(
-                x=dic_df["x"].to_numpy(),
-                y=dic_df["y"].to_numpy(),
-                polygons=sectors,
-                prior_probs=config.mcmc.priors.probability,
-                fade_method=config.mcmc.priors.fade_method,
-                fade_options=config.mcmc.priors.fade_options,
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "Error in spatial priors assignment. Check the sector geometries and prior probabilities configuration."
-            ) from exc
-    else:
-        # Default: uniform priors across sectors (not used. fail if spatial priors requested)
-        # if not config.mcmc.priors.probability:
-        #     n_sectors = len(sectors)
-        #     uniform_prob = 1.0 / n_sectors
-        #     config.mcmc.priors.probability = {
-        #         name: [uniform_prob] * n_sectors for name in sectors
-        #     }
-        raise NotImplementedError(
-            "Velocity-based priors without spatial sectors is not implemented."
-        )
-
-    # Perform MCMC clustering
-    result, scaler = run_mcmc_clustering(
-        dic_df=dic_df,
-        prior_probs_array=prior_probs_array,
-        sectors=sectors,
-        config=config,
-        img=img,
-        output_dir=output_dir,
-        base_name=base_name,
+    # -- Assign Priors (Spatial-based)
+    logger.info("Assigning spatial priors based on sectors...")
+    prior_probs_array = mcmc.assign_spatial_priors(
+        x=dic_df["x"].to_numpy(),
+        y=dic_df["y"].to_numpy(),
+        polygons=sectors,
+        prior_probs=config.mcmc.priors.probability,
+        fade_method=config.mcmc.priors.fade_method,
+        fade_options=config.mcmc.priors.fade_options,
     )
+
+    # -- Preprocess features and scale them for MCMC
+    logger.info("Transforming and scaling features for MCMC...")
+    data_array_scaled, scaler, velocities, transform_info = (
+        transform_and_scale_features(
+            df_input=dic_df,
+            variables_names=config.preprocessing.variables_names,
+            transform_velocity=config.preprocessing.velocity_transform,
+            transform_params=config.preprocessing.transform_params,
+            feature_weights=config.preprocessing.feature_weights,
+            make_plots=True,
+            output_dir=output_dir,
+            base_name=base_name,
+        )
+    )
+    joblib.dump(scaler, output_dir / f"{base_name}_mcmc_feature_scaler.joblib")
+    np.savetxt(
+        output_dir / f"{base_name}_mcmc_scaled_features.csv",
+        data_array_scaled,
+        delimiter=",",
+        header=",".join(config.preprocessing.variables_names),
+        comments="",
+    )
+
+    # -- Run MCMC Clustering
+    logger.info("Running MCMC Clustering...")
+    result = clusterize_gaussian_mixture(
+        data_array_scaled=data_array_scaled,
+        prior_probs=prior_probs_array,
+        sectors=sectors,
+        sample_args=config.mcmc.sample_options,
+        mu_params=OmegaConf.to_container(
+            config.mcmc.model_options.mu_params, resolve=True
+        ),
+        sigma_params=OmegaConf.to_container(
+            config.mcmc.model_options.sigma_params, resolve=True
+        ),
+        apply_mrf_regularization=config.mcmc.mrf_regularization,
+        x_pos=dic_df["x"].to_numpy(),
+        y_pos=dic_df["y"].to_numpy(),
+        mrf_kwargs=config.mcmc.mrf_kwargs,
+        second_pass=config.mcmc.second_pass,
+        second_pass_sample_args=config.mcmc.second_pass_sample_args,
+        force_cpu=config.mcmc.force_cpu,
+        random_seed=config.random_seed,
+        output_dir=output_dir,
+        base_name=f"{base_name}_mcmc",
+        debug=True,
+        save_ctx={"df_input": dic_df, "scaler": scaler, "img": img},
+    )
+
     timer.update("mcmc_clustering")
 
     # ===  POST-PROCESSING AND CLEANING OF FINAL CLUSTERING  === #
@@ -822,41 +771,38 @@ def run_pipeline(config: DictConfig | ListConfig) -> bool:
 def main():
     args = parse_arguments()
 
-    # 1. Load Base Config
+    # Load Base Config
     config_path = args.config if args.config else None
     config = load_config(config_path)
 
-    # 2. Apply Specific CLI Flags (Highest Priority for these shortcuts)
+    # Apply Specific CLI Flags (Highest Priority for these shortcuts)
     if args.date:
         config.data.reference_date = args.date
     if args.output_dir:
         config.data.base_output_dir = args.output_dir
 
-    # 3. Apply Generic Dotlist Overrides
+    # Apply Generic Dotlist Overrides
     if args.overrides:
         # OmegaConf can natively merge list of dot-string arguments
         # e.g. ["data.dt_min=10", "mcmc.regularization=False"]
         cli_conf = OmegaConf.from_dotlist(args.overrides)
         config = OmegaConf.merge(config, cli_conf)
 
-    # 4. Dynamic update 'year' based on 'reference_date'
-    # This must happen before resolution so that paths using ${data.year} are correct
-    if not config.data.reference_date:
-        raise ValueError("reference_date must be provided via CLI or config.")
-    try:
-        ref_dt = datetime.strptime(config.data.reference_date, "%Y-%m-%d")
-        config.data.year = str(ref_dt.year)
-        logger.debug(
-            f"CLI: Updating 'data.year' to {config.data.year} based on reference date."
-        )
-    except ValueError:
-        logger.error(
-            f"Could not parse year from reference_date: {config.data.reference_date}"
-        )
-        config.data.year = "unknown"
+    # If subset_name is not provided, use the year of the reference date as default subset name for outputs. This helps to organize outputs by year when processing multiple dates.
+    if not config.data.get("subset_name"):
+        try:
+            ref_date_dt = datetime.strptime(config.data.reference_date, "%Y-%m-%d")
+            config.data.subset_name = str(ref_date_dt.year)
+            logger.debug(
+                f"subset_name not provided. Using year {config.data.subset_name} as default subset name for outputs."
+            )
+        except Exception as e:
+            config.data.subset_name = "unknown"
+            logger.warning(
+                f"Could not parse reference date for subset naming: {e}. subset_name will remain unset."
+            )
 
-    # 5. Resolve Configuration
-    # This computes all interpolations (e.g. ${data.output_dir}) now.
+    # Resolve Configuration with interpolations (e.g. ${data.output_dir}) now.
     OmegaConf.resolve(config)
 
     # Run the main pipeline with error handling to ensure that if something goes wrong, we log it and optionally clean up any partial outputs.
@@ -879,6 +825,7 @@ def main():
     if config.mcmc.force_cpu:
         os.environ["JAX_PLATFORMS"] = "cpu"
 
+    # Run the pipeline
     try:
         result = run_pipeline(config)
     except Exception as e:

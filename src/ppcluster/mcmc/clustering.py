@@ -18,7 +18,6 @@ from PIL import Image
 from scipy.stats import mode
 from scipy.stats import norm as scipy_norm
 from sklearn.metrics import adjusted_rand_score
-from sklearn.preprocessing import StandardScaler
 
 from ppcluster.mcmc.assignment import (
     compute_cluster_statistics,
@@ -171,6 +170,10 @@ def clusterize_gaussian_mixture(
     second_pass: str = "short",
     second_pass_sample_args: dict | None = None,
     force_cpu: bool = False,
+    output_dir: Path | None = None,
+    base_name: str | None = None,
+    debug: bool = False,
+    save_ctx: dict | None = None,
     random_seed: int = 8927,
 ) -> ClusteringResult:
     """
@@ -189,6 +192,10 @@ def clusterize_gaussian_mixture(
         second_pass (str, optional): Strategy for second sampling pass ("skip", "short", "full"). Default is "full".
         second_pass_sample_args (dict, optional): Arguments for second pass sampling. Default is None.
         force_cpu (bool, optional): Whether to force CPU sampling even if GPU is available. Default is False.
+        output_dir (Path, optional): Directory to save outputs. Default is None (no saving).
+        base_name (str, optional): Base name for output files. Required when output_dir is set.
+        debug (bool, optional): If True, save all diagnostic plots (trace, forest, results) in addition to the summary JSON. Default is False.
+        save_ctx (dict, optional): Context for plot generation. May contain "df_input" (pd.DataFrame), "scaler", and "img". Required for spatial prior and velocity clustering plots.
         random_seed (int, optional): Random seed for reproducibility. Default is 8927.
 
     Returns:
@@ -206,6 +213,62 @@ def clusterize_gaussian_mixture(
         sigma_mean = idata_in.posterior["sigma"].mean(dim=["chain", "draw"]).values
         init = {"mu": mu_mean, "sigma": sigma_mean}
         return [init for _ in range(n_chains)]
+
+    # ── Save helpers ──────────────────────────────────────────────────────────
+    _can_save = output_dir is not None and base_name is not None
+    _df_save = save_ctx.get("df_input") if save_ctx else None
+    _scaler_save = save_ctx.get("scaler") if save_ctx else None
+    _img_save = save_ctx.get("img") if save_ctx else None
+
+    def _save_sampling_info(idata_s, conv_flag):
+        if not _can_save:
+            return
+        sampling_info = {
+            "convergence": conv_flag,
+            "summary_stats": az.summary(idata_s, var_names=["mu", "sigma"]).to_dict(),
+        }
+        with open(output_dir / f"{base_name}_sampling_summary.json", "w") as f:
+            json.dump(sampling_info, f, indent=4)
+        if debug:
+            fig, axes = plt.subplots(2, 2, figsize=(10, 6))
+            az.plot_trace(
+                idata_s, var_names=["mu", "sigma"], axes=axes, compact=True, legend=True
+            )
+            fig.savefig(output_dir / f"{base_name}_trace_plots.jpg", dpi=150)
+            plt.close(fig)
+            fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+            az.plot_forest(
+                idata_s, var_names=["mu", "sigma"], combined=True, ess=True, ax=axes
+            )
+            fig.savefig(output_dir / f"{base_name}_forest_plot.jpg", dpi=150)
+            plt.close(fig)
+
+    def _save_priors_plot(priors_to_plot, suffix):
+        if not _can_save or _df_save is None:
+            return
+        fig, _ = plot_spatial_priors(
+            df=_df_save, prior_probs=priors_to_plot, img=_img_save
+        )
+        fig.savefig(
+            output_dir / f"{base_name}_{suffix}.jpg", dpi=150, bbox_inches="tight"
+        )
+        plt.close(fig)
+
+    def _save_results_plot(cluster_pred_s, posterior_probs_s, idata_s):
+        if not _can_save or not debug or _df_save is None or _scaler_save is None:
+            return
+        fig = plot_velocity_clustering(
+            df_features=_df_save,
+            img=_img_save,
+            idata=idata_s,
+            cluster_pred=cluster_pred_s,
+            posterior_probs=posterior_probs_s,
+            scaler=_scaler_save,
+        )
+        fig.savefig(
+            output_dir / f"{base_name}_results.jpg", dpi=300, bbox_inches="tight"
+        )
+        plt.close(fig)
 
     logger.info("Running MCMC clustering...")
 
@@ -248,6 +311,9 @@ def clusterize_gaussian_mixture(
         enforce_ordered_means=enforce_ordered_means,
     )
 
+    # Save initial (pre-MRF) spatial priors
+    _save_priors_plot(priors, "spatial_priors_initial")
+
     # Sample model (1st pass)
     idata, convergence_flag = sample_model(model, force_cpu=force_cpu, **sample_args)
     if not convergence_flag:
@@ -270,6 +336,9 @@ def clusterize_gaussian_mixture(
         priors, q_mrf = mrf_regularization(
             data_array_scaled, idata, priors, x_pos, y_pos, **mrf_kwargs
         )
+        # Save spatial priors after MRF regularization
+        _save_priors_plot(priors, "spatial_priors_afterMRF")
+
         if second_pass.lower() == "skip":
             logger.info(
                 "Skipping re-sampling after MRF regularization. Using pre-sampled MCMC posteriors."
@@ -277,6 +346,9 @@ def clusterize_gaussian_mixture(
             posterior_probs = q_mrf
             cluster_pred = np.argmax(posterior_probs, axis=1)
             uncertainty = 1.0 - posterior_probs.max(axis=1)
+
+            _save_sampling_info(idata, convergence_flag)
+            _save_results_plot(cluster_pred, posterior_probs, idata)
 
             return ClusteringResult(
                 idata=idata,
@@ -286,6 +358,7 @@ def clusterize_gaussian_mixture(
                 uncertainty=uncertainty,
                 priors=priors,
             )
+
         else:
             logger.info("Re-sampling with MRF-regularized priors...")
             with model:
@@ -318,6 +391,9 @@ def clusterize_gaussian_mixture(
     # Compute entropy as an additional uncertainty measure
     entropy = -np.sum(posterior_probs * np.log(posterior_probs + 1e-10), axis=1)
 
+    _save_sampling_info(idata, convergence_flag)
+    _save_results_plot(cluster_pred, posterior_probs, idata)
+
     result = ClusteringResult(
         convergence_flag=convergence_flag,
         idata=idata,
@@ -340,7 +416,7 @@ def save_sampling_summary(
     df_input: pd.DataFrame | None = None,
     cluster_pred: np.ndarray | None = None,
     posterior_probs: np.ndarray | None = None,
-    scaler: StandardScaler | None = None,
+    scaler: Any | None = None,
     img: np.ndarray | None = None,
 ):
     sampling_info = {

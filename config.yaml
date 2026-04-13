@@ -2,31 +2,31 @@
 data:
   reference_date: null # Date to process (e.g., "2017-06-15"). It can be ovewritten by the --date in the command-line
 
+  subset_name: null # Subset name (e.g., "2025" or a custom string e.g., "2024_18mp") used to construct file paths and output directories. By default the year extracted from reference_date is used as subset_name, but it can be overwritten by setting this parameter.
+  camera_name: "PPCX_Tele" # Name of the camera ("PPCX_Tele", "PPCX_Wide").
+
+  base_output_dir: "output/${data.subset_name}_${data.camera_name}" # Output directory base path. The actual output of each run will be saved in a subfolder with the camera name and date (e.g., "output/2025_PPCX_Tele/2025-01-08/")
+  run_output_subdir: "${data.reference_date}" # Subdirectory name for the current run's output (e.g., "2025-01-08"). This will be created inside base_output_dir. If null, the base_output_dir will be used directly without creating a subfolder.
+
   # Data Source Configuration
   source: "file" # "database" or "file"
   file_path: null    # Path to input file (e.g. NetCDF) if source is "file"
-  search_dir: "/mnt/irpinas/planpincieux/data/${data.year}/correlation/day_dic_ensemble_netcdf/" # Directory to search for input files if source is "file". Can use glob patterns (e.g., "data/2017/*.nc") to specify multiple files.
+  search_dir: "/mnt/irpinas/planpincieux/data/${data.subset_name}/correlation/day_dic_ensemble_netcdf/" # Directory to search for input files if source is "file". Can use glob patterns (e.g., "data/2017/*.nc") to specify multiple files.
   search_pattern: 'day_dic_(?P<slave>\d{4}-\d{2}-\d{2})_(?P<master>\d{4}-\d{2}-\d{2})_dt(?P<dt>\d+)_.*\.nc' # Regular expression pattern to extract slave date, master date, and time difference  from filenames when source is "file". The pattern should include named groups for the relevant metadata. For example:
   #   'day_dic_(?P<slave>\d{4}-\d{2}-\d{2})_(?P<master>\d{4}-\d{2}-\d{2})_dt(?P<dt>\d+)_.*\.nc'
-  #   This pattern match filename like:
-  #   "day_dic_2025-01-08_2025-01-01_dt7_ensemble2.nc".
-  image_dir: "/mnt/irpinas/planpincieux/data/${data.year}/coregistration/coregistered/"
-
-  # Database query parameters. Used only if source is "database"
-  camera_name: "PPCX_Tele" # Name of the camera ("PPCX_Tele", "PPCX_Wide").
-  days_before_to_include: 0 # Number of days before the reference date to include in the analysis. 
-  days_after_to_include: 0 # Number of days after the reference date to include in the analysis.
+  #   This pattern match filename like: "day_dic_2025-01-08_2025-01-01_dt7_ensemble2.nc".
+  image_dir: "/mnt/irpinas/planpincieux/data/${data.subset_name}/coregistration/coregistered/"
 
   dt_min: 48  # Minimum time difference between images in hours. Used both for files and database sources.
   dt_max: 96  # Maximum time difference between images in hours. Used both for files and database sources.
 
   # Priors and ROI
-  sector_prior_path: "data/${data.year}*.zip" # Path to CVAT ZIP file containing sector prior polygons (and optionally ROI polygon)
+  sector_prior_path: "data/${data.subset_name}*.zip" # Path to CVAT ZIP file containing sector prior polygons (and optionally ROI polygon)
   # roi_path: "data/roi.xml" # Path to CVAT XML file containing ROI polygon (optional, if not already included in sector_prior_path)
 
-  base_output_dir: "output/${data.year}_${data.camera_name}" # Output directory base path. The actual output of each run will be saved in a subfolder with the camera name and date (e.g., "output/2025_PPCX_Tele/2025-01-08/")
-
-  run_output_subdir: "${data.reference_date}" # Subdirectory name for the current run's output (e.g., "2025-01-08"). This will be created inside base_output_dir. If null, the base_output_dir will be used directly without creating a subfolder.
+  # Database query parameters. Used only if source is "database"
+  days_before_to_include: 0 # Number of days before the reference date to include in the analysis. 
+  days_after_to_include: 0 # Number of days after the reference date to include in the analysis.
 
 
 # Data preprocessing parameters
@@ -37,9 +37,10 @@ preprocessing:
   transform_params: null # e.g., {"midpoint_percentile": 70, "steepness": 2.0}
   subsample_factor: 1 # 2 means keep every 2nd point, 1 means no subsampling
   subsample_method: "regular"  # or 'random'
-  min_global_mad_threshold: 2.0  # Minimum global MAD (mean of the MAD on the DIC map) threshold. DIC maps with mean MAD below this threshold will be discarded. Set to None to disable global MAD filtering. 
+  mean_global_mad_threshold: 3  # Maximum mean global MAD (mean of the MAD on the DIC map) threshold. DIC maps with mean MAD above this threshold will be discarded. Set to None to disable global MAD filtering.
   min_ensemble_size: 2  # Minimum number of DIC maps (ensembles) required for a given date to be included in the analysis. Set to None to disable ensemble size filtering.
   max_point_mad: 3 # Maximum MAD threshold for filtering. Points with MAD above this value will be removed. Set to None to disable MAD filtering.
+
   filter_kwargs:
     min_velocity: 0.5  # Minimum velocity threshold (units depend on input data)
     filter_outliers: false
@@ -184,26 +185,6 @@ plotting:
     cmap: "OrRd"
     vmin: 0
     vmax: 15
-
-anomaly_detection:
-  target_sector: "A" # Sector to analyze for anomalies (e.g., "A")
-  prior_percentile_threshold: 95 # Percentile threshold for velocity-based priors (e.g., 90 means points above the 90th percentile of velocity are more likely to be anomalies)
-  # variables_names: ["V", "u"] # TODO: This is hardcoded in the code, now we are using V and V_trans (direction)
-  model_options:
-    mu_params:
-      mu: 0
-      sigma: 10
-    sigma_params:
-      sigma: 0.5
-  sample_options:
-    target_accept: 0.95
-    draws: 4000
-    tune: 2000
-  mrf_options: # MRF settings specific for anomaly detection (can be more aggressive to capture small anomalous features)
-    n_neighbors: 12
-    length_scale: 50
-    beta: 4.0
-    n_iter: 20
 
 # Database configuration
 database:

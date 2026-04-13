@@ -730,25 +730,6 @@ def apply_morphological_operations(
         if n_components == 0:
             continue
 
-        # # Step 3: Remove small components
-        # components_removed = 0
-        # for comp_id in range(1, n_components + 1):
-        #     comp_mask = labeled_eroded == comp_id
-        #     comp_size = np.sum(comp_mask)
-
-        #     if comp_size < min_cluster_size:
-        #         labeled_eroded[comp_mask] = 0
-        #         components_removed += 1
-
-        # if components_removed > 0:
-        #     logger.debug(
-        #         f"Cluster {cluster_id}: removed {components_removed} small component(s)"
-        #     )
-
-        # # Check if anything remains after filtering
-        # if not np.any(labeled_eroded > 0):
-        #     continue
-
         # Step 4: Dilation to restore size (but not reconnect separated parts)
         if dilation_iterations > 0:
             # Dilate each component separately to avoid reconnection
