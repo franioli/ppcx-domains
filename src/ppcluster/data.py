@@ -30,6 +30,12 @@ from ppcluster.utils.database import (
 logger = logging.getLogger("ppcx")
 
 
+class DataLoadingError(Exception):
+    """Custom exception raised when data loading from the database fails."""
+
+    pass
+
+
 def read_data_from_db(
     config: DictConfig | ListConfig,
     reference_date: str | datetime,
@@ -59,7 +65,7 @@ def read_data_from_db(
         dt_hours_max=config.data.dt_max,
     )
     if len(dic_ids) < 1:
-        raise ValueError("No DIC analyses found for the given criteria")
+        raise DataLoadingError("No DIC analyses found for the given criteria")
 
     dic_analyses = get_dic_analysis_by_ids(db_engine=db_engine, dic_ids=dic_ids)
     logger.info("Fetched DIC analysis:")
@@ -103,7 +109,7 @@ def find_ensemble_files(
         List[Path] of selected NetCDF files matching the criteria, sorted by dt and filename. If no files match, returns an empty list.
     """
     if not search_dir.exists():
-        raise FileNotFoundError(f"Search directory does not exist: {search_dir}")
+        raise DataLoadingError(f"Search directory does not exist: {search_dir}")
 
     # Convert dt range from hours to days (integer)
     dt_days_min = round(dt_hours_min / 24)
@@ -119,7 +125,7 @@ def find_ensemble_files(
         try:
             regex = re.compile(filename_pattern)
         except re.error as e:
-            raise ValueError(
+            raise DataLoadingError(
                 f"Invalid regex pattern provided: {filename_pattern}"
             ) from e
 
@@ -382,7 +388,7 @@ def read_sectors_from_file(sector_prior_path: Path, sector_names: list[str]):
                 label_col = candidate
                 break
         if not label_col:
-            raise ValueError(
+            raise DataLoadingError(
                 f"Could not find a classification label column in {sector_prior_path}."
             )
         for _, row in gdf_priors.iterrows():
@@ -394,7 +400,7 @@ def read_sectors_from_file(sector_prior_path: Path, sector_names: list[str]):
                 else:
                     sectors[lbl] = geom
     else:
-        raise ValueError(
+        raise DataLoadingError(
             f"Unsupported sector prior file format: {sector_prior_path.suffix}"
         )
     return sectors
@@ -510,7 +516,7 @@ def load_sectors_and_roi(
         prior_file_pattern.parent.glob(Path(prior_file_pattern).name)
     )
     if len(sector_prior_paths) == 0:
-        raise FileNotFoundError(
+        raise DataLoadingError(
             f"No sector prior file found matching: {sector_prior_path}"
         )
     if len(sector_prior_paths) > 1:
@@ -521,11 +527,6 @@ def load_sectors_and_roi(
 
     # Load sectors
     sectors = read_sectors_from_file(sector_prior_path, sector_names)
-    # if not sectors or any(name not in sectors for name in sector_names):
-    #     missing = [name for name in sector_names if name not in sectors]
-    #     raise ValueError(
-    #         f"Sectors missing in prior file {sector_prior_path}: {missing}. Expected: {sector_names}"
-    #     )
 
     # Try to read ROI from separate file if provided, else from sector_prior_path
     roi = None
