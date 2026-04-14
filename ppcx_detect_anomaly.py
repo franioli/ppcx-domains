@@ -78,9 +78,7 @@ from ppcluster.data import (
 from ppcluster.griddata import create_2d_grid
 from ppcluster.mcmc.clustering import (
     clusterize_gaussian_mixture,
-    save_sampling_summary,
 )
-from ppcluster.mcmc.priors import plot_spatial_priors
 from ppcluster.preprocessing import (
     transform_and_scale_features,
 )
@@ -103,6 +101,12 @@ HEADLESS = True  # set to True when running in non-GUI environment
 
 if HEADLESS:
     plt.switch_backend("Agg")
+
+
+class SectorNotFoundError(Exception):
+    """Custom exception raised when the specified sector is not found in the sectors GeoDataFrame."""
+
+    pass
 
 
 def parse_arguments():
@@ -189,8 +193,7 @@ def run_anomaly_pipeline(
 
     # 2. Extract ROI (Target Sector) for optimizing data loading
     if target_sector not in sectors_gdf["sector"].values:
-        logger.error(f"Sector {target_sector} not present in loaded file.")
-        return False
+        raise SectorNotFoundError(f"Sector {target_sector} not found.")
 
     target_poly = sectors_gdf[
         sectors_gdf["sector"] == target_sector
@@ -397,33 +400,10 @@ def detect_anomaly(
             "power": {"exponent": 5}
         },  # This will make low velocities (noise) more distinguishable and high velocities (potential anomalies) more spread out.
         scaler_type="standard",
+        make_plots=True,
+        output_dir=output_dir,
+        base_name=f"{anomaly_base_name}_feature_distributions",
     )
-
-    # Debugging Plot: Scaled vs Original Distributions
-    n_feats = data_array.shape[1]
-    fig, axes = plt.subplots(n_feats, 1, figsize=(10, 4 * n_feats), squeeze=False)
-    for i, var_name in enumerate(refine_features):
-        ax = axes[i, 0]
-        scaled_data = data_array[:, i]
-
-        # Plot distribution on primary axis (Scaled)
-        ax.hist(scaled_data, bins=50, color="skyblue", edgecolor="black", alpha=0.7)
-        ax.set_xlabel(f"{var_name} (Scaled / Z-score)")
-        ax.set_ylabel("Frequency")
-        ax.grid(True, linestyle="--", alpha=0.6)
-
-        # Add secondary axis for original values
-        ax2 = ax.twiny()
-        # Scale the secondary axis limits by inverting the primary limits
-        ax2.set_xlim(
-            scaler.inverse_transform(
-                np.array([ax.get_xlim()]).T.repeat(n_feats, axis=1)
-            )[:, i]
-        )
-        ax2.set_xlabel(f"{var_name} (Original Units)")
-    plt.tight_layout()
-    fig.savefig(output_dir / f"{base_name}_mcmc_feature_distributions.jpg", dpi=150)
-    plt.close(fig)
 
     # 4. Setup Anomalous/Background Priors
     # Bounds for p(anomaly).
@@ -544,56 +524,17 @@ def detect_anomaly(
         second_pass_sample_args=anomaly_config.second_pass_sample_args,
         random_seed=config.random_seed,
         force_cpu=anomaly_config.force_cpu,
-    )
-
-    # 6. Save Diagnostics
-    save_sampling_summary(
-        convergence_flag=result.convergence_flag,
-        idata=result.idata,
         output_dir=output_dir,
-        base_name=f"{anomaly_base_name}_mcmc",
-        make_plots=True,
-        df_input=dic_df,
-        cluster_pred=result.cluster_pred,
-        posterior_probs=result.posterior_probs,
-        scaler=scaler,
-        img=img,
+        base_name=f"{base_name}_mcmc",
+        debug=True,
+        save_ctx={"df_input": dic_df, "scaler": scaler, "img": img},
     )
-
-    # 6. Plot spatial priors for the anomaly detection step (before-after MRF)
-    try:
-        fig, ax = plot_spatial_priors(
-            df=dic_df,
-            prior_probs=prior_probs,
-            img=img,
-        )
-        fig.savefig(
-            output_dir / f"{anomaly_base_name}_spatial_priors_beforeMRF.jpg",
-            dpi=150,
-            bbox_inches="tight",
-        )
-        plt.close(fig)
-        fig, ax = plot_spatial_priors(
-            df=dic_df,
-            prior_probs=result.priors,
-            img=img,
-        )
-        fig.savefig(
-            output_dir / f"{anomaly_base_name}_spatial_priors_afterMRF.jpg",
-            dpi=150,
-            bbox_inches="tight",
-        )
-        plt.close(fig)
-    except Exception as e:
-        logger.warning(f"Failed to plot spatial priors for anomaly detection: {e}")
 
     # 7. Post-Processing: Vectorization
-
-    # Map classes: 0 -> base, 1 -> anomaly
-    labels_map = ["base", "anomaly"]
+    labels_map = ["base", "anomaly"]  # Map classes: 0 -> base, 1 -> anomaly
     dic_df["sector"] = [labels_map[p] for p in result.cluster_pred]
 
-    # Save Sub-sector GeoJSON (points)
+    # Save classified points with their assigned sectors
     dic_df.to_csv(output_dir / f"{anomaly_base_name}_points.csv", index=False)
 
     # 1. Separate points by class
@@ -608,12 +549,25 @@ def detect_anomaly(
 
     logger.info(f"Vectorizing anomaly cluster with {len(anomaly_df)} points...")
 
-    # Vectorize points to polygon
+    # Create a grid of the anomaly points for vectorization.
     x_a = anomaly_df["x"].to_numpy()
     y_a = anomaly_df["y"].to_numpy()
     X_sub, Y_sub, label_grid_sub = create_2d_grid(
         x=x_a, y=y_a, labels=np.ones(len(x_a))
     )
+
+    # Apply one iteration of erosion+dilation to clean up the anomaly mask before vectorization. This helps remove small noise clusters and fill small gaps, resulting in cleaner polygons.
+    # from ppcluster.griddata import apply_morphological_operations
+
+    # label_grid_sub = apply_morphological_operations(
+    #     cluster_grid=label_grid_sub,
+    #     erosion_iterations=1,
+    #     dilation_iterations=1,
+    #     min_cluster_size=20,
+    #     connectivity=8,
+    # )
+
+    #  Vectorize points to polygon
     anomaly_gdf = vectorize_gridded_sectors(label_grid_sub, X_sub, Y_sub)
 
     # Check validity and non-emptiness
@@ -627,7 +581,6 @@ def detect_anomaly(
     # Remove small anomalies that are likely noise (e.g., smaller than 5 points) and fill small holes (e.g., smaller than 3 points) to clean up the geometry. # TODO: MAKE THIS CONFIGURABLE
     n_points_threshold = 5
     n_points_holes_to_fill = 3
-    keep_n_largest = 1
     grid_res = abs(float(X_sub[0, 1] - X_sub[0, 0]) if X_sub.shape[1] > 1 else 1.0)
 
     # Explode MultiPolygons into individual Polygon rows
@@ -655,15 +608,41 @@ def detect_anomaly(
     except Exception as e:
         logger.error(f"Error during hole filling: {e}")
 
-    # Keep only the largest contiguous geometry if multiple remain (optional, can be disabled if we want to keep multiple anomalies)  # TODO: MAKE THIS OPTIONAL
+    # If multiple anomaly geometries remain, select the one with the strongest
+    # velocity signal (largest median-velocity difference from the base sector).
+    # Points are spatially joined to each candidate polygon; the one whose point
+    # median velocity most exceeds the overall base median is kept.
     if len(anomaly_gdf) > 1:
-        anomaly_gdf["area"] = anomaly_gdf.area
-        anomaly_gdf = (
-            anomaly_gdf.sort_values("area", ascending=False).head(keep_n_largest).copy()
+        from shapely.geometry import Point
+
+        base_v_median = dic_df["V"].median()  # rough base reference before any split
+        pts_geoseries = gpd.GeoSeries(
+            [Point(x, y) for x, y in zip(dic_df["x"], dic_df["y"], strict=True)],
+            crs=anomaly_gdf.crs,
         )
-        logger.info(
-            "Multiple anomaly geometries detected after filtering. Keeping only the largest one."
-        )
+
+        best_idx, best_delta = None, -np.inf
+        for idx, candidate_geom in anomaly_gdf.geometry.items():
+            inside = pts_geoseries.within(candidate_geom)
+            candidate_v = dic_df.loc[inside.values, "V"]
+            if len(candidate_v) < 3:
+                continue
+            delta = candidate_v.median() - base_v_median
+            if delta > best_delta:
+                best_delta = delta
+                best_idx = idx
+
+        if best_idx is not None:
+            logger.info(
+                f"Multiple anomaly geometries ({len(anomaly_gdf)}): keeping geometry "
+                f"#{best_idx} with largest velocity excess "
+                f"(Δv_median = {best_delta:.3f})."
+            )
+            anomaly_gdf = anomaly_gdf.loc[[best_idx]].reset_index(drop=True)
+        else:
+            logger.warning(
+                "Could not rank anomaly geometries by velocity; keeping all of them."
+            )
 
     # Prepare the 'anomaly' and base geometries for combination:
     # Keep only geometry and add new labels
@@ -686,6 +665,18 @@ def detect_anomaly(
     gdf_refined = compute_sector_stats(
         gdf_refined, anomaly_pots, value_col="V", group_col="sector"
     )
+
+    # Log the velocity contrast between the selected anomaly and base
+    if "v_median" in gdf_refined.columns:
+        stats_by_sector = gdf_refined.set_index("sector")["v_median"]
+        if "anomaly" in stats_by_sector.index and "base" in stats_by_sector.index:
+            v_anom = stats_by_sector["anomaly"]
+            v_base = stats_by_sector["base"]
+            logger.info(
+                f"Velocity contrast — anomaly v_median: {v_anom:.3f}, "
+                f"base v_median: {v_base:.3f}, "
+                f"Δv_median: {v_anom - v_base:.3f}"
+            )
 
     # Save refined geometries, stats and classified points
     logger.info("Saving refined geometries and stats...")
@@ -752,9 +743,7 @@ def find_sectors_file(config, provided_path=None):
         if c.exists():
             return c
 
-    raise FileNotFoundError(
-        f"Could not find sectors file for {ref_date}. Tried: {candidates}"
-    )
+    raise SectorNotFoundError(f"Could not find sectors file for {ref_date}.")
 
 
 def load_best_dic_map(

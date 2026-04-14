@@ -220,7 +220,7 @@ def preprocess_dic_data(
     return dic_df
 
 
-def process_clustering_results(
+def vectorize_clustering_results(
     df_points: pd.DataFrame,
     cluster_labels: np.ndarray,
     output_dir: Path,
@@ -663,12 +663,8 @@ def run_pipeline(config: DictConfig | ListConfig) -> bool:
         prior_probs=prior_probs_array,
         sectors=sectors,
         sample_args=config.mcmc.sample_options,
-        mu_params=OmegaConf.to_container(
-            config.mcmc.model_options.mu_params, resolve=True
-        ),
-        sigma_params=OmegaConf.to_container(
-            config.mcmc.model_options.sigma_params, resolve=True
-        ),
+        mu_params=config.mcmc.model_options.mu_params,
+        sigma_params=config.mcmc.model_options.sigma_params,
         apply_mrf_regularization=config.mcmc.mrf_regularization,
         x_pos=dic_df["x"].to_numpy(),
         y_pos=dic_df["y"].to_numpy(),
@@ -689,7 +685,7 @@ def run_pipeline(config: DictConfig | ListConfig) -> bool:
 
     # Use the shared function for the main data
     logger.info("Processing main clustering results...")
-    sectors, pts_by_sector = process_clustering_results(
+    sectors, pts_by_sector = vectorize_clustering_results(
         df_points=dic_df,  # The original full dataframe
         cluster_labels=result.cluster_pred,
         output_dir=output_dir,
