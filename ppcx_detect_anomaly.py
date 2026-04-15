@@ -65,23 +65,21 @@ import pandas as pd
 from matplotlib import pyplot as plt
 from omegaconf import DictConfig, ListConfig, OmegaConf
 from PIL import Image
+from shapely.geometry import Point
 from smoothify import smoothify
 
-from ppcluster import Timer, load_config, setup_logger
-from ppcluster.cvat import (
-    filter_dataframe_by_polygons,
+from ppcluster import (
+    DICMapNotFoundError,
+    SectorNotFoundError,
+    Timer,
+    load_config,
+    setup_logger,
 )
-from ppcluster.data import (
-    find_ensemble_files,
-    read_data_from_pylamma_nc,
-)
+from ppcluster.cvat import filter_dataframe_by_polygons
+from ppcluster.data import find_ensemble_files, read_data_from_pylamma_nc
 from ppcluster.griddata import create_2d_grid
-from ppcluster.mcmc.clustering import (
-    clusterize_gaussian_mixture,
-)
-from ppcluster.preprocessing import (
-    transform_and_scale_features,
-)
+from ppcluster.mcmc.clustering import clusterize_gaussian_mixture
+from ppcluster.preprocessing import transform_and_scale_features
 from ppcluster.sectors import (
     classify_points_by_polygons,
     compute_sector_stats,
@@ -89,9 +87,7 @@ from ppcluster.sectors import (
     filter_small_sectors,
     vectorize_gridded_sectors,
 )
-from ppcluster.visualization import (
-    plot_dic_vectors,
-)
+from ppcluster.visualization import plot_dic_vectors
 
 logger = setup_logger(level=logging.INFO, name="ppcx")
 
@@ -101,12 +97,6 @@ HEADLESS = True  # set to True when running in non-GUI environment
 
 if HEADLESS:
     plt.switch_backend("Agg")
-
-
-class SectorNotFoundError(Exception):
-    """Custom exception raised when the specified sector is not found in the sectors GeoDataFrame."""
-
-    pass
 
 
 def parse_arguments():
@@ -171,11 +161,15 @@ def run_anomaly_pipeline(
     # Determine output directory for anomaly detection results.
     output_base_dir = Path(config.data.base_output_dir)
     run_output_subdir = config.data.get("run_output_subdir")
+
     if run_output_subdir:
         output_dir = output_base_dir / run_output_subdir
     else:
-        output_dir = output_base_dir
-    output_dir = output_dir / f"anomaly_{target_sector}"  # Dedicated subfolder
+        # Default to using the reference date as subfolder if run_output_subdir is not set
+        output_dir = output_base_dir / ref_date
+
+    # output_dir = output_dir / f"anomaly_{target_sector}"  # Dedicated subfolder
+
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Anomaly detection outputs will be saved to: {output_dir}")
 
@@ -187,49 +181,43 @@ def run_anomaly_pipeline(
     OmegaConf.save(config, config_path)
 
     # 1. Load Sectors
-    sectors_path = find_sectors_file(config, sectors_file_path)
+    sectors_path = find_sectors_file(
+        sectors_path=sectors_file_path,
+        sectors_dir=Path(config.data.sectors_dir)
+        if config.data.get("sectors_dir")
+        else None,
+        reference_date=ref_date,
+        sector_pattern="*_sectors_polygon.geojson",
+    )
+    if not sectors_path:
+        logger.error("Sectors file not found. Cannot proceed with anomaly detection.")
+        return False
+
     logger.info(f"Loading sectors from: {sectors_path}")
     sectors_gdf = gpd.read_file(sectors_path)
 
-    # 2. Extract ROI (Target Sector) for optimizing data loading
-    if target_sector not in sectors_gdf["sector"].values:
-        raise SectorNotFoundError(f"Sector {target_sector} not found.")
-
-    target_poly = sectors_gdf[
-        sectors_gdf["sector"] == target_sector
-    ].geometry.union_all()
-    # Use a safe buffer to ensure we load enough data for the anomaly detection context (MRF needs neighbors)
-    buffer = config.anomaly_detection.sector_buffer
-    if buffer is not None and buffer > 0:
-        roi_poly = target_poly.buffer(buffer)
-    else:
-        roi_poly = target_poly
-
-    # 3. Load DIC Data (Partial Load using ROI)
-    source = config.data.get("source", "database")
-    if source == "database":
-        raise NotImplementedError(
-            "Currently only file-based loading is implemented for anomaly detection."
-        )
-
+    # 2. Load DIC Data
     base_img_dir = Path(config.data.image_dir) if config.data.get("image_dir") else None
     logger.info(
-        f"Using {config.data.reference_date} for DIC loading (searching for maps from the day before)."
+        f"Searching for DIC maps for {config.data.reference_date} (dt: {config.data.dt_min}-{config.data.dt_max} hours)."
     )
     try:
         dic_df, dic_analyses, img = load_best_dic_map(
-            ref_date_dt=ref_date_dt,
+            ref_date=ref_date_dt,
             file_path=config.data.get("file_path"),
             search_dir=Path(config.data.get("search_dir")),
             search_pattern=config.data.get("search_pattern"),
             dt_min=config.data.dt_min,
             dt_max=config.data.dt_max,
             base_image_dir=base_img_dir,
-            mean_global_mad_threshold=config.preprocessing.mean_global_mad_threshold,
+            mean_mad_threshold=config.preprocessing.mean_global_mad_threshold,
             min_ensemble_size=config.preprocessing.min_ensemble_size,
         )
-    except (FileNotFoundError, RuntimeError) as e:
+    except DICMapNotFoundError as e:
         logger.error(str(e))
+        return False
+    if dic_df is None or dic_df.empty:
+        logger.error("No valid DIC data found. Cannot proceed with anomaly detection.")
         return False
 
     date_start = dic_analyses.iloc[0]["master_timestamp"].strftime("%Y-%m-%d")
@@ -239,9 +227,23 @@ def run_anomaly_pipeline(
         index=False,
     )
 
-    # Filter only points inside the spatial priors sectors
+    # 2. Filter only points inside the spatial priors sectors
+    if target_sector not in sectors_gdf["sector"].values:
+        raise SectorNotFoundError(f"Sector {target_sector} not found.")
+    target_poly = sectors_gdf[
+        sectors_gdf["sector"] == target_sector
+    ].geometry.union_all()
+
+    # Use a safe buffer to ensure we load enough data for the anomaly detection context (MRF needs neighbors)
+    buffer = config.anomaly_detection.sector_buffer
+    if buffer is not None and buffer > 0:
+        roi_poly = target_poly.buffer(buffer)
+    else:
+        roi_poly = target_poly
     if roi_poly is not None:
-        dic_df = filter_dataframe_by_polygons(dic_df, polygon=roi_poly)
+        dic_df = filter_dataframe_by_polygons(
+            dic_df, polygon=roi_poly, return_mask=False
+        )
 
     # Apply MAD filtering if max_point_mad is specified
     num_points = len(dic_df)
@@ -254,7 +256,9 @@ def run_anomaly_pipeline(
 
     dic_df.to_csv(output_dir / f"{base_name}_preprocessed_dic_data.csv", index=False)
 
-    if len(dic_df) < 50:  # Arbitrary minimum points #TODO: make this configurable
+    if (
+        len(dic_df) < 50
+    ):  # Arbitrary minimum points in Sector A to attempt anomaly detection
         logger.warning(
             f"Not enough points in Sector {target_sector} ({len(dic_df)}) for refinement."
         )
@@ -578,7 +582,7 @@ def detect_anomaly(
         anomaly_gdf = gpd.GeoDataFrame(geometry=[])
         return anomaly_gdf, dic_df
 
-    # Remove small anomalies that are likely noise (e.g., smaller than 5 points) and fill small holes (e.g., smaller than 3 points) to clean up the geometry. # TODO: MAKE THIS CONFIGURABLE
+    # Remove small anomalies that are likely noise (e.g., smaller than 5 points) and fill small holes (e.g., smaller than 3 points) to clean up the geometry.
     n_points_threshold = 5
     n_points_holes_to_fill = 3
     grid_res = abs(float(X_sub[0, 1] - X_sub[0, 0]) if X_sub.shape[1] > 1 else 1.0)
@@ -613,8 +617,6 @@ def detect_anomaly(
     # Points are spatially joined to each candidate polygon; the one whose point
     # median velocity most exceeds the overall base median is kept.
     if len(anomaly_gdf) > 1:
-        from shapely.geometry import Point
-
         base_v_median = dic_df["V"].median()  # rough base reference before any split
         pts_geoseries = gpd.GeoSeries(
             [Point(x, y) for x, y in zip(dic_df["x"], dic_df["y"], strict=True)],
@@ -709,65 +711,57 @@ def detect_anomaly(
     return gdf_refined, anomaly_pots
 
 
-def find_sectors_file(config, provided_path=None):
+def find_sectors_file(
+    sectors_path: str | Path | None = None,
+    reference_date: str | None = None,
+    sectors_dir: str | Path | None = None,
+    sector_pattern: str = "*_sectors_polygon.geojson",
+) -> Path | None:
     """Locates the domain classification GeoJSON output."""
     # 1. Check CLI argument
-    if provided_path and Path(provided_path).exists():
-        return Path(provided_path)
+    if sectors_path and Path(sectors_path).exists():
+        return Path(sectors_path)
 
-    # 2. Check Config
-    if (
-        "input_sectors_path" in config.anomaly_detection
-        and config.anomaly_detection.input_sectors_path
-    ):
-        path = Path(config.anomaly_detection.input_sectors_path)
-        if path.exists():
-            return path
+    # 2. Check in the sectors_dir for a file matching the reference date
+    if sectors_dir and Path(sectors_dir).is_dir():
+        sectors_dir = Path(sectors_dir)
+        if not reference_date:
+            raise ValueError(
+                "reference_date must be provided to search for sectors file in the directory."
+            )
+        for f in sectors_dir.glob(sector_pattern):
+            if reference_date in f.stem:
+                logger.debug(f"Found sectors file for {reference_date}: {f}")
+                return f
 
-    # 3. Automatic Discovery based on directory structure
-    # Expected: {base_output_dir}/kinematic_sectors_geojson/{date}_sectors_polygon.geojson
-    base_dir = Path(config.data.base_output_dir)
-    ref_date = config.data.reference_date
-
-    # Common standard paths
-    candidates = [
-        base_dir / "kinematic_sectors_geojson" / f"{ref_date}_sectors_polygon.geojson",
-        base_dir
-        / ref_date
-        / "kinematic_sectors_geojson"
-        / f"{ref_date}_sectors_polygon.geojson",
-        base_dir / "kinematic_sectors" / f"{ref_date}_sectors_polygon.geojson",
-    ]
-
-    for c in candidates:
-        if c.exists():
-            return c
-
-    raise SectorNotFoundError(f"Could not find sectors file for {ref_date}.")
+    logger.warning(
+        "Sectors file not found. Please provide a valid path via --sectors-file or ensure the file exists in the specified sectors_dir with the correct naming pattern."
+    )
+    return None
 
 
 def load_best_dic_map(
-    ref_date_dt: datetime,
+    ref_date: datetime,
     file_path: str | None,
     search_dir: Path,
     search_pattern: str,
     dt_min: int,
     dt_max: int,
     base_image_dir: Path | None = None,
-    mean_global_mad_threshold: float | None = None,
+    mean_mad_threshold: float | None = None,
     min_ensemble_size: int | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, Image.Image | None]:
     """
     Locate, read and select the best DIC NetCDF file for a given reference date.
 
     Args:
-        ref_date_dt: reference date as datetime (used to search day-before maps).
+        ref_date: reference date as datetime (used to search day-before maps).
         file_path: explicit file path to a single NetCDF file (if provided, search is skipped).
         search_dir: directory to search for candidate NetCDF files.
         search_pattern: filename glob/pattern used by find_ensemble_files.
         dt_min, dt_max: accepted temporal difference limits passed to find_ensemble_files.
         base_image_dir: optional directory containing background images (used to load an image if metadata lacks one).
-        mean_global_mad_threshold: optional MAD threshold to reject noisy maps (None disables this check).
+        mean_mad_threshold: optional MAD threshold to reject noisy maps (None disables this check).
         min_ensemble_size: optional minimum ensemble size to accept a map (None disables this check).
 
     Returns:
@@ -777,21 +771,21 @@ def load_best_dic_map(
         FileNotFoundError: if no candidate files are found.
         RuntimeError: if no candidate passes the optional quality filters.
     """
-    # discover candidate files
+    # 1. Locate candidate files
     if file_path and Path(file_path).is_file():
+        logger.info(f"Using explicitly provided DIC file: {file_path}")
         nc_paths = [Path(file_path)]
     else:
-        date_day_before = (ref_date_dt - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        # discover candidate files
         nc_paths = find_ensemble_files(
-            search_dir, date_day_before, dt_min, dt_max, search_pattern
+            search_dir, ref_date.strftime("%Y-%m-%d"), dt_min, dt_max, search_pattern
         )
-
     if not nc_paths:
-        raise FileNotFoundError(
+        raise DICMapNotFoundError(
             "No DIC files found for the specified date and criteria."
         )
 
-    # read candidates
+    # 2. Read candidates
     candidates: dict[str, tuple[pd.DataFrame, pd.DataFrame]] = {}
     for p in nc_paths:
         try:
@@ -802,9 +796,9 @@ def load_best_dic_map(
             logger.warning(f"Failed to read {p}: {exc}")
 
     if not candidates:
-        raise FileNotFoundError("No readable DIC candidates found.")
+        raise DICMapNotFoundError("No readable DIC candidates found.")
 
-    # evaluate and filter candidates (skip checks when thresholds are None)
+    # 3. Evaluate and filter candidates (skip checks when thresholds are None)
     valid: list[dict] = []
     for name, (df, meta) in candidates.items():
         mean_mad = float(df["mad"].mean()) if "mad" in df.columns else None
@@ -822,12 +816,12 @@ def load_best_dic_map(
             )
 
         if (
-            (mean_global_mad_threshold is not None)
+            (mean_mad_threshold is not None)
             and (mean_mad is not None)
-            and (mean_mad > mean_global_mad_threshold)
+            and (mean_mad > mean_mad_threshold)
         ):
             logger.warning(
-                f"Rejecting {name}: MAD {mean_mad:.2f} > {mean_global_mad_threshold}"
+                f"Rejecting {name}: MAD {mean_mad:.2f} > {mean_mad_threshold}"
             )
             continue
 
@@ -853,7 +847,7 @@ def load_best_dic_map(
         )
 
     if not valid:
-        raise RuntimeError("No DIC candidates passed quality filters.")
+        raise DICMapNotFoundError("No DIC candidates passed quality filters.")
 
     # prefer entries with MAD available (lowest MAD), otherwise keep first valid
     with_mad = [v for v in valid if v["mad"] is not None]
@@ -880,7 +874,7 @@ def load_best_dic_map(
 
     if img is None and base_image_dir is not None:
         try:
-            ref_date_str = ref_date_dt.strftime("%Y_%m_%d")
+            ref_date_str = ref_date.strftime("%Y_%m_%d")
             img_candidates = sorted(Path(base_image_dir).glob(f"*{ref_date_str}*.jpg"))
             if img_candidates:
                 img = Image.open(img_candidates[len(img_candidates) // 2])
@@ -891,130 +885,6 @@ def load_best_dic_map(
             logger.warning(f"Could not locate/load fallback image: {exc}")
 
     return dic_df, dic_meta, img
-
-
-def load_dic_from_nc_file(
-    ref_date_dt: datetime,
-    file_path: str | None,
-    search_dir: Path,
-    search_pattern: str,
-    dt_min: int,
-    dt_max: int,
-    mean_global_mad_threshold: float | None = None,
-    min_ensemble_size: int | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Locate, read and select the best DIC NetCDF file for a given reference date.
-
-    Args:
-        ref_date_dt: reference date as datetime (used to search day-before maps).
-        file_path: explicit file path to a single NetCDF file (if provided, search is skipped).
-        search_dir: directory to search for candidate NetCDF files.
-        search_pattern: filename glob/pattern used by find_ensemble_files.
-        dt_min, dt_max: accepted temporal difference limits passed to find_ensemble_files.
-        mean_global_mad_threshold: optional MAD threshold to reject noisy maps (None disables this check).
-        min_ensemble_size: optional minimum ensemble size to accept a map (None disables this check).
-
-    Returns:
-        tuple of (dic_df, dic_analyses_meta)
-
-    Raises:
-        FileNotFoundError: if no candidate files are found.
-        RuntimeError: if no candidate passes the optional quality filters.
-    """
-    # discover candidate files
-    if file_path and Path(file_path).is_file():
-        nc_paths = [Path(file_path)]
-    else:
-        date_day_before = (ref_date_dt - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-        nc_paths = find_ensemble_files(
-            search_dir, date_day_before, dt_min, dt_max, search_pattern
-        )
-
-    if not nc_paths:
-        raise FileNotFoundError(
-            "No DIC files found for the specified date and criteria."
-        )
-
-    # read candidates
-    candidates: dict[str, tuple[pd.DataFrame, pd.DataFrame]] = {}
-    for p in nc_paths:
-        try:
-            df, meta = read_data_from_pylamma_nc(p)
-            if not df.empty:
-                candidates[p.stem] = (df, meta)
-        except Exception as exc:
-            logger.warning(f"Failed to read {p}: {exc}")
-
-    if not candidates:
-        raise FileNotFoundError("No readable DIC candidates found.")
-
-    # evaluate and filter candidates (skip checks when thresholds are None)
-    valid: list[dict] = []
-    for name, (df, meta) in candidates.items():
-        mean_mad = float(df["mad"].mean()) if "mad" in df.columns else None
-        if mean_mad is None:
-            logger.warning(
-                f"Source {name}: 'mad' column not available; skipping MAD-based filtering."
-            )
-
-        min_ens = (
-            int(df["ensemble_size"].min()) if "ensemble_size" in df.columns else None
-        )
-        if min_ens is None:
-            logger.warning(
-                f"Source {name}: 'ensemble_size' column not available; skipping ensemble-size-based filtering."
-            )
-
-        if (
-            (mean_global_mad_threshold is not None)
-            and (mean_mad is not None)
-            and (mean_mad > mean_global_mad_threshold)
-        ):
-            logger.warning(
-                f"Rejecting {name}: MAD {mean_mad:.2f} > {mean_global_mad_threshold}"
-            )
-            continue
-
-        if (
-            (min_ensemble_size is not None)
-            and (min_ens is not None)
-            and (min_ens < min_ensemble_size)
-        ):
-            logger.warning(
-                f"Rejecting {name}: Ensemble size {min_ens} < {min_ensemble_size}"
-            )
-            continue
-
-        valid.append(
-            {
-                "name": name,
-                "df": df,
-                "meta": meta,
-                "mad": mean_mad,
-                "ens": min_ens,
-                "dt": meta.iloc[0]["dt_hours"],
-            }
-        )
-
-    if not valid:
-        raise RuntimeError("No DIC candidates passed quality filters.")
-
-    # prefer entries with MAD available (lowest MAD), otherwise keep first valid
-    with_mad = [v for v in valid if v["mad"] is not None]
-    if with_mad:
-        with_mad.sort(key=lambda x: (x["mad"], -(x["ens"] or 0), -x["dt"]))
-        best = with_mad[0]
-    else:
-        logger.warning(
-            "MAD not available for any valid candidate. Selecting the first valid candidate."
-        )
-        best = valid[0]
-
-    dic_df = best["df"]
-    dic_meta = best["meta"]
-
-    return dic_df, dic_meta
 
 
 def plot_anomaly_with_velocity(

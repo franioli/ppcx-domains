@@ -5,17 +5,17 @@ data:
   subset_name: null # Subset name (e.g., "2025" or a custom string e.g., "2024_18mp") used to construct file paths and output directories. By default the year extracted from reference_date is used as subset_name, but it can be overwritten by setting this parameter.
   camera_name: "PPCX_Tele" # Name of the camera ("PPCX_Tele", "PPCX_Wide").
 
-  base_output_dir: "output/${data.subset_name}_${data.camera_name}" # Output directory base path. The actual output of each run will be saved in a subfolder with the camera name and date (e.g., "output/2025_PPCX_Tele/2025-01-08/")
+  base_output_dir: "output_anomaly/${data.subset_name}_${data.camera_name}" # Output directory base path. The actual output of each run will be saved in a subdirectory of this path, determined by run_output_subdir.
   run_output_subdir: "${data.reference_date}" # Subdirectory name for the current run's output (e.g., "2025-01-08"). This will be created inside base_output_dir. If null, the base_output_dir will be used directly without creating a subfolder.
 
   # Data Source Configuration
-  source: "file" # "database" or "file"
-  file_path: null    # Path to input file (e.g. NetCDF) if source is "file"
-  search_dir: "/mnt/irpinas/planpincieux/data/${data.subset_name}/correlation/day_dic_ensemble_netcdf/" # Directory to search for input files if source is "file". Can use glob patterns (e.g., "data/2017/*.nc") to specify multiple files.
-  search_pattern: 'day_dic_(?P<slave>\d{4}-\d{2}-\d{2})_(?P<master>\d{4}-\d{2}-\d{2})_dt(?P<dt>\d+)_.*\.nc' # Regular expression pattern to extract slave date, master date, and time difference  from filenames when source is "file". The pattern should include named groups for the relevant metadata. For example:
-  #   'day_dic_(?P<slave>\d{4}-\d{2}-\d{2})_(?P<master>\d{4}-\d{2}-\d{2})_dt(?P<dt>\d+)_.*\.nc'
-  #   This pattern match filename like: "day_dic_2025-01-08_2025-01-01_dt7_ensemble2.nc".
-  image_dir: "/mnt/irpinas/planpincieux/data/${data.subset_name}/coregistration/coregistered/"
+  dic_file_path: null    # Path to input DIC map file (e.g. NetCDF)
+  search_dir: "/mnt/irpinas/planpincieux/data/${data.subset_name}/correlation/day_dic_ensemble_netcdf" # Directory to search for input files if source is "file".
+  search_pattern: 'day_dic_(?P<slave>\d{4}-\d{2}-\d{2})_(?P<master>\d{4}-\d{2}-\d{2})_dt(?P<dt>\d+)_.*\.nc' # Regular expression pattern to extract slave date, master date, and time difference from filenames. 
+  # The pattern should include named groups for the relevant metadata (master, slave, dt). For example:
+  #   'day_dic_(?P<slave>\d{4}-\d{2}-\d{2})_(?P<master>\d{4}-\d{2}-\d{2})_dt(?P<dt>\d+)_.*\.nc' match filename like: "day_dic_2025-01-08_2025-01-01_dt7_ensemble2.nc".
+  image_dir: "/mnt/irpinas/planpincieux/data/${data.subset_name}/coregistration/coregistered"
+  sectors_dir: "output_domains/${data.subset_name}_${data.camera_name}/kinematic_sectors_geojson" # Directory containing sector definitions (e.g., shapefiles or GeoJSON files). The code will look for a file named "sectors_${camera_name}.shp" or "sectors_${camera_name}.geojson" in this directory.
 
   dt_min: 0  # Minimum time difference between images in hours. Used both for files and database sources.
   dt_max: 30  # Maximum time difference between images in hours. Used both for files and database sources.

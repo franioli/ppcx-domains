@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Literal, overload
 
 import numpy as np
 import pandas as pd
@@ -71,14 +72,83 @@ def read_polygons_from_cvat(
     return merged_polygons
 
 
+@overload
 def filter_dataframe_by_polygons(
     df: pd.DataFrame | pd.Series,
     polygon: ShapelyPolygon,
     x_col: str = "x",
     y_col: str = "y",
+    *,
+    invert: bool = False,
+    return_mask: Literal[False] = False,
+) -> pd.DataFrame | pd.Series:
+    """
+    Filter a DIC dataframe keeping only points inside (or outside if invert=True) a Shapely Polygon.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame | pandas.Series
+        Input dataframe containing point coordinates.
+    polygon : ShapelyPolygon
+        Polygon object defining the area(s) to filter by.
+    x_col, y_col : str
+        Column names in df with x and y coordinates.
+    invert : bool
+        If True return points outside the selected polygons.
+    return_mask : bool
+        If True return tuple (filtered_df, boolean_mask) where mask is aligned with df.
+
+    Returns
+    -------
+    pandas.DataFrame | pandas.Series
+        Filtered dataframe.
+    """
+    ...
+
+
+@overload
+def filter_dataframe_by_polygons(
+    df: pd.DataFrame | pd.Series,
+    polygon: ShapelyPolygon,
+    x_col: str = "x",
+    y_col: str = "y",
+    *,
+    invert: bool = False,
+    return_mask: Literal[True],
+) -> tuple[pd.DataFrame | pd.Series, np.ndarray]:
+    """
+    Filter a DIC dataframe keeping only points inside (or outside if invert=True) a Shapely Polygon.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame | pandas.Series
+        Input dataframe containing point coordinates.
+    polygon : ShapelyPolygon
+        Polygon object defining the area(s) to filter by.
+    x_col, y_col : str
+        Column names in df with x and y coordinates.
+    invert : bool
+        If True return points outside the selected polygons.
+    return_mask : bool
+        If True return tuple (filtered_df, boolean_mask) where mask is aligned with df.
+
+    Returns
+    -------
+    tuple[pandas.DataFrame | pandas.Series, np.ndarray]
+        Filtered dataframe and mask if return_mask=True.
+    """
+    ...
+
+
+def filter_dataframe_by_polygons(
+    df: pd.DataFrame | pd.Series,
+    polygon: ShapelyPolygon,
+    x_col: str = "x",
+    y_col: str = "y",
+    *,
     invert: bool = False,
     return_mask: bool = False,
-) -> pd.DataFrame | tuple[pd.DataFrame, np.ndarray]:
+) -> pd.DataFrame | pd.Series | tuple[pd.DataFrame | pd.Series, np.ndarray]:
     """
     Filter a DIC dataframe keeping only points inside (or outside if invert=True) a Shapely Polygon.
 

@@ -477,9 +477,10 @@ def get_sector_colors(
         dict[str, str]: Dictionary mapping each sector label to a hex color string.
     """
     cmap = plt.get_cmap(colormap)
+    unique_labels = sorted(set(sector_labels))
+
     return {
-        label: mcolors.to_hex(cmap(i % cmap.N))
-        for i, label in enumerate(sorted(sector_labels))
+        label: mcolors.to_hex(cmap(i % cmap.N)) for i, label in enumerate(unique_labels)
     }
 
 

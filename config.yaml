@@ -5,12 +5,11 @@ data:
   subset_name: null # Subset name (e.g., "2025" or a custom string e.g., "2024_18mp") used to construct file paths and output directories. By default the year extracted from reference_date is used as subset_name, but it can be overwritten by setting this parameter.
   camera_name: "PPCX_Tele" # Name of the camera ("PPCX_Tele", "PPCX_Wide").
 
-  base_output_dir: "output/${data.subset_name}_${data.camera_name}" # Output directory base path. The actual output of each run will be saved in a subfolder with the camera name and date (e.g., "output/2025_PPCX_Tele/2025-01-08/")
+  base_output_dir: "output_domains/${data.subset_name}_${data.camera_name}" # Output directory base path. The actual output of each run will be saved in a subfolder with the camera name and date (e.g., "output/2025_PPCX_Tele/2025-01-08/")
   run_output_subdir: "${data.reference_date}" # Subdirectory name for the current run's output (e.g., "2025-01-08"). This will be created inside base_output_dir. If null, the base_output_dir will be used directly without creating a subfolder.
 
   # Data Source Configuration
-  source: "file" # "database" or "file"
-  file_path: null    # Path to input file (e.g. NetCDF) if source is "file"
+  dic_file_path: null    # Path to input file (e.g. NetCDF) if source is "file"
   search_dir: "/mnt/irpinas/planpincieux/data/${data.subset_name}/correlation/day_dic_ensemble_netcdf/" # Directory to search for input files if source is "file". Can use glob patterns (e.g., "data/2017/*.nc") to specify multiple files.
   search_pattern: 'day_dic_(?P<slave>\d{4}-\d{2}-\d{2})_(?P<master>\d{4}-\d{2}-\d{2})_dt(?P<dt>\d+)_.*\.nc' # Regular expression pattern to extract slave date, master date, and time difference  from filenames when source is "file". The pattern should include named groups for the relevant metadata. For example:
   #   'day_dic_(?P<slave>\d{4}-\d{2}-\d{2})_(?P<master>\d{4}-\d{2}-\d{2})_dt(?P<dt>\d+)_.*\.nc'
@@ -23,11 +22,6 @@ data:
   # Priors and ROI
   sector_prior_path: "data/${data.subset_name}*.zip" # Path to CVAT ZIP file containing sector prior polygons (and optionally ROI polygon)
   # roi_path: "data/roi.xml" # Path to CVAT XML file containing ROI polygon (optional, if not already included in sector_prior_path)
-
-  # Database query parameters. Used only if source is "database"
-  days_before_to_include: 0 # Number of days before the reference date to include in the analysis. 
-  days_after_to_include: 0 # Number of days after the reference date to include in the analysis.
-
 
 # Data preprocessing parameters
 preprocessing:
@@ -150,33 +144,25 @@ mcmc:
     cores: 4
     target_accept: 0.9
 
-# Multi-scale processing parameters # DEPRECATED: This section is currently not used, but it can be reintroduced in the future for multi-scale clustering approaches.
-multiscale:
-  sigma_values: null # [0] # List of Gaussian sigma values for multi-scale processing (0 means no smoothing)
-  aggregation:
-    similarity_threshold: 0.7
-    overall_threshold: 0.8
-
 # Post-processing parameters
 postprocessing:
   vectorization:
     min_area_px2: 100000.0
-    isolation_buffer: 30.0
+    isolation_buffer: 100.0
     velocity_merge_threshold: 1
-    force_minimum_sectors: true
     target_number_of_sectors: 4
     fill_holes_area: 80000.0
     smooth_geometries: true
     smooth_method: "smoothify"
-    smooth_iterations: 1
+    smooth_iterations: 2
   sector_assignment:
-    method: "y_centroid"  # Sorts resulting clusters by elevation to ensure consistent labeling (A, B, C...)
-    ascending: false      # False if sector A is at the bottom (lowest Y), True otherwise (the y axis is inverted in image coordinates (0 at top))
-    # sector_colors:
-    #   A: "#b3140b"      # Red
-    #   B: "#ee9c21"      # Orange
-    #   C: "#f1ee30"      # Yellow
-    #   D: "#5fb61c"      # Green
+    method: "prior_velocity"  # Possible values: "prior_velocity" | "prior" | "y_centroid" | "area"
+      # prior_velocity -> overlap with priors + velocity tiebreak for edge polygons (recommended)
+      # prior          -> pure overlap with spatial priors, no velocity
+      # y_centroid     -> sort by centroid Y, assign A, B, C... (always used as fallback)
+      # area           -> sort by area, assign A, B, C...
+    ascending: false      # Sort order for geometry-based methods. False = first label is lowest/smallest.
+    ambiguity_threshold: 0.7  # (prior_velocity only) Overlap fraction below which a polygon is considered ambiguous and the velocity tiebreak is applied. Range [0, 1].
 
 plotting:
   default_discrete_cmap: "tab10"  # Colormap for discrete sector colors when not specified

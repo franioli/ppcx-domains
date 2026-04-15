@@ -35,7 +35,7 @@ class DataConfig:
     )
 
     # File source parameters
-    file_path: str | None = None
+    dic_file_path: str | None = None
     subset_name: str | None = (
         None  # Subset name (e.g., "2025" or a custom string e.g., "2024_18mp") used to construct file paths and output directories.   By default the year extracted from reference_date is used as subset_name, but it can be overwritten by setting this parameter.
     )
@@ -46,6 +46,9 @@ class DataConfig:
         None  # Regex pattern to match files when searching in search_dir. Should include named groups for 'slave', 'master', and 'dt'.
     )
     image_dir: str | None = None  # Directory where input images are stored
+    sectors_dir: str | None = (
+        None  # Directory containing sector definitions (e.g., GeoJSON files) for anomaly detection.
+    )
 
     # Query parameters for database source
     camera_name: str | None = None
@@ -160,26 +163,22 @@ class McmcConfig:
     force_cpu: bool = False
 
 
-@dataclass
-class MultiscaleConfig:
-    sigma_values: list[float] | None = None
-    aggregation: dict = field(
-        default_factory=lambda: {
-            "similarity_threshold": 0.7,
-            "overall_threshold": 0.8,
-        }
-    )
+# @dataclass
+# class MultiscaleConfig:
+#     sigma_values: list[float] | None = None
+#     aggregation: dict = field(
+#         default_factory=lambda: {
+#             "similarity_threshold": 0.7,
+#             "overall_threshold": 0.8,
+#         }
+#     )
 
 
 @dataclass
 class VectorizationConfig:
-    method: str = "smoothify"
-    buffer_distance: float = 2.0
-    simplify_tolerance: float = 0.0
     min_area_px2: float = 100000.0
     isolation_buffer: float = 30.0
     velocity_merge_threshold: float = 1.0
-    force_minimum_sectors: bool = True
     target_number_of_sectors: int = 4
     fill_holes_area: float = 80000.0
     smooth_geometries: bool = True
@@ -189,15 +188,12 @@ class VectorizationConfig:
 
 @dataclass
 class SectorAssignmentConfig:
-    method: str = "y_position"
+    method: str = "prior"
     ascending: bool = False
-    sector_colors: dict[str, str] | None = None
-    # Example of custom colors: sector_colors = field(default_factory=lambda: {
-    #         "A": "#b3140b", # Red
-    #         "B": "#ee9c21", # Orange
-    #         "C": "#f1ee30", # Yellow
-    #         "D": "#5fb61c", # Green
-    # }
+    ambiguity_threshold: float = 0.7
+    sector_colors: dict[str, str] | None = (
+        None  # Optional dictionary mapping sector labels to colors (e.g., {"A": "#b3140b", "B": "#ee9c21", "C": "#f1ee30", "D": "#5fb61c"}). If not provided, default colors from the plotting configuration will be assigned based on the sector labels.
+    )
 
 
 @dataclass
@@ -293,7 +289,7 @@ class PipelineConfig:
     preprocessing: PreprocessingConfig = field(default_factory=PreprocessingConfig)
     priors: PriorsConfig = field(default_factory=PriorsConfig)
     mcmc: McmcConfig = field(default_factory=McmcConfig)
-    multiscale: MultiscaleConfig = field(default_factory=MultiscaleConfig)
+    # multiscale: MultiscaleConfig = field(default_factory=MultiscaleConfig)
     postprocessing: PostProcessingConfig = field(default_factory=PostProcessingConfig)
     plotting: PlottingConfig = field(default_factory=PlottingConfig)
     anomaly_detection: AnomalyDetectionConfig = field(

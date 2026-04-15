@@ -8,7 +8,7 @@ import pandas as pd
 from matplotlib import pyplot as plt
 from matplotlib.colors import ListedColormap
 from scipy import ndimage
-from scipy.ndimage import binary_dilation, binary_erosion, label
+from scipy.ndimage import binary_erosion
 
 logger = logging.getLogger("ppcx")
 
@@ -231,15 +231,13 @@ def apply_cluster_grid_cleaning(
 
     # Retrieve post-processing parameters
     do_split = config.get("split_disconnected_components", True)
-    erosion_iters = config.get("erosion_iterations", 0)
-    dilation_iters = config.get("dilation_iterations", 0)
-    connectivity = config.get("connectivity", 8)
+    smoothing_rounds = config.get("smoothing_rounds", 0)
+    connectivity = config.get("connectivity", 4)
     min_cluster_size = config.get("min_cluster_size", 0)
     keep_only_largest_n = config.get("keep_only_largest_n", 0)
 
     logger.info(
-        f"Post-proc params: erosion={erosion_iters}, "
-        f"dilation={dilation_iters}, min_size={min_cluster_size}"
+        f"Post-proc params: smoothing_rounds={smoothing_rounds}, min_size={min_cluster_size}"
     )
 
     # Store pre-postprocessing grid for comparison
@@ -261,12 +259,11 @@ def apply_cluster_grid_cleaning(
         merge_strategy="merge",  # merge small components to nearest neighbor
     )
 
-    # Apply morphological operations (erosion + dilation)
-    if erosion_iters > 0 or dilation_iters > 0:
+    # Apply morphological smoothing (opening→closing per round)
+    if smoothing_rounds > 0:
         clusters = apply_morphological_operations(
             cluster_grid=clusters,
-            erosion_iterations=erosion_iters,
-            dilation_iterations=dilation_iters,
+            smoothing_rounds=smoothing_rounds,
             min_cluster_size=min_cluster_size,
             connectivity=connectivity,
         )
@@ -284,7 +281,6 @@ def apply_cluster_grid_cleaning(
         clusters = keep_only_largest_clusters(
             label_grid=clusters,
             n_largest=keep_only_largest_n,
-            connectivity=connectivity,
         )
 
     # Plot comparison before/after post-processing
@@ -429,7 +425,6 @@ def remove_small_grid_components(
 def keep_only_largest_clusters(
     label_grid: np.ndarray,
     n_largest: int,
-    connectivity: int = 4,
 ) -> np.ndarray:
     """
     Keep only the N largest clusters in a 2D label grid.
@@ -667,98 +662,176 @@ def split_disconnected_components(label_grid, connectivity=8, start_label=0):
     return new_grid, mapping
 
 
+def _erode_grid(grid: np.ndarray, structure: np.ndarray) -> np.ndarray:
+    """
+    Apply one step of erosion to all clusters in the grid simultaneously.
+
+    Boundary cells that touch a different label (or an unassigned cell) are
+    set to -1 (unassigned), shrinking every cluster away from its edges.
+    """
+    result = grid.copy()
+    unique_labels = np.unique(grid)
+    unique_labels = unique_labels[unique_labels >= 0]
+    for lab in unique_labels:
+        mask = grid == lab
+        eroded = binary_erosion(mask, structure=structure).astype(bool)
+        result[mask & ~eroded] = -1
+    return result
+
+
+def _dilate_grid(grid: np.ndarray, structure: np.ndarray) -> np.ndarray:
+    """
+    Apply one step of dilation to all clusters in the grid simultaneously.
+
+    Each unassigned cell is assigned the label of its most-represented
+    neighbor (by neighbor count).  Ties leave the cell unassigned so no
+    arbitrary bias is introduced.
+    """
+    result = grid.copy()
+    unassigned_mask = grid < 0
+    if not np.any(unassigned_mask):
+        return result
+
+    unique_labels = np.unique(grid)
+    unique_labels = unique_labels[unique_labels >= 0]
+    if len(unique_labels) == 0:
+        return result
+
+    best_label = np.full(grid.shape, -1, dtype=int)
+    best_count = np.zeros(grid.shape, dtype=int)
+    has_tie = np.zeros(grid.shape, dtype=bool)
+
+    for lab in unique_labels:
+        mask = (grid == lab).astype(np.uint8)
+        neighbor_count = ndimage.convolve(
+            mask, structure.astype(np.uint8), mode="constant", cval=0
+        )
+        # Only consider unassigned cells
+        nc_unassigned = neighbor_count * unassigned_mask
+        improve = nc_unassigned > best_count
+        tie = (nc_unassigned == best_count) & (nc_unassigned > 0) & ~improve
+        has_tie[tie] = True
+        has_tie[improve] = False
+        best_label[improve] = lab
+        best_count[improve] = nc_unassigned[improve]
+
+    fill = unassigned_mask & (best_count > 0) & ~has_tie
+    result[fill] = best_label[fill]
+    return result
+
+
 def apply_morphological_operations(
     cluster_grid: np.ndarray,
-    erosion_iterations: int = 2,
-    dilation_iterations: int = 2,
-    min_cluster_size: int = 100,
-    connectivity: int = 8,
+    smoothing_rounds: int = 1,
+    connectivity: Literal[4, 8] = 4,
+    min_cluster_size: int = 0,
 ) -> np.ndarray:
     """
-    Apply morphological operations (erosion + dilation) to disconnect narrow bridges
-    and remove small clusters.
+    Apply morphological smoothing (opening) to the cluster grid.
 
-    Operations performed per cluster:
-    1. Erosion: disconnect narrow bridges and remove small protrusions
-    2. Component labeling: identify separated parts after erosion
-    3. Size filtering: remove components smaller than threshold
-    4. Dilation: restore cluster size without reconnecting separated parts
+    Each round applies one opening (erode → dilate), which removes thin protrusions,
+    narrow bridges, and small isolated fragments while leaving large clusters roughly
+    intact.  No closing step is applied: for tightly-packed multi-label grids (all
+    interior space is assigned to some cluster), the closing dilation has nothing to
+    expand into, so the closing erosion would permanently shrink every cluster without
+    recovery.  Interior holes are handled separately by close_small_holes().
+
+    NaN cells (cells outside the DIC data footprint) are preserved throughout
+    all operations and restored in the returned array.
 
     Args:
-        cluster_grid: 2D array with cluster labels (negative values = unassigned)
-        erosion_iterations: Number of erosion iterations to disconnect narrow bridges
-        dilation_iterations: Number of dilation iterations to restore cluster size
-        min_cluster_size: Minimum number of pixels for a cluster component to survive
-        structure: Structuring element for morphological operations (default: 3x3 ones)
+        cluster_grid: 2D array with cluster labels. Accepts float (NaN = outside
+            data footprint) or int (negative = unassigned). NaN cells are never
+            modified and are restored in the output.
+        smoothing_rounds: Number of opening→closing cycles to apply.
+        connectivity: 4 or 8 neighbor connectivity for the structuring element.
+        min_cluster_size: If > 0, remove clusters smaller than this after processing.
 
     Returns:
-        Processed cluster grid with same shape as input
-    """
+        Float array with the same shape and NaN positions as the input.
 
+    Raises:
+        ValueError: If the input has no valid cells, or if all cells are erased
+            during processing (clusters too thin for the requested number of rounds).
+    """
     if connectivity == 8:
         structure = np.ones((3, 3), dtype=bool)
-    else:
+    elif connectivity == 4:
         structure = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=bool)
+    else:
+        raise ValueError("connectivity must be 4 or 8")
 
     logger.info(
-        f"Applying morphological operations: erosion={erosion_iterations}, "
-        f"dilation={dilation_iterations}, min_size={min_cluster_size}"
+        f"Applying morphological smoothing: smoothing_rounds={smoothing_rounds}"
     )
 
-    # Get unique cluster labels (excluding negative = unassigned)
-    unique_labels = np.unique(cluster_grid)
-    unique_labels = unique_labels[unique_labels >= 0]
+    # Preserve NaN cells (outside DIC data footprint — must never be filled)
+    nan_mask = np.isnan(cluster_grid)
 
-    # Process each cluster separately
-    processed_grid = np.full_like(cluster_grid, -1, dtype=int)
+    # Safe NaN → -1: avoids undefined behavior of float(NaN) → int cast
+    grid = np.where(nan_mask, -1, cluster_grid).astype(int)
 
-    for cluster_id in sorted(unique_labels):
-        # Create binary mask for this cluster
-        cluster_mask = (cluster_grid == cluster_id).astype(np.uint8)
+    n_valid_input = int(np.sum(grid >= 0))
+    if n_valid_input == 0:
+        raise ValueError(
+            "apply_morphological_operations: input grid has no valid cluster cells "
+            "(all cells are NaN or negative). Check the clustering output."
+        )
 
-        # Step 1: Erosion to disconnect narrow bridges
-        if erosion_iterations > 0:
-            eroded_mask = binary_erosion(
-                cluster_mask, iterations=erosion_iterations, structure=structure
-            ).astype(np.uint8)
-        else:
-            eroded_mask = cluster_mask
+    for i in range(1, smoothing_rounds + 1):
+        # Opening: erode → dilate (removes thin bridges and noisy protrusions,
+        # smooths convex boundary corners).
+        # NOTE: No closing step here. Closing (dilate→erode) is destructive for
+        # tightly-packed multi-label grids: after opening, all interior space is
+        # already assigned to some cluster, so the closing dilation cannot expand
+        # any cluster.  The closing erosion then removes a full border ring from
+        # every cluster without a preceding expansion to compensate, causing
+        # strong permanent shrinkage.  Interior holes are handled separately by
+        # close_small_holes(), called after this function.
+        grid = _erode_grid(grid, structure)
+        grid[nan_mask] = -1  # NaN cells must not be altered by erosion
 
-        # Step 2: Label connected components after erosion
-        labeled_eroded, n_components = label(eroded_mask, structure=structure)
+        n_valid = int(np.sum(grid >= 0))
+        if n_valid == 0:
+            raise ValueError(
+                f"Round {i}/{smoothing_rounds} (opening / erosion): all cluster cells "
+                "were erased. The clusters may be too thin for this many smoothing "
+                "rounds. Reduce smoothing_rounds or inspect the clustering quality."
+            )
 
-        if n_components == 0:
-            continue
+        grid = _dilate_grid(grid, structure)
+        grid[nan_mask] = -1  # prevent dilation from expanding into data-free cells
 
-        # Step 4: Dilation to restore size (but not reconnect separated parts)
-        if dilation_iterations > 0:
-            # Dilate each component separately to avoid reconnection
-            dilated_mask = np.zeros_like(labeled_eroded, dtype=np.uint8)
-            remaining_components = np.unique(labeled_eroded)
-            remaining_components = remaining_components[remaining_components > 0]
+        n_valid = int(np.sum(grid >= 0))
+        if n_valid == 0:
+            raise ValueError(
+                f"Round {i}/{smoothing_rounds} (opening / dilation): all cluster cells "
+                "were erased. Consider reducing smoothing_rounds."
+            )
 
-            for comp_id in remaining_components:
-                comp_mask = (labeled_eroded == comp_id).astype(np.uint8)
-                dilated_comp = binary_dilation(
-                    comp_mask, iterations=dilation_iterations, structure=structure
-                ).astype(np.uint8)
-                # Add to final mask (max to handle overlaps)
-                dilated_mask = np.maximum(dilated_mask, dilated_comp)
+        logger.debug(
+            f"Smoothing round {i}/{smoothing_rounds}: "
+            f"{len(np.unique(grid[grid >= 0]))} clusters, "
+            f"{np.sum(grid < 0)} unassigned cells"
+        )
 
-            final_mask = dilated_mask
-        else:
-            final_mask = (labeled_eroded > 0).astype(np.uint8)
+    if min_cluster_size > 0:
+        grid = remove_small_grid_components(
+            grid, min_size=min_cluster_size, connectivity=connectivity
+        )
 
-        # Add processed cluster to output grid
-        processed_grid[final_mask > 0] = cluster_id
-
-    n_clusters_before = len(unique_labels)
-    n_clusters_after = len(np.unique(processed_grid[processed_grid >= 0]))
+    valid_input = cluster_grid[~nan_mask]
+    n_clusters_before = int(len(np.unique(valid_input[valid_input >= 0])))
+    n_clusters_after = int(len(np.unique(grid[grid >= 0])))
     logger.info(
-        f"Morphological operations: {n_clusters_before} → {n_clusters_after} clusters"
+        f"Morphological smoothing: {n_clusters_before} → {n_clusters_after} clusters"
     )
 
-    return processed_grid
+    # Return float with NaN restored: downstream functions (close_small_holes,
+    # vectorize_gridded_sectors) expect float dtype with NaN for empty cells.
+    result = grid.astype(float)
+    result[nan_mask] = np.nan
+    return result
 
 
 # === Visualization ===

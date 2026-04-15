@@ -36,61 +36,12 @@ class DataLoadingError(Exception):
     pass
 
 
-def read_data_from_db(
-    config: DictConfig | ListConfig,
-    reference_date: str | datetime,
-    reference_start_date: str | datetime | None = None,
-    reference_end_date: str | datetime | None = None,
-) -> tuple[dict[int, pd.DataFrame], pd.DataFrame, Any]:
-    """
-    Fetch DIC data and metadata from the database.
-
-    Args:
-        config: Configuration object containing database and data specs.
-        reference_date: Target reference date.
-        reference_start_date: Start of the temporal search window.
-        reference_end_date: End of the temporal search window.
-
-    Returns:
-        tuple: (dict of DIC dataframes, metadata dataframe, background image).
-    """
-    db_engine = create_engine(config.db_url)
-    dic_ids = fetch_dic_analysis_ids(
-        db_engine,
-        camera_name=config.data.camera_name,
-        reference_date=reference_date,
-        reference_date_start=reference_start_date,
-        reference_date_end=reference_end_date,
-        dt_hours_min=config.data.dt_min,
-        dt_hours_max=config.data.dt_max,
-    )
-    if len(dic_ids) < 1:
-        raise DataLoadingError("No DIC analyses found for the given criteria")
-
-    dic_analyses = get_dic_analysis_by_ids(db_engine=db_engine, dic_ids=dic_ids)
-    logger.info("Fetched DIC analysis:")
-    for _, row in dic_analyses.iterrows():
-        logger.info(
-            f"DIC ID: {row['dic_id']}, date: {row['reference_date']}, dt (hrs): {row['dt_hours']}, Master: {row['master_timestamp']}, Slave: {row['slave_timestamp']}"
-        )
-
-    master_image_id = dic_analyses["master_image_id"].iloc[0]
-
-    img = get_image(image_id=master_image_id, config=config.api)
-
-    out = get_multi_dic_data(dic_ids, stack_results=False, config=config.api)
-    logger.info(f"Found stack of {len(out)} DIC dataframes.")
-
-    # Rename columns to match the standard u,v format if necessary
-    for key in out:
-        out[key] = out[key].rename(columns={"dx": "u", "dy": "v"}, errors="ignore")
-
-    return out, dic_analyses, img
+DEFAULT_FILENAME_PATTERN = r"day_dic_(?P<slave>\d{4}-\d{2}-\d{2})_(?P<master>\d{4}-\d{2}-\d{2})_dt(?P<dt>\d+)_.*\.nc"
 
 
 def find_ensemble_files(
     search_dir: Path,
-    reference_date: str,
+    reference_date: str | datetime,
     dt_hours_min: int,
     dt_hours_max: int,
     filename_pattern: str | None = None,
@@ -100,16 +51,20 @@ def find_ensemble_files(
 
     Args:
         search_dir: Directory to search in.
-        reference_date: The date string (YYYY-MM-DD) corresponding to the slave/final date.
+        reference_date: The date string (YYYY-MM-DD) or datetime object corresponding to the slave/final date.
         dt_hours_min: Minimum time delta in hours.
         dt_hours_max: Maximum time delta in hours.
-        filename_pattern: Optional regex pattern. If None, uses default:
-                          'day_dic_(?P<slave>\d{4}-\d{2}-\d{2})_(?P<master>\d{4}-\d{2}-\d{2})_dt(?P<dt>\d+)_.*\.nc'
+        filename_pattern: Optional regex pattern. If None, uses default: day_dic_{slave}_{master}_dt{dt}_ensemble{ens}.nc
+        where {slave} and {master} are dates in YYYY-MM-DD format, and {dt} is the time delta in days."
     Returns:
         List[Path] of selected NetCDF files matching the criteria, sorted by dt and filename. If no files match, returns an empty list.
     """
     if not search_dir.exists():
         raise DataLoadingError(f"Search directory does not exist: {search_dir}")
+
+    # Normalize reference_date to YYYY-MM-DD string
+    if isinstance(reference_date, datetime):
+        reference_date = reference_date.strftime("%Y-%m-%d")
 
     # Convert dt range from hours to days (integer)
     dt_days_min = round(dt_hours_min / 24)
@@ -286,14 +241,7 @@ def read_data_from_pylamma_nc(
         image_path_str = None
         try:
             master_list = ast.literal_eval(master_list_str)
-        except Exception:
-            master_list = []
-        if not isinstance(master_list, list) or len(master_list) == 0:
-            logger.warning(
-                f"No valid master_list found in NetCDF {nc_path.name}; image path will be unset."
-            )
-            image_path_str = None
-        else:
+
             mid_idx = len(master_list) // 2
             mid_filename = master_list[mid_idx]
 
@@ -324,12 +272,21 @@ def read_data_from_pylamma_nc(
 
             if image_path_str is None:
                 logger.warning(
-                    f"Background image {mid_filename} could not be located for NetCDF {nc_path.name}."
+                    f"Image {mid_filename} could not be located for NetCDF {nc_path.name}."
                 )
 
-        dic_analyses["image_path"] = (
-            image_path_str if image_path_str is not None else np.nan
-        )
+        except Exception as e:
+            logger.warning(
+                f"Error while trying to locate image for NetCDF {nc_path.name}: {e}"
+            )
+            image_path_str = None
+
+        if image_path_str is not None:
+            logger.info(f"Associated image found for {nc_path.name}: {image_path_str}")
+            dic_analyses["image_path"] = image_path_str
+        else:
+            logger.warning(f"No associated image found for {nc_path.name}.")
+            dic_analyses["image_path"] = np.nan
 
         # --- 4. Data Processing ---
         # Process DIC data into DataFrame with structure: x, y, u, v, V, MAD
@@ -364,6 +321,58 @@ def read_data_from_pylamma_nc(
         df = df[column_to_keep].dropna(subset=["V"])
 
     return df, dic_analyses
+
+
+def read_data_from_db(
+    config: DictConfig | ListConfig,
+    reference_date: str | datetime,
+    reference_start_date: str | datetime | None = None,
+    reference_end_date: str | datetime | None = None,
+) -> tuple[dict[int, pd.DataFrame], pd.DataFrame, Any]:
+    """
+    Fetch DIC data and metadata from the database.
+
+    Args:
+        config: Configuration object containing database and data specs.
+        reference_date: Target reference date.
+        reference_start_date: Start of the temporal search window.
+        reference_end_date: End of the temporal search window.
+
+    Returns:
+        tuple: (dict of DIC dataframes, metadata dataframe, background image).
+    """
+    db_engine = create_engine(config.db_url)
+    dic_ids = fetch_dic_analysis_ids(
+        db_engine,
+        camera_name=config.data.camera_name,
+        reference_date=reference_date,
+        reference_date_start=reference_start_date,
+        reference_date_end=reference_end_date,
+        dt_hours_min=config.data.dt_min,
+        dt_hours_max=config.data.dt_max,
+    )
+    if len(dic_ids) < 1:
+        raise DataLoadingError("No DIC analyses found for the given criteria")
+
+    dic_analyses = get_dic_analysis_by_ids(db_engine=db_engine, dic_ids=dic_ids)
+    logger.info("Fetched DIC analysis:")
+    for _, row in dic_analyses.iterrows():
+        logger.info(
+            f"DIC ID: {row['dic_id']}, date: {row['reference_date']}, dt (hrs): {row['dt_hours']}, Master: {row['master_timestamp']}, Slave: {row['slave_timestamp']}"
+        )
+
+    master_image_id = dic_analyses["master_image_id"].iloc[0]
+
+    img = get_image(image_id=master_image_id, config=config.api)
+
+    out = get_multi_dic_data(dic_ids, stack_results=False, config=config.api)
+    logger.info(f"Found stack of {len(out)} DIC dataframes.")
+
+    # Rename columns to match the standard u,v format if necessary
+    for key in out:
+        out[key] = out[key].rename(columns={"dx": "u", "dy": "v"}, errors="ignore")
+
+    return out, dic_analyses, img
 
 
 def read_sectors_from_file(sector_prior_path: Path, sector_names: list[str]):
