@@ -33,7 +33,7 @@ preprocessing:
   subsample_method: "regular"  # or 'random'
   mean_global_mad_threshold: 3  # Maximum mean global MAD (mean of the MAD on the DIC map) threshold. DIC maps with mean MAD above this threshold will be discarded. Set to None to disable global MAD filtering.
   min_ensemble_size: 2  # Minimum number of DIC maps (ensembles) required for a given date to be included in the analysis. Set to None to disable ensemble size filtering.
-  max_point_mad: 3 # Maximum MAD threshold for filtering. Points with MAD above this value will be removed. Set to None to disable MAD filtering.
+  max_point_mad: 5 # Maximum MAD threshold for filtering. Points with MAD above this value will be removed. Set to None to disable MAD filtering.
 
   filter_kwargs:
     min_velocity: 0.5  # Minimum velocity threshold (units depend on input data)

@@ -16,6 +16,7 @@ dependencies = [
     "cvatkit>=0.1.0",
     "dotenv>=0.9.9",
     "exifread>=3.3.1",
+    "fiona>=1.10.1",
     "graphviz>=0.21",
     "ipykernel>=6.29.5",
     "ipympl>=0.9.7",
