@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import gc
 import json
 import logging
@@ -48,7 +50,7 @@ def _gpu_available() -> bool:
 
 @dataclass
 class ClusteringResult:
-    idata: az.InferenceData
+    idata: Any
     convergence_flag: bool
     posterior_probs: np.ndarray
     cluster_pred: np.ndarray
@@ -59,7 +61,7 @@ class ClusteringResult:
 
 def sample_model(
     model: pm.Model, force_cpu: bool = False, **kwargs
-) -> tuple[az.InferenceData, bool]:
+) -> tuple[Any, bool]:
     """
     Sample a PyMC model.
     - If force_cpu=True: go straight to pm.sample(), JAX is never touched.

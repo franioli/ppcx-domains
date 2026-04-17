@@ -4,20 +4,20 @@ import logging
 
 # Import modules
 from ppcluster import (
-    cvat,  # noqa: F401
-    data,  # noqa: F401
-    griddata,  # noqa: F401
-    mcmc,  # noqa: F401
-    sectors,  # noqa: F401
-    utils,  # noqa: F401
-    visualization,  # noqa: F401
+    cvat,
+    data,
+    griddata,
+    mcmc,
+    sectors,
+    utils,
+    visualization,
 )
 
 # Import specific functions and classes
-from ppcluster.config import load_config  # noqa: F401
-from ppcluster.exceptions import DICMapNotFoundError, SectorNotFoundError  # noqa: F401
-from ppcluster.utils.logger import get_logger, set_log_level, setup_logger  # noqa: F401
-from ppcluster.utils.timer import Timer  # noqa: F401
+from ppcluster.config import load_config
+from ppcluster.exceptions import DICMapNotFoundError, SectorNotFoundError
+from ppcluster.utils.logger import get_logger, set_log_level, setup_logger
+from ppcluster.utils.timer import Timer
 
 # Create the logger but DO NOT add StreamHandlers/FileHandlers here.
 # Only set a default level (INFO), but no output will happen yet.
@@ -25,11 +25,20 @@ logger = logging.getLogger("ppcx")
 logger.addHandler(logging.NullHandler())
 logger.setLevel(logging.INFO)
 
+# Define __all__ to specify the namespace of the package and what is available for import when using 'from ppcluster import *'.
 __all__ = [
+    "cvat",
+    "data",
+    "griddata",
+    "sectors",
     "mcmc",
     "utils",
+    "visualization",
     "load_config",
     "get_logger",
     "set_log_level",
     "setup_logger",
+    "Timer",
+    "DICMapNotFoundError",
+    "SectorNotFoundError",
 ]

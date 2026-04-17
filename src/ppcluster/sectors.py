@@ -246,6 +246,7 @@ def clean_vector_sectors(
 
 # === Sector assignment and classification === #
 
+
 def classify_points_by_polygons(
     polygons: gpd.GeoDataFrame,
     points: pd.DataFrame | gpd.GeoDataFrame,
@@ -471,7 +472,9 @@ def assign_labels_by_prior_overlap_velocity(
         else:
             # Build reference velocities from confidently-assigned polygons
             confident_indices = [
-                i for i in range(len(gdf)) if not is_ambiguous[i] and labels[i] is not None
+                i
+                for i in range(len(gdf))
+                if not is_ambiguous[i] and labels[i] is not None
             ]
             ref_velocities: dict = {}
 
@@ -490,10 +493,14 @@ def assign_labels_by_prior_overlap_velocity(
                     predicate="within",
                 )
                 if not joined.empty:
-                    ref_velocities = joined.groupby("_label")[velocity_col].median().to_dict()
+                    ref_velocities = (
+                        joined.groupby("_label")[velocity_col].median().to_dict()
+                    )
                     logger.info(
                         "Reference velocities from confident polygons: "
-                        + ", ".join(f"{k}={v:.2f}" for k, v in sorted(ref_velocities.items()))
+                        + ", ".join(
+                            f"{k}={v:.2f}" for k, v in sorted(ref_velocities.items())
+                        )
                     )
 
             pts_gdf = gpd.GeoDataFrame(
@@ -511,7 +518,9 @@ def assign_labels_by_prior_overlap_velocity(
                 # Top-2 candidate labels by overlap fraction
                 candidates = [
                     lbl
-                    for lbl, _ in sorted(fracs.items(), key=lambda x: x[1], reverse=True)
+                    for lbl, _ in sorted(
+                        fracs.items(), key=lambda x: x[1], reverse=True
+                    )
                     if fracs[lbl] > 0
                 ][:2]
 
@@ -541,7 +550,8 @@ def assign_labels_by_prior_overlap_velocity(
 
                 if best_candidate is not None and best_candidate != labels[i]:
                     cand_str = ", ".join(
-                        f"{c}={ref_velocities.get(c, float('nan')):.2f}" for c in candidates
+                        f"{c}={ref_velocities.get(c, float('nan')):.2f}"
+                        for c in candidates
                     )
                     logger.debug(
                         f"Polygon {i}: overlap={fracs.get(candidates[0], 0):.2f}, "
@@ -609,7 +619,9 @@ def assign_sector_labels(
                 f"method='{method}' requested but no priors_gdf provided. "
                 "Falling back to y_centroid."
             )
-            return assign_labels_by_geometry(gdf, set_by="y_centroid", ascending=ascending)
+            return assign_labels_by_geometry(
+                gdf, set_by="y_centroid", ascending=ascending
+            )
 
         if method == "prior":
             return assign_labels_by_prior_overlap(gdf, priors_gdf)
@@ -622,7 +634,9 @@ def assign_sector_labels(
             )
             return assign_labels_by_prior_overlap(gdf, priors_gdf)
         return assign_labels_by_prior_overlap_velocity(
-            gdf, priors_gdf, df_points,
+            gdf,
+            priors_gdf,
+            df_points,
             ambiguity_threshold=ambiguity_threshold,
             velocity_col=velocity_col,
         )
@@ -634,6 +648,7 @@ def assign_sector_labels(
 
 
 # === Sector statistics === #
+
 
 def compute_distribution_stats(
     df: pd.DataFrame | gpd.GeoDataFrame,

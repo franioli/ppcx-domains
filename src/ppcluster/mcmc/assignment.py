@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import logging
 from datetime import datetime
@@ -159,7 +161,7 @@ def compute_max_probs(
 
 
 def get_model_parameters_from_idata(
-    idata: az.InferenceData,
+    idata: Any,
     scaler: Any | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
     """Extract model parameters from ArviZ InferenceData object.
@@ -315,7 +317,7 @@ def compute_cluster_statistics(
 
 
 def collect_run_metadata(
-    idata: az.InferenceData,
+    idata: Any,
     convergence_flag: bool,
     data_array_scaled: np.ndarray,
     variables_names: list,

@@ -1,7 +1,8 @@
+from __future__ import annotations
+
 import logging
 from typing import Any
 
-import arviz as az
 import numpy as np
 import omegaconf
 import pymc as pm
@@ -307,7 +308,7 @@ def build_discrete_marginalized_mixture_model(
 
 def mrf_regularization(
     data_scaled: np.ndarray,
-    idata: az.InferenceData,
+    idata: Any,
     prior_init: np.ndarray,
     x: np.ndarray,
     y: np.ndarray,
@@ -336,7 +337,7 @@ def mrf_regularization(
     Args:
         data_scaled (np.ndarray):
             Feature data (N, D), scaled (e.g., StandardScaler).
-        idata (az.InferenceData):
+        idata (Any):
             MCMC results containing posterior samples for 'mu' and 'sigma'.
             Used to compute the data likelihood term.
         prior_init (np.ndarray):
