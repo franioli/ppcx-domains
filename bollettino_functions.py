@@ -5,20 +5,17 @@ from pathlib import Path
 from typing import Any, Literal
 
 import geopandas as gpd
-import matplotlib
-import numpy as np
-import pandas as pd
-import seaborn as sns
-from matplotlib import pyplot as plt
-from PIL import Image
-
-matplotlib.use("Agg")  # Use non-interactive backend for batch processing
 import joblib
 import matplotlib.dates as mdates
+import numpy as np
+import pandas as pd
 import scipy.stats as stats
+import seaborn as sns
 from joblib import Parallel, delayed
+from matplotlib import pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.patches import Patch
+from PIL import Image
 from tqdm import tqdm
 
 from ppcluster import setup_logger
@@ -318,97 +315,6 @@ def load_image(
             f"No images found in '{img_dir}' for pattern: {pattern}"
         )
     return Image.open(candidates[len(candidates) // 2])
-
-
-# === Legacy joblib loading functions (for backward compatibility) ===#
-
-
-def find_result_folders(
-    base_dir: Path, pattern: str = r".*_\d{4}-\d{2}-\d{2}$"
-) -> list[Path]:
-    """
-    Find result folders matching `pattern` under `base_dir`.
-
-    Args:
-        base_dir: directory to scan for result folders
-        pattern: regex to match folder names (default: CAMERA_YYYY-MM-DD)
-
-    Returns:
-        Sorted list of Path objects for folders that match the pattern.
-    """
-    folders = []
-    date_pattern = re.compile(r"(\d{4}-\d{2}-\d{2})")
-
-    for folder in base_dir.iterdir():
-        if not folder.is_dir():
-            continue
-        if re.match(pattern, folder.name):
-            # Extract date from folder name
-            match = date_pattern.search(folder.name)
-            if match:
-                date_str = match.group(1)
-                folders.append((date_str, folder))
-
-    # Sort by date
-    folders.sort(key=lambda x: x[0])
-
-    # Return only folder paths
-    folders = [folder for _, folder in folders]
-
-    return folders
-
-
-def load_sector_results(
-    folder: Path, search_pattern: str | None = None
-) -> dict[str, Any] | None:
-    """
-    Load a single date results bundle from `folder`.
-
-    Args:
-        folder: path to a results folder
-        search_pattern: glob pattern to find the results bundle (default "*results.joblib")
-
-    Returns:
-        Dict with keys "date", "sectors", "stats", "pts_by_sector" on success, None on failure.
-    """
-    try:
-        # Auto-detect base_name from folder if not provided
-        if search_pattern is None:
-            search_pattern = "*results.joblib"
-
-        # Look for the bundle file
-        bundle_files = list(folder.glob(search_pattern))
-        if not bundle_files:
-            raise FileNotFoundError(f"No bundle file found in {folder}")
-
-        if len(bundle_files) > 1:
-            logger.warning(
-                f"Multiple bundle files found in {folder}, using the first one"
-            )
-        bundle_path = bundle_files[0]
-
-        # Load main results bundle
-        if not bundle_path.exists():
-            raise FileNotFoundError(f"Bundle file not found: {bundle_path}")
-
-        bundle = joblib.load(bundle_path)
-        if not isinstance(bundle, dict):
-            raise ValueError(f"Invalid bundle format in {bundle_path}")
-
-        # Extract relevant data
-        date = bundle.get("reference_date", None)
-        sectors = bundle.get("sectors", None)
-        pts_by_sector = bundle.get("pts_by_sector", None)
-
-        return {
-            "date": date,
-            "sectors": sectors,
-            "pts_by_sector": pts_by_sector,
-        }
-
-    except Exception as exc:
-        logger.error(f"Failed to load results from {folder}: {exc}")
-        return None
 
 
 # === Collect all data for time series ===#
@@ -1527,3 +1433,101 @@ def create_sectors_evolution_mosaic(
             )
         )
     logger.info("Completed mosaic plotting.")
+
+
+# === Legacy joblib loading functions (for backward compatibility) ===#
+
+
+def find_result_folders(
+    base_dir: Path, pattern: str = r".*_\d{4}-\d{2}-\d{2}$"
+) -> list[Path]:
+    """
+    Find result folders matching `pattern` under `base_dir`.
+
+    Args:
+        base_dir: directory to scan for result folders
+        pattern: regex to match folder names (default: CAMERA_YYYY-MM-DD)
+
+    Returns:
+        Sorted list of Path objects for folders that match the pattern.
+    """
+
+    logger.warning(
+        "find_result_folders is deprecated; consider using load_sectors_results_from_geojson instead."
+    )
+    folders = []
+    date_pattern = re.compile(r"(\d{4}-\d{2}-\d{2})")
+
+    for folder in base_dir.iterdir():
+        if not folder.is_dir():
+            continue
+        if re.match(pattern, folder.name):
+            # Extract date from folder name
+            match = date_pattern.search(folder.name)
+            if match:
+                date_str = match.group(1)
+                folders.append((date_str, folder))
+
+    # Sort by date
+    folders.sort(key=lambda x: x[0])
+
+    # Return only folder paths
+    folders = [folder for _, folder in folders]
+
+    return folders
+
+
+def load_sector_results(
+    folder: Path, search_pattern: str | None = None
+) -> dict[str, Any] | None:
+    """
+    Load a single date results bundle from `folder`.
+
+    Args:
+        folder: path to a results folder
+        search_pattern: glob pattern to find the results bundle (default "*results.joblib")
+
+    Returns:
+        Dict with keys "date", "sectors", "stats", "pts_by_sector" on success, None on failure.
+    """
+    logger.warning(
+        "find_result_folders is deprecated; consider using load_sectors_results_from_geojson instead."
+    )
+    try:
+        # Auto-detect base_name from folder if not provided
+        if search_pattern is None:
+            search_pattern = "*results.joblib"
+
+        # Look for the bundle file
+        bundle_files = list(folder.glob(search_pattern))
+        if not bundle_files:
+            raise FileNotFoundError(f"No bundle file found in {folder}")
+
+        if len(bundle_files) > 1:
+            logger.warning(
+                f"Multiple bundle files found in {folder}, using the first one"
+            )
+        bundle_path = bundle_files[0]
+
+        # Load main results bundle
+        if not bundle_path.exists():
+            raise FileNotFoundError(f"Bundle file not found: {bundle_path}")
+
+        bundle = joblib.load(bundle_path)
+        if not isinstance(bundle, dict):
+            raise ValueError(f"Invalid bundle format in {bundle_path}")
+
+        # Extract relevant data
+        date = bundle.get("reference_date", None)
+        sectors = bundle.get("sectors", None)
+        pts_by_sector = bundle.get("pts_by_sector", None)
+
+        return {
+            "date": date,
+            "sectors": sectors,
+            "pts_by_sector": pts_by_sector,
+        }
+
+    except Exception as exc:
+        logger.error(f"Failed to load results from {folder}: {exc}")
+        return None

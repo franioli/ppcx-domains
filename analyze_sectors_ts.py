@@ -12,10 +12,10 @@ from bollettino_functions import (  # noqa: F401
     collect_statistics,
     create_sectors_evolution_mosaic,
     create_time_series_plot,
-    find_result_folders,
-    load_sector_results,
+    load_sectors_results_from_geojson,
     plot_area_panel,
     plot_sector_evolution_boxplots,
+    plot_sectors_velocity_area_time_series,
     plot_swimmer_all_sectors,
     plot_velocity_panel,
     plot_velocity_separation_panel,
@@ -81,8 +81,7 @@ DISCARDED_DAYS = {
 
 # ==== Default options for CLI parser ====
 DEFAULT_OUTPUT_SUBDIR = "kinematic_sectors_time_series"
-DEFAULT_DIR_PATTERN = r"\d{4}-\d{2}-\d{2}$"
-DEFAULT_RESULTS_PATTERN = "*results.joblib"
+DEFAULT_GEOJSON_SUBDIR = "kinematic_sectors_geojson"
 DEFAULT_N_JOBS = 1
 DEFAULT_SECTORS = ["A", "B", "C"]
 DEFAULT_UNIT = "px"
@@ -98,7 +97,8 @@ def parse_args(argv=None):
         "-i",
         type=str,
         required=True,
-        help="Base input directory containing result folders (required)",
+        help="Year run directory (e.g. output_domains/2016_PPCX_Tele). "
+             f"GeoJSON data is expected in <input-dir>/{DEFAULT_GEOJSON_SUBDIR}",
     )
     parser.add_argument(
         "--output-dir",
@@ -106,18 +106,6 @@ def parse_args(argv=None):
         type=str,
         default=None,
         help=f"Output directory (default: <input-dir>/{DEFAULT_OUTPUT_SUBDIR})",
-    )
-    parser.add_argument(
-        "--dir-pattern",
-        type=str,
-        default=DEFAULT_DIR_PATTERN,
-        help=f"Regex to match result folders (default: {DEFAULT_DIR_PATTERN})",
-    )
-    parser.add_argument(
-        "--results-pattern",
-        type=str,
-        default=DEFAULT_RESULTS_PATTERN,
-        help=f"Glob pattern to find results bundle files (default: {DEFAULT_RESULTS_PATTERN})",
     )
     parser.add_argument(
         "--make-mosaic",
@@ -140,19 +128,18 @@ def parse_args(argv=None):
 
 def main(args):
     in_dir = Path(args.input_dir)
+    geojson_dir = in_dir / DEFAULT_GEOJSON_SUBDIR
     out_dir = (
         Path(args.output_dir) if args.output_dir else in_dir / DEFAULT_OUTPUT_SUBDIR
     )
-    dir_pattern = args.dir_pattern
-    results_pattern = args.results_pattern
     make_mosaic = args.make_mosaic
     n_jobs = args.jobs
     show_plots = args.show
 
     year = in_dir.name.split("_")[0]
 
-    if not in_dir.exists():
-        logger.error(f"Input directory not found: {in_dir}")
+    if not geojson_dir.exists():
+        logger.error(f"GeoJSON directory not found: {geojson_dir}")
         return
 
     # Load the config file
@@ -164,35 +151,19 @@ def main(args):
     # Create output directory
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"Searching for result folders in {in_dir}...")
-    folders = find_result_folders(in_dir, pattern=dir_pattern)
-    logger.info(f"Found {len(folders)} result folders")
+    # Load results from the final GeoJSON outputs
+    logger.info(f"Loading sector results from {geojson_dir}...")
+    results_list = load_sectors_results_from_geojson(geojson_dir)
 
-    logger.info("Loading results from all dates...")
+    # Filter out discarded dates
+    day_to_discard = set(DISCARDED_DAYS.get(year, []))
+    if day_to_discard:
+        before = len(results_list)
+        results_list = [r for r in results_list if r["date"] not in day_to_discard]
+        skipped = before - len(results_list)
+        logger.info(f"Skipped {skipped} discarded date(s) for year {year}")
 
-    day_to_discard = DISCARDED_DAYS.get(year, [])
-    results_list = []
-    loaded = 0
-    skipped = 0
-    failed = 0
-    for folder in folders:
-        # Skip date if the days is in the discarded day dictionary
-        date_str = folder.name.split("_")[-1]
-        if date_str in day_to_discard:
-            logger.info(f"Skipping discarded date {date_str} in year {year}")
-            skipped += 1
-            continue
-
-        res = load_sector_results(folder, search_pattern=results_pattern)
-        if not res:
-            failed += 1
-            continue
-        results_list.append(res)
-        loaded += 1
-
-    logger.info(
-        f"Successfully loaded {loaded} results out of {len(folders)} folders (skipped: {skipped}, failed: {failed})"
-    )
+    logger.info(f"Using {len(results_list)} date(s) for time series analysis")
 
     # Collect and prepare data
     df_sectors = collect_statistics(results_list)
